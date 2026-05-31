@@ -1,8 +1,17 @@
 [workspace]
 members = [
-    "crates/mailproto",
-    "crates/mailcore",
-    "crates/ui",
+    "crates/courier-proto",
+    "crates/courier-domain",
+    "crates/courier-storage",
+    "crates/courier-mime",
+    "crates/courier-render",
+    "crates/courier-security",
+    "crates/courier-provider",
+    "crates/courier-adapter",
+    "crates/courier-sync",
+    "crates/courier-search",
+    "crates/courier-app",
+    "crates/courier-ui",
 ]
 resolver = "2"
 
@@ -13,9 +22,18 @@ repository = ""
 
 [workspace.dependencies]
 anyhow = "1"
+courier-adapter = { path = "crates/courier-adapter" }
+courier-app = { path = "crates/courier-app" }
+courier-domain = { path = "crates/courier-domain" }
+courier-mime = { path = "crates/courier-mime" }
+courier-proto = { path = "crates/courier-proto" }
+courier-provider = { path = "crates/courier-provider" }
+courier-render = { path = "crates/courier-render" }
+courier-search = { path = "crates/courier-search" }
+courier-security = { path = "crates/courier-security" }
+courier-storage = { path = "crates/courier-storage" }
+courier-sync = { path = "crates/courier-sync" }
 iced = { version = "0.13", features = ["tokio"] }
-mailcore = { path = "crates/mailcore" }
-mailproto = { path = "crates/mailproto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
