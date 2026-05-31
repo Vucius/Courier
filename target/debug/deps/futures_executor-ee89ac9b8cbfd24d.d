@@ -1,0 +1,9 @@
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\futures_executor-ee89ac9b8cbfd24d.d: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\local_pool.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\thread_pool.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\unpark_mutex.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\enter.rs
+
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\libfutures_executor-ee89ac9b8cbfd24d.rmeta: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\local_pool.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\thread_pool.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\unpark_mutex.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\enter.rs
+
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\lib.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\local_pool.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\thread_pool.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\unpark_mutex.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-executor-0.3.32\src\enter.rs:

@@ -1,0 +1,14 @@
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\softbuffer-bc614dab7bc00e12.d: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backend_dispatch.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backend_interface.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backends\mod.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backends\win32.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\error.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\util.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\../README.md
+
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\libsoftbuffer-bc614dab7bc00e12.rmeta: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backend_dispatch.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backend_interface.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backends\mod.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backends\win32.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\error.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\util.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\../README.md
+
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\lib.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backend_dispatch.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backend_interface.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backends\mod.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\backends\win32.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\error.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\util.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\softbuffer-0.4.8\src\../README.md:
+
+# env-dep:CARGO_PKG_VERSION=0.4.8

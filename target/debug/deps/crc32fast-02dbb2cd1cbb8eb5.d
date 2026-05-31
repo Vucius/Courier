@@ -1,0 +1,10 @@
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\crc32fast-02dbb2cd1cbb8eb5.d: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\baseline.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\combine.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\specialized\mod.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\table.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\specialized\pclmulqdq.rs
+
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\libcrc32fast-02dbb2cd1cbb8eb5.rmeta: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\baseline.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\combine.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\specialized\mod.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\table.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\specialized\pclmulqdq.rs
+
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\lib.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\baseline.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\combine.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\specialized\mod.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\table.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\crc32fast-1.5.0\src\specialized\pclmulqdq.rs:

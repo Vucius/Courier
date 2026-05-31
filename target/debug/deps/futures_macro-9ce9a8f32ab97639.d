@@ -1,0 +1,9 @@
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\futures_macro-9ce9a8f32ab97639.d: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\executor.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\join.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\select.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\stream_select.rs
+
+C:\AAAAAAAAAAA_temp\desktop\Hephaestus_Repository\Colosseum\MailSpring_Rust\target\debug\deps\futures_macro-9ce9a8f32ab97639.dll: C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\lib.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\executor.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\join.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\select.rs C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\stream_select.rs
+
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\lib.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\executor.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\join.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\select.rs:
+C:\Users\Spade\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\futures-macro-0.3.32\src\stream_select.rs:
