@@ -13,5 +13,6 @@ fn main() -> iced::Result {
 
     iced::application("Courier", app::update, app::view)
         .theme(app::theme)
+        .subscription(app::subscription)
         .run_with(app::init)
 }

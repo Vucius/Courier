@@ -108,7 +108,14 @@ pub struct DraftMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineCommand {
     SyncNow(AccountId),
+    ListThreads {
+        mailbox_id: Option<MailboxId>,
+        query: String,
+    },
+    LoadThread(ThreadId),
     MarkRead(MessageId, bool),
+    ArchiveMessage(MessageId),
+    MoveToTrash(MessageId),
     SendMessage(DraftId),
     SaveDraft(DraftMessage),
     Snooze(MessageId, i64),
@@ -118,6 +125,7 @@ pub enum EngineCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineEvent {
     Ready,
+    MailboxesUpdated(Vec<MailboxSummary>),
     SyncProgress {
         account_id: AccountId,
         progress: f32,
