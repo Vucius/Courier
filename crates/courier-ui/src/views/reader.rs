@@ -1,6 +1,6 @@
+use courier_proto::MessageBody;
 use iced::Element;
 use iced::widget::{column, text};
-use courier_proto::MessageBody;
 
 use crate::app::Message;
 

@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row};
-use iced::{Element, Length, Task, Theme};
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
     AccountId, EngineCommand, MailboxRole, MailboxSummary, MessageBody, ThreadSummary,
 };
+use iced::widget::{button, column, container, row};
+use iced::{Element, Length, Task, Theme};
 
 #[derive(Debug, Clone)]
 pub enum Message {

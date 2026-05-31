@@ -13,7 +13,10 @@ pub enum ImageSource {
 pub enum RenderNode {
     Text(String),
     Paragraph(Vec<RenderNode>),
-    Link { href: String, children: Vec<RenderNode> },
+    Link {
+        href: String,
+        children: Vec<RenderNode>,
+    },
     Image(ImageSource),
     BlockQuote(Vec<RenderNode>),
     Table(Vec<RenderNode>),
@@ -28,7 +31,9 @@ pub struct RenderTree {
 pub fn render_tree_from_html(input: &str) -> RenderTree {
     let sanitized = sanitize_email_html(input);
     RenderTree {
-        nodes: vec![RenderNode::Paragraph(vec![RenderNode::Text(sanitized.html)])],
+        nodes: vec![RenderNode::Paragraph(vec![RenderNode::Text(
+            sanitized.html,
+        )])],
         blocked_remote_images: sanitized.blocked_remote_images,
     }
 }

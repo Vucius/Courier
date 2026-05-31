@@ -21,7 +21,9 @@ pub struct SanitizedHtml {
 
 pub fn sanitize_email_html(input: &str) -> SanitizedHtml {
     let mut html = input.to_string();
-    for tag in ["script", "iframe", "object", "embed", "form", "input", "button"] {
+    for tag in [
+        "script", "iframe", "object", "embed", "form", "input", "button",
+    ] {
         html = strip_tag_blocks(&html, tag);
     }
 

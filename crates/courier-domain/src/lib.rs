@@ -191,7 +191,10 @@ impl Message {
 
 impl Mailbox {
     pub fn map_role_from_imap(imap_attrs: &[&str]) -> MailboxRole {
-        if imap_attrs.iter().any(|attr| attr.eq_ignore_ascii_case("\\Inbox")) {
+        if imap_attrs
+            .iter()
+            .any(|attr| attr.eq_ignore_ascii_case("\\Inbox"))
+        {
             MailboxRole::Inbox
         } else if imap_attrs
             .iter()
@@ -208,9 +211,10 @@ impl Mailbox {
             .any(|attr| attr.eq_ignore_ascii_case("\\Trash"))
         {
             MailboxRole::Trash
-        } else if imap_attrs.iter().any(|attr| {
-            attr.eq_ignore_ascii_case("\\Junk") || attr.eq_ignore_ascii_case("\\Spam")
-        }) {
+        } else if imap_attrs
+            .iter()
+            .any(|attr| attr.eq_ignore_ascii_case("\\Junk") || attr.eq_ignore_ascii_case("\\Spam"))
+        {
             MailboxRole::Spam
         } else if imap_attrs
             .iter()

@@ -25,9 +25,17 @@ pub struct RemoteDelta {
 
 #[derive(Debug, Clone)]
 pub enum RemoteOp {
-    MarkRead { message_id: String, read: bool },
-    Move { message_id: String, mailbox_id: String },
-    Delete { message_id: String },
+    MarkRead {
+        message_id: String,
+        read: bool,
+    },
+    Move {
+        message_id: String,
+        mailbox_id: String,
+    },
+    Delete {
+        message_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]

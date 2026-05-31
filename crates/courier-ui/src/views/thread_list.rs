@@ -1,6 +1,6 @@
+use courier_proto::ThreadSummary;
 use iced::Element;
 use iced::widget::{column, text};
-use courier_proto::ThreadSummary;
 
 use crate::app::Message;
 

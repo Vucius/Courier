@@ -1,2 +1,27 @@
 target/
 .courier/
+
+# Local editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Rust build and tooling output
+*.pdb
+*.profraw
+coverage/
+tarpaulin-report.html
+
+# Local environment and runtime data
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+attachments/
+raw/
