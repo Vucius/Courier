@@ -1,3 +1,5 @@
+#![allow(clippy::manual_async_fn)]
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -223,10 +225,10 @@ impl MailRemote for NoopRemote {
         let deltas = self.deltas.clone();
 
         async move {
-            if let Ok(mut deltas) = deltas.lock() {
-                if let Some(delta) = deltas.pop_front() {
-                    return Ok(delta);
-                }
+            if let Ok(mut deltas) = deltas.lock()
+                && let Some(delta) = deltas.pop_front()
+            {
+                return Ok(delta);
             }
 
             Ok(RemoteDelta::empty(cursor))

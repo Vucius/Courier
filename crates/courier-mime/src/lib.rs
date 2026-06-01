@@ -567,13 +567,13 @@ fn percent_decode(value: &str) -> String {
     let mut index = 0;
 
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-            {
-                output.push((hi << 4) | lo);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            output.push((hi << 4) | lo);
+            index += 3;
+            continue;
         }
 
         output.push(bytes[index]);

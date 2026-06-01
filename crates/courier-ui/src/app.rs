@@ -34,6 +34,7 @@ pub enum Message {
     AccountSmtpHostChanged(String),
     AccountSmtpPortChanged(String),
     SaveAccount,
+    TestAccountConnection,
     EditAccount(AccountId),
     ToggleAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
@@ -67,6 +68,7 @@ pub struct App {
     account_smtp_port: String,
     identity_name: String,
     identity_email: String,
+    account_connection_status: String,
     status: String,
 }
 
@@ -98,6 +100,7 @@ pub fn init() -> (App, Task<Message>) {
         account_smtp_port: "587".to_string(),
         identity_name: String::new(),
         identity_email: String::new(),
+        account_connection_status: String::new(),
         status: "Engine starting".to_string(),
     };
 
@@ -327,6 +330,26 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::TestAccountConnection => match account_config_from_form(app) {
+            Ok(account) => {
+                let engine = app.engine.clone();
+                app.account_connection_status = "Testing IMAP and SMTP reachability".to_string();
+                app.status = "Testing account connection".to_string();
+                Task::perform(
+                    async move {
+                        let _ = engine
+                            .send(EngineCommand::TestAccountConnection(account))
+                            .await;
+                    },
+                    |_| Message::SyncQueued,
+                )
+            }
+            Err(error) => {
+                app.account_connection_status = error.clone();
+                app.status = error;
+                Task::none()
+            }
+        },
         Message::EditAccount(account_id) => {
             if let Some(account) = app
                 .accounts
@@ -343,6 +366,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.account_smtp_port = account.smtp_port.to_string();
                 app.identity_name.clear();
                 app.identity_email.clear();
+                app.account_connection_status.clear();
                 app.status = "Editing account".to_string();
             } else {
                 app.status = "Account no longer exists".to_string();
@@ -444,16 +468,19 @@ pub fn view(app: &App) -> Element<'_, Message> {
     );
     let reader = if app.account_setup_visible {
         column![crate::views::account_setup::view(
-            &app.accounts,
-            &app.identities,
-            app.editing_account_id.as_ref(),
-            &app.account_email,
-            &app.account_imap_host,
-            &app.account_imap_port,
-            &app.account_smtp_host,
-            &app.account_smtp_port,
-            &app.identity_name,
-            &app.identity_email,
+            crate::views::account_setup::AccountSetupViewState {
+                accounts: &app.accounts,
+                identities: &app.identities,
+                editing_account_id: app.editing_account_id.as_ref(),
+                email: &app.account_email,
+                imap_host: &app.account_imap_host,
+                imap_port: &app.account_imap_port,
+                smtp_host: &app.account_smtp_host,
+                smtp_port: &app.account_smtp_port,
+                identity_name: &app.identity_name,
+                identity_email: &app.identity_email,
+                connection_status: &app.account_connection_status,
+            },
         )]
         .height(Length::Fill)
         .spacing(10)
@@ -534,6 +561,16 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
             app.editing_account_id = None;
             reset_account_form(app);
             app.status = format!("Account saved: {}", account.email);
+        }
+        EngineEvent::AccountConnectionTested(result) => {
+            let imap = endpoint_status("IMAP", &result.imap);
+            let smtp = endpoint_status("SMTP", &result.smtp);
+            app.account_connection_status = format!("{imap}; {smtp}");
+            app.status = if result.imap.ok && result.smtp.ok {
+                "Connection test passed".to_string()
+            } else {
+                "Connection test failed".to_string()
+            };
         }
         EngineEvent::IdentitySaved(identity) => {
             app.identity_name.clear();
@@ -679,6 +716,20 @@ fn reset_account_form(app: &mut App) {
     app.account_smtp_port = "587".to_string();
     app.identity_name.clear();
     app.identity_email.clear();
+    app.account_connection_status.clear();
+}
+
+fn endpoint_status(label: &str, result: &courier_proto::EndpointCheckResult) -> String {
+    if result.ok {
+        format!("{label} {}:{} reachable", result.host, result.port)
+    } else {
+        format!(
+            "{label} {}:{} failed: {}",
+            result.host,
+            result.port,
+            result.error.as_deref().unwrap_or("unknown error")
+        )
+    }
 }
 
 fn parse_port(value: &str, label: &str) -> Result<u16, String> {

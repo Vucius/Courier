@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   rust:
@@ -41,3 +42,22 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build release desktop binary
+        run: cargo build -p courier-ui --release --locked
+
+      - name: Upload release binary (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: courier-ui-windows
+          path: target/release/courier-ui.exe
+          if-no-files-found: error
+
+      - name: Upload release binary (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: courier-ui-linux
+          path: target/release/courier-ui
+          if-no-files-found: error

@@ -879,18 +879,18 @@ impl Storage {
             params![op_id],
         )?;
 
-        if let Some(message_id) = message_id {
-            if !has_pending_op_for_message(&transaction, &message_id, op_id)? {
-                transaction.execute(
-                    r#"
-                    UPDATE messages
-                    SET conflict_state = 'none'
-                    WHERE id = ?1
-                      AND conflict_state = 'local_pending'
-                    "#,
-                    params![message_id.0],
-                )?;
-            }
+        if let Some(message_id) = message_id
+            && !has_pending_op_for_message(&transaction, &message_id, op_id)?
+        {
+            transaction.execute(
+                r#"
+                UPDATE messages
+                SET conflict_state = 'none'
+                WHERE id = ?1
+                  AND conflict_state = 'local_pending'
+                "#,
+                params![message_id.0],
+            )?;
         }
 
         transaction.commit()?;

@@ -106,6 +106,21 @@ pub struct IdentitySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointCheckResult {
+    pub host: String,
+    pub port: u16,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountConnectionTestResult {
+    pub account_id: AccountId,
+    pub imap: EndpointCheckResult,
+    pub smtp: EndpointCheckResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxSummary {
     pub id: MailboxId,
     pub account_id: AccountId,
@@ -172,6 +187,7 @@ pub enum EngineCommand {
     SaveAccount(AccountConfig),
     SetAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
+    TestAccountConnection(AccountConfig),
     SaveIdentity(IdentityConfig),
     DeleteIdentity(IdentityId),
     SendMessage(DraftId),
@@ -188,6 +204,7 @@ pub enum EngineEvent {
     IdentitySaved(IdentitySummary),
     MailboxesUpdated(Vec<MailboxSummary>),
     AccountSaved(AccountSummary),
+    AccountConnectionTested(AccountConnectionTestResult),
     SyncProgress {
         account_id: AccountId,
         progress: f32,

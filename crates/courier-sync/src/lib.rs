@@ -1,3 +1,5 @@
+#![allow(clippy::manual_async_fn)]
+
 use courier_adapter::{
     MailRemote, NoopRemote, OutgoingMessage, RemoteDelta, RemoteMessage, RemoteOp,
 };
@@ -89,14 +91,14 @@ where
             .map(remote_op_from_queued_op)
             .collect::<Result<Vec<_>>>()?;
 
-        if !remote_ops.is_empty() {
-            if let Err(error) = self.remote.apply_ops(remote_ops).await {
-                for op in &pending_ops {
-                    self.storage.mark_op_failed(op.id, &error.to_string())?;
-                }
-
-                return Err(error.into());
+        if !remote_ops.is_empty()
+            && let Err(error) = self.remote.apply_ops(remote_ops).await
+        {
+            for op in &pending_ops {
+                self.storage.mark_op_failed(op.id, &error.to_string())?;
             }
+
+            return Err(error.into());
         }
 
         for op in &pending_ops {

@@ -4,19 +4,22 @@ use iced::{Alignment, Element, Length};
 
 use crate::app::Message;
 
-pub fn view<'a>(
-    accounts: &'a [AccountState],
-    identities: &'a [IdentitySummary],
-    editing_account_id: Option<&'a AccountId>,
-    email: &'a str,
-    imap_host: &'a str,
-    imap_port: &'a str,
-    smtp_host: &'a str,
-    smtp_port: &'a str,
-    identity_name: &'a str,
-    identity_email: &'a str,
-) -> Element<'a, Message> {
-    let title = if editing_account_id.is_some() {
+pub struct AccountSetupViewState<'a> {
+    pub accounts: &'a [AccountState],
+    pub identities: &'a [IdentitySummary],
+    pub editing_account_id: Option<&'a AccountId>,
+    pub email: &'a str,
+    pub imap_host: &'a str,
+    pub imap_port: &'a str,
+    pub smtp_host: &'a str,
+    pub smtp_port: &'a str,
+    pub identity_name: &'a str,
+    pub identity_email: &'a str,
+    pub connection_status: &'a str,
+}
+
+pub fn view<'a>(state: AccountSetupViewState<'a>) -> Element<'a, Message> {
+    let title = if state.editing_account_id.is_some() {
         "Edit Account"
     } else {
         "Account Setup"
@@ -28,6 +31,10 @@ pub fn view<'a>(
                 title,
                 row![
                     crate::components::action_bar::button_toolbar("New", Message::AddAccount),
+                    crate::components::action_bar::button_toolbar(
+                        "Test",
+                        Message::TestAccountConnection,
+                    ),
                     crate::components::action_bar::button_primary("Save", Message::SaveAccount),
                 ]
                 .spacing(6),
@@ -42,47 +49,64 @@ pub fn view<'a>(
             crate::components::form::labeled_input(
                 "Email",
                 "name@example.com",
-                email,
+                state.email,
                 Message::AccountEmailChanged,
             ),
             crate::components::form::labeled_input(
                 "IMAP",
                 "imap.example.com",
-                imap_host,
+                state.imap_host,
                 Message::AccountImapHostChanged,
             ),
             crate::components::form::labeled_input(
                 "Port",
                 "993",
-                imap_port,
+                state.imap_port,
                 Message::AccountImapPortChanged,
             ),
             crate::components::form::labeled_input(
                 "SMTP",
                 "smtp.example.com",
-                smtp_host,
+                state.smtp_host,
                 Message::AccountSmtpHostChanged,
             ),
             crate::components::form::labeled_input(
                 "Port",
                 "587",
-                smtp_port,
+                state.smtp_port,
                 Message::AccountSmtpPortChanged,
             ),
+            connection_status_view(state.connection_status),
             crate::components::surface::divider(),
             identities_view(
-                identities,
-                editing_account_id,
-                identity_name,
-                identity_email,
+                state.identities,
+                state.editing_account_id,
+                state.identity_name,
+                state.identity_email,
             ),
             crate::components::surface::divider(),
-            accounts_view(accounts, editing_account_id),
+            accounts_view(state.accounts, state.editing_account_id),
         ]
         .spacing(0),
     )
     .height(Length::Fill)
     .into()
+}
+
+fn connection_status_view<'a>(connection_status: &'a str) -> Element<'a, Message> {
+    if connection_status.trim().is_empty() {
+        return column![].into();
+    }
+
+    let kind = if connection_status.contains("failed") {
+        crate::components::notice::NoticeKind::Error
+    } else if connection_status.contains("reachable") {
+        crate::components::notice::NoticeKind::Success
+    } else {
+        crate::components::notice::NoticeKind::Info
+    };
+
+    crate::components::notice::inline(kind, connection_status)
 }
 
 fn identities_view<'a>(

@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use courier_proto::{
-    AccountId, AccountSummary, EngineCommand, EngineEvent, MailboxId, MailboxRole, MailboxSummary,
-    MessageBody, MessageId, ProviderKind, TaskId, ThreadId, ThreadSummary,
+    AccountConnectionTestResult, AccountId, AccountSummary, EndpointCheckResult, EngineCommand,
+    EngineEvent, MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind,
+    TaskId, ThreadId, ThreadSummary,
 };
 use courier_search::SearchIndex;
 use courier_storage::Storage;
@@ -242,6 +244,18 @@ impl EngineRuntime {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
                 }
             },
+            EngineCommand::TestAccountConnection(account) => {
+                let result = test_account_connection(&account).await;
+                tracing::info!(
+                    account_id = %account.id.0,
+                    imap_ok = result.imap.ok,
+                    smtp_ok = result.smtp.ok,
+                    "tested account TCP connectivity"
+                );
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::AccountConnectionTested(result));
+            }
             EngineCommand::SaveIdentity(identity) => match storage.upsert_identity(&identity) {
                 Ok(()) => {
                     tracing::info!(
@@ -357,6 +371,45 @@ impl EngineRuntime {
                 let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
             }
         }
+    }
+}
+
+async fn test_account_connection(
+    account: &courier_proto::AccountConfig,
+) -> AccountConnectionTestResult {
+    AccountConnectionTestResult {
+        account_id: account.id.clone(),
+        imap: test_endpoint(&account.imap_host, account.imap_port).await,
+        smtp: test_endpoint(&account.smtp_host, account.smtp_port).await,
+    }
+}
+
+async fn test_endpoint(host: &str, port: u16) -> EndpointCheckResult {
+    let address = format!("{host}:{port}");
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&address),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => EndpointCheckResult {
+            host: host.to_string(),
+            port,
+            ok: true,
+            error: None,
+        },
+        Ok(Err(error)) => EndpointCheckResult {
+            host: host.to_string(),
+            port,
+            ok: false,
+            error: Some(error.to_string()),
+        },
+        Err(_) => EndpointCheckResult {
+            host: host.to_string(),
+            port,
+            ok: false,
+            error: Some("connection timed out".to_string()),
+        },
     }
 }
 
