@@ -1,9 +1,12 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use courier_domain::SyncCursor;
+use courier_mime::{BodyKind, ParsedAttachment, parse_rfc822};
 use courier_proto::{
-    AccountId, AccountSummary, AuthType, DraftId, DraftMessage, MailboxId, MailboxRole,
-    MailboxSummary, MessageBody, MessageId, ProviderKind, ThreadId, ThreadSummary,
+    AccountId, AccountSummary, AttachmentId, AuthType, DraftId, DraftMessage, MailboxId,
+    MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind, ThreadId, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -18,6 +21,8 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("mime error: {0}")]
+    Mime(#[from] courier_mime::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +39,15 @@ pub struct QueuedOp {
     pub status: String,
     pub retry_count: u32,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAttachment {
+    pub id: AttachmentId,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub blob_path: Option<PathBuf>,
 }
 
 impl Storage {
@@ -298,6 +312,52 @@ impl Storage {
         Ok(())
     }
 
+    pub fn import_raw_message(
+        &self,
+        account_id: &AccountId,
+        mailbox_id: &MailboxId,
+        raw: &[u8],
+    ) -> Result<MessageId> {
+        let parsed = parse_rfc822(raw)?;
+        let message_id = MessageId(message_id_from_raw(
+            parsed.headers.message_id.as_deref(),
+            raw,
+        ));
+        let thread = ThreadSummary {
+            id: ThreadId(format!("thread:{}", message_id.0)),
+            account_id: account_id.clone(),
+            subject: draft_subject(&parsed.headers.subject),
+            sender: parsed.headers.from.clone(),
+            snippet: draft_snippet(&parsed.body.content),
+            unread: true,
+            last_message_ts: unix_timestamp(),
+        };
+        let body = MessageBody {
+            id: message_id.clone(),
+            thread_id: thread.id.clone(),
+            subject: thread.subject.clone(),
+            from: thread.sender.clone(),
+            to: parsed.headers.to,
+            content_type: match parsed.body.kind {
+                BodyKind::PlainText => "text/plain".to_string(),
+                BodyKind::Html => "text/html".to_string(),
+            },
+            body: parsed.body.content,
+        };
+
+        self.upsert_thread(&thread)?;
+        self.upsert_message(mailbox_id, &thread, &body)?;
+        let raw_path = self.persist_raw_message_blob(&message_id, raw)?;
+        self.persist_message_attachments(&message_id, &parsed.attachments)?;
+        self.update_message_blob_state(
+            &message_id,
+            Some(&raw_path),
+            !parsed.attachments.is_empty(),
+        )?;
+
+        Ok(message_id)
+    }
+
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
         self.list_threads_for_mailbox(None)
     }
@@ -387,6 +447,29 @@ impl Storage {
             )
             .optional()
             .map_err(Error::from)
+    }
+
+    pub fn list_attachments(&self, message_id: &MessageId) -> Result<Vec<StoredAttachment>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, filename, mime_type, size, blob_path
+            FROM attachments
+            WHERE message_id = ?1
+            ORDER BY filename COLLATE NOCASE, id
+            "#,
+        )?;
+        let rows = statement.query_map(params![message_id.0], |row| {
+            Ok(StoredAttachment {
+                id: AttachmentId(row.get(0)?),
+                filename: row.get(1)?,
+                mime_type: row.get(2)?,
+                size: row.get::<_, i64>(3)?.max(0) as u64,
+                blob_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+            })
+        })?;
+
+        collect_rows(rows)
     }
 
     pub fn mark_message_read(&self, message_id: &MessageId, read: bool) -> Result<()> {
@@ -689,6 +772,81 @@ impl Storage {
         )?;
         Ok(())
     }
+
+    fn persist_raw_message_blob(&self, message_id: &MessageId, raw: &[u8]) -> Result<PathBuf> {
+        let relative =
+            PathBuf::from("raw").join(format!("{}.eml", safe_path_segment(&message_id.0)));
+        let absolute = self.data_dir.join(&relative);
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&absolute, raw)?;
+        Ok(relative)
+    }
+
+    fn persist_message_attachments(
+        &self,
+        message_id: &MessageId,
+        attachments: &[ParsedAttachment],
+    ) -> Result<()> {
+        let connection = self.connection()?;
+
+        for attachment in attachments {
+            let relative = PathBuf::from("attachments")
+                .join(safe_path_segment(&message_id.0))
+                .join(safe_path_segment(&attachment.id.0));
+            let absolute = self.data_dir.join(&relative);
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&absolute, &attachment.data)?;
+
+            connection.execute(
+                r#"
+                INSERT INTO attachments (id, message_id, filename, mime_type, size, blob_path)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(id) DO UPDATE SET
+                    filename = excluded.filename,
+                    mime_type = excluded.mime_type,
+                    size = excluded.size,
+                    blob_path = excluded.blob_path
+                "#,
+                params![
+                    attachment.id.0,
+                    message_id.0,
+                    attachment.filename,
+                    attachment.mime_type,
+                    u64_to_i64(attachment.size),
+                    relative.to_string_lossy(),
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn update_message_blob_state(
+        &self,
+        message_id: &MessageId,
+        raw_path: Option<&Path>,
+        has_attachments: bool,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            UPDATE messages
+            SET raw_path = ?2,
+                has_attachments = ?3
+            WHERE id = ?1
+            "#,
+            params![
+                message_id.0,
+                raw_path.map(|path| path.to_string_lossy().to_string()),
+                if has_attachments { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 const THREAD_SUMMARY_FOR_INBOX_QUERY: &str = r#"
@@ -911,6 +1069,45 @@ fn draft_snippet(body: &str) -> String {
     } else {
         snippet.to_string()
     }
+}
+
+fn message_id_from_raw(header_message_id: Option<&str>, raw: &[u8]) -> String {
+    if let Some(message_id) = header_message_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("message:{}", safe_identifier(message_id));
+    }
+
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    format!("message:raw:{:016x}", hasher.finish())
+}
+
+fn safe_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@' | ':') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn safe_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn unix_timestamp() -> i64 {
@@ -1191,6 +1388,88 @@ mod tests {
             .expect("sent body exists");
         assert_eq!(sent_body.from, "sender@example.test");
         assert_eq!(sent_body.to, vec!["receiver@example.test".to_string()]);
+
+        std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[test]
+    fn raw_message_import_persists_body_raw_and_attachments() {
+        let data_dir = test_data_dir("raw-import");
+        let storage = Storage::open(&data_dir).expect("open storage");
+        storage.initialize().expect("initialize storage");
+
+        let account = AccountSummary {
+            id: AccountId("account:raw".to_string()),
+            email: "raw@example.test".to_string(),
+            provider: ProviderKind::GenericImap,
+        };
+        let mailbox = MailboxSummary {
+            id: MailboxId("account:raw:inbox".to_string()),
+            account_id: account.id.clone(),
+            name: "Inbox".to_string(),
+            role: MailboxRole::Inbox,
+            unread_count: 0,
+        };
+        let raw = br#"Subject: Raw import
+From: sender@example.test
+To: raw@example.test
+Message-ID: <raw-import@example.test>
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: text/html
+
+<p>Imported HTML body</p>
+--mix
+Content-Type: text/plain; name="note.txt"
+Content-Disposition: attachment; filename="note.txt"
+Content-Transfer-Encoding: base64
+
+SGVsbG8=
+--mix--
+"#;
+
+        storage.upsert_account(&account).expect("upsert account");
+        storage.upsert_mailbox(&mailbox).expect("upsert mailbox");
+
+        let message_id = storage
+            .import_raw_message(&account.id, &mailbox.id, raw)
+            .expect("import raw message");
+        assert_eq!(
+            message_id,
+            MessageId("message:raw-import@example.test".to_string())
+        );
+
+        let threads = storage.list_threads().expect("list threads");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].subject, "Raw import");
+        assert_eq!(threads[0].sender, "sender@example.test");
+
+        let body = storage
+            .load_message_for_thread(&threads[0].id)
+            .expect("load imported message")
+            .expect("message exists");
+        assert_eq!(body.content_type, "text/html");
+        assert_eq!(body.body, "<p>Imported HTML body</p>");
+
+        let attachments = storage
+            .list_attachments(&message_id)
+            .expect("list attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "note.txt");
+        assert_eq!(attachments[0].mime_type, "text/plain");
+        assert_eq!(attachments[0].size, 5);
+        let attachment_path = data_dir.join(attachments[0].blob_path.as_ref().expect("blob path"));
+        assert_eq!(
+            std::fs::read(attachment_path).expect("read attachment"),
+            b"Hello"
+        );
+        assert!(
+            data_dir
+                .join("raw")
+                .join("message-raw-import-example.test.eml")
+                .exists()
+        );
 
         std::fs::remove_dir_all(data_dir).expect("remove test data");
     }

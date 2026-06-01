@@ -677,6 +677,7 @@ version = "0.1.0"
 dependencies = [
  "courier-proto",
  "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -723,6 +724,7 @@ name = "courier-storage"
 version = "0.1.0"
 dependencies = [
  "courier-domain",
+ "courier-mime",
  "courier-proto",
  "rusqlite",
  "serde_json",

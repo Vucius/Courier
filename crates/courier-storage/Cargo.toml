@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 courier-domain.workspace = true
+courier-mime.workspace = true
 courier-proto.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true

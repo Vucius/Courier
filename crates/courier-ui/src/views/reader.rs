@@ -26,19 +26,14 @@ pub fn view<'a>(
                         crate::components::action_bar::button_text("Reply", Message::Compose),
                     ),
                     crate::components::surface::divider(),
-                    column![
-                        row![
-                            text("From").size(12).color(crate::theme::TEXT_MUTED),
-                            text(&body.from).size(13).color(crate::theme::TEXT),
-                        ]
-                        .spacing(12),
-                        row![
-                            text("To").size(12).color(crate::theme::TEXT_MUTED),
-                            text(recipients).size(13).color(crate::theme::TEXT),
-                        ]
-                        .spacing(24),
+                    row![
+                        crate::components::avatar::view(&body.from, false),
+                        crate::components::list::metadata_rows(vec![
+                            ("From", body.from.clone()),
+                            ("To", recipients),
+                        ]),
                     ]
-                    .spacing(6)
+                    .spacing(10)
                     .padding(12),
                     rendered_body,
                 ]
@@ -63,11 +58,10 @@ fn render_tree_view<'a>(
     match render_tree {
         Some(tree) => {
             if tree.blocked_remote_images {
-                content = content.push(
-                    text("Remote images blocked")
-                        .size(12)
-                        .color(crate::theme::TEXT_MUTED),
-                );
+                content = content.push(crate::components::notice::inline(
+                    crate::components::notice::NoticeKind::Warning,
+                    "Remote images were blocked for this message.",
+                ));
             }
 
             for node in &tree.nodes {
@@ -144,14 +138,16 @@ fn render_inline_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
 }
 
 fn image_label<'a>(source: &'a ImageSource) -> Element<'a, Message> {
-    let label = match source {
-        ImageSource::RemoteUrl(_) => "Remote image blocked",
-        ImageSource::Cid(_) => "Inline image",
-        ImageSource::Attachment(_) => "Attachment image",
-        ImageSource::LocalPath(_) => "Image",
-    };
-
-    text(label).size(12).color(crate::theme::TEXT_MUTED).into()
+    match source {
+        ImageSource::RemoteUrl(_) => {
+            crate::components::attachment::image_placeholder("Remote image blocked")
+        }
+        ImageSource::Cid(value) => crate::components::attachment::chip(value, "inline image"),
+        ImageSource::Attachment(value) => {
+            crate::components::attachment::chip(value, "attachment image")
+        }
+        ImageSource::LocalPath(value) => crate::components::attachment::chip(value, "image"),
+    }
 }
 
 fn children_text(children: &[RenderNode]) -> String {

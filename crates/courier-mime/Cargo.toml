@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 courier-proto.workspace = true
 serde.workspace = true
+thiserror.workspace = true

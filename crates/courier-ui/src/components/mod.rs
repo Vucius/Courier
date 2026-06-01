@@ -1,5 +1,11 @@
 pub mod action_bar;
+pub mod attachment;
+pub mod avatar;
+pub mod badge;
 pub mod empty_state;
+pub mod form;
+pub mod list;
+pub mod notice;
 pub mod search;
 pub mod status_bar;
 pub mod surface;

@@ -1,7 +1,6 @@
-use courier_proto::{MailboxId, MailboxSummary};
+use courier_proto::{MailboxId, MailboxRole, MailboxSummary};
 use iced::Element;
-use iced::widget::{button, column, row, text};
-use iced::{Alignment, Length};
+use iced::widget::{column, text};
 
 use crate::app::Message;
 
@@ -15,8 +14,8 @@ pub fn view<'a>(
             text("Local").size(12).color(crate::theme::TEXT_MUTED),
         ),
         crate::components::surface::divider(),
-        crate::components::surface::section_title("MAILBOXES"),
-        mailbox_row("Unified Inbox", None, 0, selected_mailbox.is_none()),
+        crate::components::list::section_label("MAILBOXES"),
+        mailbox_row("Unified Inbox", "ALL", None, 0, selected_mailbox.is_none(),),
     ]
     .spacing(8)
     .padding(8);
@@ -25,6 +24,7 @@ pub fn view<'a>(
         let selected = selected_mailbox == Some(&mailbox.id);
         list = list.push(mailbox_row(
             &mailbox.name,
+            role_code(&mailbox.role),
             Some(&mailbox.id),
             mailbox.unread_count,
             selected,
@@ -36,38 +36,34 @@ pub fn view<'a>(
 
 fn mailbox_row<'a>(
     name: &'a str,
+    role: &'a str,
     mailbox_id: Option<&'a MailboxId>,
     unread_count: u32,
     selected: bool,
 ) -> Element<'a, Message> {
-    let unread = if unread_count == 0 {
-        text("").into()
+    let trailing = if unread_count == 0 {
+        None
     } else {
-        crate::components::surface::badge(unread_count)
+        Some(crate::components::badge::count(unread_count))
     };
 
-    let content = row![
-        text(name).size(14).color(crate::theme::TEXT),
-        iced::widget::horizontal_space(),
-        unread,
-    ]
-    .align_y(Alignment::Center)
-    .spacing(8)
-    .width(Length::Fill);
+    crate::components::list::outline_row(
+        crate::components::badge::role(role),
+        name,
+        trailing,
+        selected,
+        Message::MailboxSelected(mailbox_id.cloned(), name.to_string()),
+    )
+}
 
-    let row = if selected {
-        crate::components::surface::row_surface(content, true)
-    } else {
-        iced::widget::container(content)
-    };
-
-    button(row)
-        .style(iced::widget::button::text)
-        .padding(0)
-        .width(Length::Fill)
-        .on_press(Message::MailboxSelected(
-            mailbox_id.cloned(),
-            name.to_string(),
-        ))
-        .into()
+fn role_code(role: &MailboxRole) -> &'static str {
+    match role {
+        MailboxRole::Inbox => "IN",
+        MailboxRole::Sent => "SE",
+        MailboxRole::Drafts => "DR",
+        MailboxRole::Archive => "AR",
+        MailboxRole::Trash => "TR",
+        MailboxRole::Spam => "SP",
+        MailboxRole::Custom => "FO",
+    }
 }

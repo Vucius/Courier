@@ -1,6 +1,6 @@
 use courier_proto::{ThreadId, ThreadSummary};
 use iced::Element;
-use iced::widget::{button, column, row, scrollable, text};
+use iced::widget::{column, row, scrollable, text};
 use iced::{Alignment, Length};
 
 use crate::app::Message;
@@ -35,44 +35,39 @@ pub fn view<'a>(
 
 fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Message> {
     let subject_size = if thread.unread { 15 } else { 14 };
-    let unread_marker = if thread.unread {
-        text("*").size(14).color(crate::theme::ACCENT)
+    let unread = if thread.unread {
+        crate::components::badge::pill("Unread")
     } else {
-        text(" ").size(14)
+        crate::components::badge::pill("Read")
     };
 
-    let content = row![
-        unread_marker,
-        column![
-            row![
-                text(&thread.sender).size(13).color(crate::theme::TEXT),
-                iced::widget::horizontal_space(),
-                text(timestamp_label(thread.last_message_ts))
-                    .size(11)
-                    .color(crate::theme::TEXT_MUTED),
-            ]
-            .align_y(Alignment::Center)
-            .spacing(8),
-            text(&thread.subject)
-                .size(subject_size)
-                .color(crate::theme::TEXT),
-            text(&thread.snippet)
-                .size(12)
+    let content = column![
+        row![
+            text(&thread.sender).size(13).color(crate::theme::TEXT),
+            iced::widget::horizontal_space(),
+            text(timestamp_label(thread.last_message_ts))
+                .size(11)
                 .color(crate::theme::TEXT_MUTED),
         ]
-        .spacing(4)
-        .width(Length::Fill),
+        .align_y(Alignment::Center)
+        .spacing(8),
+        text(&thread.subject)
+            .size(subject_size)
+            .color(crate::theme::TEXT),
+        text(&thread.snippet)
+            .size(12)
+            .color(crate::theme::TEXT_MUTED),
+        row![unread].spacing(6),
     ]
-    .spacing(8)
-    .padding(10)
+    .spacing(4)
     .width(Length::Fill);
 
-    button(crate::components::surface::row_surface(content, selected))
-        .style(iced::widget::button::text)
-        .padding(0)
-        .width(Length::Fill)
-        .on_press(Message::SelectThread(thread.id.clone()))
-        .into()
+    crate::components::list::message_row(
+        crate::components::avatar::view(&thread.sender, selected),
+        content,
+        selected,
+        Message::SelectThread(thread.id.clone()),
+    )
 }
 
 fn timestamp_label(timestamp: i64) -> &'static str {

@@ -62,6 +62,7 @@ cargo fmt
 The project is beyond a static shell. Preserve and extend these paths instead of reintroducing hard-coded UI state:
 
 - `courier-storage` initializes SQLite, stores accounts/mailboxes/threads/messages/bodies, maintains FTS rows, and can load thread bodies.
+- `courier-storage` can import raw RFC822 through `courier-mime`, persist the raw `.eml`, write attachment blobs/metadata, and expose attachment summaries.
 - `courier-storage` supports mailbox-scoped thread listing and search. `None` means unified inbox; `Some(MailboxId)` means the explicit mailbox.
 - `courier-storage` writes local user actions into `op_queue`. Mark-read and move/archive/trash must update local rows first, then enqueue an op.
 - `courier-sync::SyncScheduler::sync_now` converts pending local ops into `courier-adapter::RemoteOp`, applies them through a `MailRemote`, marks ops done after adapter success, then pulls remote mailbox deltas into local storage.
@@ -71,6 +72,8 @@ The project is beyond a static shell. Preserve and extend these paths instead of
 - `courier-ui` subscribes to engine events. Do not repopulate UI demo data directly in the UI layer.
 - `courier-ui` should display thread snapshots from `EngineEvent::ThreadsUpdated` directly. Search and mailbox filtering belong in app/storage, not in a second UI-only filter.
 - `courier-ui` renders selected message bodies through `courier-render`; HTML content must be sanitized by `courier-security` before it is shown.
+- `courier-ui` has a reusable component baseline modeled after Mailspring-style mail UI primitives: action bars, pane surfaces, outline/list rows, badges, avatars, form rows, notices, status pills, attachment chips, search, and empty states.
+- `courier-mime` has a dependency-light RFC822/MIME parser covering header unfolding, multipart boundaries, text/html body selection, base64, quoted-printable, RFC5987 filenames, and attachment extraction.
 
 ## Local-First Operation Contract
 
@@ -124,8 +127,8 @@ Major project areas still open:
 
 - Real account setup and identity management UI.
 - Real IMAP/SMTP, Gmail, Outlook, and JMAP adapter implementations.
-- Full MIME parsing from raw RFC822, including multipart nesting, transfer decoding, inline CIDs, and attachment extraction.
-- Attachment persistence, preview/open policy, and download lifecycle.
+- Production-grade MIME parsing for edge cases beyond the current built-in parser, including richer charsets, nested message/rfc822 parts, inline CID resolution, and malformed server payload recovery.
+- Attachment preview/open policy, download lifecycle, and reader integration for stored attachments.
 - Robust send queue retry/backoff beyond the current single `send_draft` path.
 - Incremental sync cursors per provider, mailbox discovery reconciliation, deletions, and conflict handling.
 - Account settings, trusted sender policy, and per-message remote image allow controls.
@@ -152,6 +155,8 @@ When adding UI:
 
 - Put reusable styling and layout wrappers in `components/`.
 - Keep view modules thin and focused on composing data into UI.
+- Prefer the existing components before adding view-local row/header/input styling.
+- Use `components/list.rs` for mailbox/thread row patterns, `components/form.rs` for composer fields, `components/notice.rs` for inline warnings/status, and `components/attachment.rs` for attachment/image placeholders.
 - Add new `Message` variants in `app.rs` only when an interaction needs app-level state or side effects.
 - Match the three-column mail client pattern already present: mailbox sidebar, thread list, reader/composer pane.
 - Prefer compact, utilitarian controls suitable for repeated desktop email workflows.

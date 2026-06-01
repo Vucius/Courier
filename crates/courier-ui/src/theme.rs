@@ -13,6 +13,11 @@ pub const BORDER: Color = rgb(210, 216, 224);
 pub const TEXT: Color = rgb(31, 35, 41);
 pub const TEXT_MUTED: Color = rgb(99, 108, 120);
 pub const ACCENT: Color = rgb(37, 99, 235);
+pub const ACCENT_MUTED: Color = rgb(159, 190, 246);
+pub const AVATAR: Color = rgb(226, 230, 236);
+pub const SUCCESS: Color = rgb(22, 125, 74);
+pub const WARNING: Color = rgb(171, 104, 10);
+pub const DANGER: Color = rgb(191, 45, 45);
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color {
