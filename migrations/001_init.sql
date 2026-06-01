@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_host   TEXT NOT NULL,
     smtp_port   INTEGER NOT NULL DEFAULT 587,
     auth_type   TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  INTEGER NOT NULL
 );
 

@@ -75,6 +75,14 @@ pub struct AccountConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountState {
+    pub id: AccountId,
+    pub email: String,
+    pub provider: ProviderKind,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxSummary {
     pub id: MailboxId,
     pub account_id: AccountId,
@@ -139,6 +147,8 @@ pub enum EngineCommand {
     ArchiveMessage(MessageId),
     MoveToTrash(MessageId),
     SaveAccount(AccountConfig),
+    SetAccountEnabled(AccountId, bool),
+    DeleteAccount(AccountId),
     SendMessage(DraftId),
     SaveDraft(DraftMessage),
     Snooze(MessageId, i64),
@@ -148,6 +158,7 @@ pub enum EngineCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineEvent {
     Ready,
+    AccountsUpdated(Vec<AccountState>),
     MailboxesUpdated(Vec<MailboxSummary>),
     AccountSaved(AccountSummary),
     SyncProgress {

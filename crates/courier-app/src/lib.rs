@@ -218,6 +218,30 @@ impl EngineRuntime {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
                 }
             },
+            EngineCommand::SetAccountEnabled(account_id, enabled) => {
+                match storage.set_account_enabled(&account_id, enabled) {
+                    Ok(()) => {
+                        tracing::info!(
+                            account_id = %account_id.0,
+                            enabled,
+                            "updated account enabled state"
+                        );
+                        self.publish_snapshot(storage);
+                    }
+                    Err(error) => {
+                        let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                    }
+                }
+            }
+            EngineCommand::DeleteAccount(account_id) => match storage.delete_account(&account_id) {
+                Ok(()) => {
+                    tracing::info!(account_id = %account_id.0, "deleted account");
+                    self.publish_snapshot(storage);
+                }
+                Err(error) => {
+                    let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                }
+            },
             EngineCommand::SendMessage(draft_id) => {
                 let task_id = TaskId(format!("send:{}", draft_id.0));
                 match sync.send_draft(draft_id).await {
@@ -263,6 +287,15 @@ impl EngineRuntime {
     }
 
     fn publish_snapshot(&self, storage: &Storage) {
+        match storage.list_accounts() {
+            Ok(accounts) => {
+                let _ = self.event_tx.send(EngineEvent::AccountsUpdated(accounts));
+            }
+            Err(error) => {
+                let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+
         match storage.list_mailboxes() {
             Ok(mailboxes) => {
                 let _ = self.event_tx.send(EngineEvent::MailboxesUpdated(mailboxes));

@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use courier_domain::SyncCursor;
 use courier_mime::{BodyKind, ParsedAttachment, parse_rfc822};
 use courier_proto::{
-    AccountConfig, AccountId, AccountSummary, AttachmentId, AttachmentSummary, AuthType, DraftId,
-    DraftMessage, MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind,
-    ThreadId, ThreadSummary,
+    AccountConfig, AccountId, AccountState, AccountSummary, AttachmentId, AttachmentSummary,
+    AuthType, DraftId, DraftMessage, MailboxId, MailboxRole, MailboxSummary, MessageBody,
+    MessageId, ProviderKind, ThreadId, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -79,6 +79,7 @@ impl Storage {
         let connection = rusqlite::Connection::open(&db_path)?;
         connection.execute_batch(include_str!("../../../migrations/001_init.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/002_search.sql"))?;
+        ensure_accounts_enabled_column(&connection)?;
         ensure_tasks_retry_columns(&connection)?;
 
         tracing::info!(path = %db_path.display(), "courier storage initialized");
@@ -90,12 +91,13 @@ impl Storage {
         connection.execute(
             r#"
             INSERT INTO accounts (
-                id, email, provider, imap_host, imap_port, smtp_host, smtp_port, auth_type, created_at
+                id, email, provider, imap_host, imap_port, smtp_host, smtp_port, auth_type, enabled, created_at
             )
-            VALUES (?1, ?2, ?3, '', 993, '', 587, ?4, unixepoch())
+            VALUES (?1, ?2, ?3, '', 993, '', 587, ?4, 1, unixepoch())
             ON CONFLICT(id) DO UPDATE SET
                 email = excluded.email,
-                provider = excluded.provider
+                provider = excluded.provider,
+                enabled = 1
             "#,
             params![
                 account.id.0,
@@ -112,9 +114,9 @@ impl Storage {
         connection.execute(
             r#"
             INSERT INTO accounts (
-                id, email, provider, imap_host, imap_port, smtp_host, smtp_port, auth_type, created_at
+                id, email, provider, imap_host, imap_port, smtp_host, smtp_port, auth_type, enabled, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, unixepoch())
             ON CONFLICT(id) DO UPDATE SET
                 email = excluded.email,
                 provider = excluded.provider,
@@ -122,7 +124,8 @@ impl Storage {
                 imap_port = excluded.imap_port,
                 smtp_host = excluded.smtp_host,
                 smtp_port = excluded.smtp_port,
-                auth_type = excluded.auth_type
+                auth_type = excluded.auth_type,
+                enabled = 1
             "#,
             params![
                 account.id.0,
@@ -136,6 +139,122 @@ impl Storage {
             ],
         )?;
         self.ensure_standard_mailboxes(&account.id)
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<AccountState>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, email, provider, enabled
+            FROM accounts
+            ORDER BY email COLLATE NOCASE, id
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            let provider: String = row.get(2)?;
+            Ok(AccountState {
+                id: AccountId(row.get(0)?),
+                email: row.get(1)?,
+                provider: provider_from_str(&provider),
+                enabled: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+
+        collect_rows(rows)
+    }
+
+    pub fn set_account_enabled(&self, account_id: &AccountId, enabled: bool) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE accounts SET enabled = ?2 WHERE id = ?1",
+            params![account_id.0, if enabled { 1 } else { 0 }],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_account(&self, account_id: &AccountId) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+
+        transaction.execute(
+            "DELETE FROM message_search_fts WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            DELETE FROM message_labels
+            WHERE message_id IN (
+                SELECT id FROM messages WHERE account_id = ?1
+            )
+            "#,
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            DELETE FROM attachments
+            WHERE message_id IN (
+                SELECT id FROM messages WHERE account_id = ?1
+            )
+            "#,
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            DELETE FROM message_bodies
+            WHERE message_id IN (
+                SELECT id FROM messages WHERE account_id = ?1
+            )
+            "#,
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            DELETE FROM message_mailboxes
+            WHERE message_id IN (
+                SELECT id FROM messages WHERE account_id = ?1
+            )
+            "#,
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM messages WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM threads WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM contacts WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM message_labels WHERE label_id IN (SELECT id FROM labels WHERE account_id = ?1)",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM labels WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM op_queue WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            DELETE FROM tasks
+            WHERE payload LIKE ?1
+            "#,
+            params![format!("%{}%", account_id.0)],
+        )?;
+        transaction.execute(
+            "DELETE FROM mailboxes WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute("DELETE FROM accounts WHERE id = ?1", params![account_id.0])?;
+
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn ensure_standard_mailboxes(&self, account_id: &AccountId) -> Result<()> {
@@ -180,10 +299,12 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             r#"
-            SELECT id, account_id, name, role, unread_count
-            FROM mailboxes
+            SELECT mb.id, mb.account_id, mb.name, mb.role, mb.unread_count
+            FROM mailboxes mb
+            JOIN accounts a ON a.id = mb.account_id
+            WHERE a.enabled = 1
             ORDER BY
-                CASE role
+                CASE mb.role
                     WHEN 'inbox' THEN 0
                     WHEN 'drafts' THEN 1
                     WHEN 'sent' THEN 2
@@ -192,7 +313,7 @@ impl Storage {
                     WHEN 'trash' THEN 5
                     ELSE 6
                 END,
-                name COLLATE NOCASE
+                mb.name COLLATE NOCASE
             "#,
         )?;
 
@@ -1033,6 +1154,7 @@ SELECT
     CASE WHEN t.unread_count > 0 THEN 1 ELSE 0 END,
     t.last_message_ts
 FROM threads t
+JOIN accounts a ON a.id = t.account_id
 LEFT JOIN messages m ON m.id = (
     SELECT latest.id
     FROM messages latest
@@ -1045,6 +1167,7 @@ LEFT JOIN messages m ON m.id = (
     LIMIT 1
 )
 WHERE m.id IS NOT NULL
+  AND a.enabled = 1
 ORDER BY t.last_message_ts DESC
 "#;
 
@@ -1058,6 +1181,7 @@ SELECT
     CASE WHEN t.unread_count > 0 THEN 1 ELSE 0 END,
     t.last_message_ts
 FROM threads t
+JOIN accounts a ON a.id = t.account_id
 LEFT JOIN messages m ON m.id = (
     SELECT latest.id
     FROM messages latest
@@ -1068,6 +1192,7 @@ LEFT JOIN messages m ON m.id = (
     LIMIT 1
 )
 WHERE m.id IS NOT NULL
+  AND a.enabled = 1
 ORDER BY t.last_message_ts DESC
 "#;
 
@@ -1083,11 +1208,13 @@ SELECT DISTINCT
 FROM message_search_fts fts
 JOIN messages m ON m.id = fts.message_id
 JOIN threads t ON t.id = m.thread_id
+JOIN accounts a ON a.id = t.account_id
 JOIN message_mailboxes mm ON mm.message_id = m.id
 JOIN mailboxes mb ON mb.id = mm.mailbox_id
 WHERE message_search_fts MATCH ?1
   AND mb.role = 'inbox'
   AND (m.flags & 4) = 0
+  AND a.enabled = 1
 ORDER BY t.last_message_ts DESC
 "#;
 
@@ -1103,9 +1230,11 @@ SELECT DISTINCT
 FROM message_search_fts fts
 JOIN messages m ON m.id = fts.message_id
 JOIN threads t ON t.id = m.thread_id
+JOIN accounts a ON a.id = t.account_id
 JOIN message_mailboxes mm ON mm.message_id = m.id
 WHERE message_search_fts MATCH ?1
   AND mm.mailbox_id = ?2
+  AND a.enabled = 1
 ORDER BY t.last_message_ts DESC
 "#;
 
@@ -1167,6 +1296,15 @@ fn provider_to_str(provider: &ProviderKind) -> &'static str {
         ProviderKind::Gmail => "gmail",
         ProviderKind::Outlook => "outlook",
         ProviderKind::Jmap => "jmap",
+    }
+}
+
+fn provider_from_str(provider: &str) -> ProviderKind {
+    match provider {
+        "gmail" => ProviderKind::Gmail,
+        "outlook" => ProviderKind::Outlook,
+        "jmap" => ProviderKind::Jmap,
+        _ => ProviderKind::GenericImap,
     }
 }
 
@@ -1398,6 +1536,16 @@ fn has_pending_op_for_message(
     }
 
     Ok(false)
+}
+
+fn ensure_accounts_enabled_column(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "accounts", "enabled")? {
+        connection.execute(
+            "ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_tasks_retry_columns(connection: &Connection) -> Result<()> {
@@ -1644,6 +1792,11 @@ mod tests {
             .upsert_account_config(&account)
             .expect("upsert account config");
 
+        let accounts = storage.list_accounts().expect("list accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].email, "configured@example.test");
+        assert!(accounts[0].enabled);
+
         let mailboxes = storage.list_mailboxes().expect("list mailboxes");
         assert_eq!(mailboxes.len(), 5);
         assert!(
@@ -1671,6 +1824,32 @@ mod tests {
                 .iter()
                 .any(|mailbox| matches!(mailbox.role, MailboxRole::Trash))
         );
+
+        storage
+            .set_account_enabled(&account.id, false)
+            .expect("disable account");
+        assert!(!storage.list_accounts().expect("list disabled account")[0].enabled);
+        assert!(
+            storage
+                .list_mailboxes()
+                .expect("disabled account hides mailboxes")
+                .is_empty()
+        );
+
+        storage
+            .set_account_enabled(&account.id, true)
+            .expect("enable account");
+        assert_eq!(
+            storage
+                .list_mailboxes()
+                .expect("enabled account shows mailboxes")
+                .len(),
+            5
+        );
+
+        storage.delete_account(&account.id).expect("delete account");
+        assert!(storage.list_accounts().expect("list accounts").is_empty());
+        assert!(storage.list_mailboxes().expect("list mailboxes").is_empty());
 
         std::fs::remove_dir_all(data_dir).expect("remove test data");
     }

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
-    AccountConfig, AccountId, AuthType, DraftId, DraftMessage, EngineCommand, EngineEvent,
-    MailboxId, MailboxSummary, MessageBody, ProviderKind, ThreadId, ThreadSummary,
+    AccountConfig, AccountId, AccountState, AuthType, DraftId, DraftMessage, EngineCommand,
+    EngineEvent, MailboxId, MailboxSummary, MessageBody, ProviderKind, ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
@@ -33,10 +33,13 @@ pub enum Message {
     AccountSmtpHostChanged(String),
     AccountSmtpPortChanged(String),
     SaveAccount,
+    ToggleAccountEnabled(AccountId, bool),
+    DeleteAccount(AccountId),
 }
 
 pub struct App {
     engine: EngineHandle,
+    accounts: Vec<AccountState>,
     mailboxes: Vec<MailboxSummary>,
     threads: Vec<ThreadSummary>,
     selected_mailbox_id: Option<MailboxId>,
@@ -63,6 +66,7 @@ pub fn init() -> (App, Task<Message>) {
 
     let app = App {
         engine,
+        accounts: Vec::new(),
         mailboxes: Vec::new(),
         threads: Vec::new(),
         selected_mailbox_id: None,
@@ -303,6 +307,32 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::ToggleAccountEnabled(account_id, enabled) => {
+            let engine = app.engine.clone();
+            app.status = if enabled {
+                "Enabling account".to_string()
+            } else {
+                "Disabling account".to_string()
+            };
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::SetAccountEnabled(account_id, enabled))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::DeleteAccount(account_id) => {
+            let engine = app.engine.clone();
+            app.status = "Deleting account".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::DeleteAccount(account_id)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
     }
 }
 
@@ -336,6 +366,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     );
     let reader = if app.account_setup_visible {
         column![crate::views::account_setup::view(
+            &app.accounts,
             &app.account_email,
             &app.account_imap_host,
             &app.account_imap_port,
@@ -403,6 +434,10 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
     match event {
         EngineEvent::Ready => {
             app.status = "Engine ready".to_string();
+        }
+        EngineEvent::AccountsUpdated(accounts) => {
+            app.accounts = accounts;
+            app.status = "Accounts loaded".to_string();
         }
         EngineEvent::MailboxesUpdated(mailboxes) => {
             app.mailboxes = mailboxes;
