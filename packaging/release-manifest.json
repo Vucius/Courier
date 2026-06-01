@@ -1,0 +1,23 @@
+{
+  "name": "Courier",
+  "binary": "courier-ui",
+  "bundle_identifier": "dev.hephaestus.courier",
+  "publisher": "Hephaestus",
+  "license": "MIT",
+  "database_schema": 2,
+  "config_schema": 1,
+  "artifacts": {
+    "windows": {
+      "binary": "courier-ui.exe",
+      "installer": "pending-msi"
+    },
+    "linux": {
+      "binary": "courier-ui",
+      "installer": "pending-appimage-or-deb"
+    },
+    "macos": {
+      "bundle": "pending-app",
+      "dmg": "pending-dmg"
+    }
+  }
+}

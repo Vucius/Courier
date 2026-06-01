@@ -11,7 +11,8 @@ pub enum NoticeKind {
     Error,
 }
 
-pub fn inline<'a>(kind: NoticeKind, message: &'a str) -> Element<'a, Message> {
+pub fn inline<'a>(kind: NoticeKind, message: impl Into<String>) -> Element<'a, Message> {
+    let message = message.into();
     let (accent, label) = match kind {
         NoticeKind::Info => (crate::theme::ACCENT, "Info"),
         NoticeKind::Warning => (crate::theme::WARNING, "Warning"),

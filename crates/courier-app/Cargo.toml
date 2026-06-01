@@ -9,6 +9,7 @@ courier-domain.workspace = true
 courier-proto.workspace = true
 courier-render.workspace = true
 courier-search.workspace = true
+courier-security.workspace = true
 courier-storage.workspace = true
 courier-sync.workspace = true
 thiserror.workspace = true

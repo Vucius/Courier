@@ -5,7 +5,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use courier_domain::SyncCursor;
-use courier_proto::{AccountConfig, MailboxId, MessageId, ProviderKind, ThreadId};
+use courier_proto::{AccountConfig, AuthType, MailboxId, MessageId, ProviderKind, ThreadId};
+use courier_provider::{
+    AuthMechanism, ProviderCapabilities, ProviderEndpoint, TransportSecurity, capabilities_for,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -13,6 +16,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("remote capability is not implemented: {0}")]
     NotImplemented(&'static str),
+    #[error("provider endpoint is missing: {0}")]
+    MissingEndpoint(&'static str),
+    #[error("account auth is not supported by provider: {0}")]
+    UnsupportedAuth(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +32,8 @@ pub struct RemoteMailbox {
 pub struct RemoteDelta {
     pub cursor: SyncCursor,
     pub messages: Vec<RemoteMessage>,
+    pub deleted_messages: Vec<MessageId>,
+    pub moved_messages: Vec<RemoteMove>,
 }
 
 impl RemoteDelta {
@@ -32,11 +41,21 @@ impl RemoteDelta {
         Self {
             cursor,
             messages: Vec::new(),
+            deleted_messages: Vec::new(),
+            moved_messages: Vec::new(),
         }
     }
 
     pub fn new_message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    pub fn deleted_message_count(&self) -> usize {
+        self.deleted_messages.len()
+    }
+
+    pub fn moved_message_count(&self) -> usize {
+        self.moved_messages.len()
     }
 }
 
@@ -52,6 +71,12 @@ pub struct RemoteMessage {
     pub content_type: String,
     pub timestamp: i64,
     pub read: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMove {
+    pub message_id: MessageId,
+    pub target_mailbox_id: MailboxId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,21 +121,143 @@ pub trait MailRemote {
 #[derive(Debug, Clone)]
 pub struct ImapSmtpRemote {
     account: AccountConfig,
+    plan: ProtocolConnectionPlan,
 }
 
 #[derive(Debug, Clone)]
 pub struct GmailRemote {
     account: AccountConfig,
+    plan: ProtocolConnectionPlan,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutlookRemote {
     account: AccountConfig,
+    plan: ProtocolConnectionPlan,
 }
 
 #[derive(Debug, Clone)]
 pub struct JmapRemote {
     account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolTransport {
+    ImapSmtp,
+    GmailImapSmtp,
+    OutlookImapSmtp,
+    Jmap,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProtocolConnectionPlan {
+    pub provider: ProviderKind,
+    pub transport: ProtocolTransport,
+    pub capabilities: ProviderCapabilities,
+    pub imap_endpoint: Option<ProviderEndpoint>,
+    pub smtp_endpoint: Option<ProviderEndpoint>,
+    pub jmap_endpoint: Option<ProviderEndpoint>,
+    pub auth_mechanisms: Vec<AuthMechanism>,
+}
+
+fn auth_supported(account: &AccountConfig, auth_mechanisms: &[AuthMechanism]) -> bool {
+    match &account.auth_type {
+        AuthType::Password => auth_mechanisms.contains(&AuthMechanism::Password),
+        AuthType::OAuth2 => auth_mechanisms
+            .iter()
+            .any(|mechanism| !matches!(mechanism, AuthMechanism::Password)),
+    }
+}
+
+fn endpoint_from_account_imap(account: &AccountConfig) -> Result<Option<ProviderEndpoint>> {
+    if account.imap_host.trim().is_empty() {
+        return Err(Error::MissingEndpoint("imap"));
+    }
+
+    Ok(Some(ProviderEndpoint {
+        host: account.imap_host.trim().to_string(),
+        port: account.imap_port,
+        security: if account.imap_port == 143 {
+            TransportSecurity::StartTls
+        } else {
+            TransportSecurity::Tls
+        },
+    }))
+}
+
+fn endpoint_from_account_smtp(account: &AccountConfig) -> Result<Option<ProviderEndpoint>> {
+    if account.smtp_host.trim().is_empty() {
+        return Err(Error::MissingEndpoint("smtp"));
+    }
+
+    Ok(Some(ProviderEndpoint {
+        host: account.smtp_host.trim().to_string(),
+        port: account.smtp_port,
+        security: if account.smtp_port == 465 {
+            TransportSecurity::Tls
+        } else {
+            TransportSecurity::StartTls
+        },
+    }))
+}
+
+fn fallback_plan(account: &AccountConfig, transport: ProtocolTransport) -> ProtocolConnectionPlan {
+    let capabilities = capabilities_for(&account.provider);
+    ProtocolConnectionPlan {
+        provider: account.provider.clone(),
+        transport,
+        imap_endpoint: capabilities.imap_endpoint.clone(),
+        smtp_endpoint: capabilities.smtp_endpoint.clone(),
+        jmap_endpoint: capabilities.jmap_endpoint.clone(),
+        auth_mechanisms: capabilities.auth_mechanisms.clone(),
+        capabilities,
+    }
+}
+
+impl ProtocolConnectionPlan {
+    pub fn from_account(account: &AccountConfig) -> Result<Self> {
+        let capabilities = capabilities_for(&account.provider);
+        let auth_mechanisms = capabilities.auth_mechanisms.clone();
+        if !auth_supported(account, &auth_mechanisms) {
+            return Err(Error::UnsupportedAuth(match account.provider {
+                ProviderKind::GenericImap => "generic imap",
+                ProviderKind::Gmail => "gmail",
+                ProviderKind::Outlook => "outlook",
+                ProviderKind::Jmap => "jmap",
+            }));
+        }
+
+        let imap_endpoint = match account.provider {
+            ProviderKind::GenericImap => endpoint_from_account_imap(account)?,
+            _ => capabilities.imap_endpoint.clone(),
+        };
+        let smtp_endpoint = match account.provider {
+            ProviderKind::GenericImap => endpoint_from_account_smtp(account)?,
+            _ => capabilities.smtp_endpoint.clone(),
+        };
+        let jmap_endpoint = capabilities.jmap_endpoint.clone();
+        let transport = match account.provider {
+            ProviderKind::GenericImap => ProtocolTransport::ImapSmtp,
+            ProviderKind::Gmail => ProtocolTransport::GmailImapSmtp,
+            ProviderKind::Outlook => ProtocolTransport::OutlookImapSmtp,
+            ProviderKind::Jmap => ProtocolTransport::Jmap,
+        };
+
+        Ok(Self {
+            provider: account.provider.clone(),
+            transport,
+            capabilities,
+            imap_endpoint,
+            smtp_endpoint,
+            jmap_endpoint,
+            auth_mechanisms,
+        })
+    }
+
+    pub fn requires_oauth2(&self) -> bool {
+        !self.capabilities.supports_password && self.capabilities.supports_oauth2
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,41 +286,65 @@ impl ConfiguredRemote {
 
 impl ImapSmtpRemote {
     pub fn new(account: AccountConfig) -> Self {
-        Self { account }
+        let plan = ProtocolConnectionPlan::from_account(&account)
+            .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::ImapSmtp));
+        Self { account, plan }
     }
 
     pub fn account(&self) -> &AccountConfig {
         &self.account
+    }
+
+    pub fn plan(&self) -> &ProtocolConnectionPlan {
+        &self.plan
     }
 }
 
 impl GmailRemote {
     pub fn new(account: AccountConfig) -> Self {
-        Self { account }
+        let plan = ProtocolConnectionPlan::from_account(&account)
+            .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::GmailImapSmtp));
+        Self { account, plan }
     }
 
     pub fn account(&self) -> &AccountConfig {
         &self.account
+    }
+
+    pub fn plan(&self) -> &ProtocolConnectionPlan {
+        &self.plan
     }
 }
 
 impl OutlookRemote {
     pub fn new(account: AccountConfig) -> Self {
-        Self { account }
+        let plan = ProtocolConnectionPlan::from_account(&account)
+            .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::OutlookImapSmtp));
+        Self { account, plan }
     }
 
     pub fn account(&self) -> &AccountConfig {
         &self.account
+    }
+
+    pub fn plan(&self) -> &ProtocolConnectionPlan {
+        &self.plan
     }
 }
 
 impl JmapRemote {
     pub fn new(account: AccountConfig) -> Self {
-        Self { account }
+        let plan = ProtocolConnectionPlan::from_account(&account)
+            .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::Jmap));
+        Self { account, plan }
     }
 
     pub fn account(&self) -> &AccountConfig {
         &self.account
+    }
+
+    pub fn plan(&self) -> &ProtocolConnectionPlan {
+        &self.plan
     }
 }
 
@@ -496,6 +667,37 @@ mod tests {
             ConfiguredRemote::from_account_config(account_config(ProviderKind::Jmap)),
             ConfiguredRemote::Jmap(_)
         ));
+    }
+
+    #[test]
+    fn generic_imap_plan_uses_account_endpoints() {
+        let account = account_config(ProviderKind::GenericImap);
+        let plan = ProtocolConnectionPlan::from_account(&account).expect("connection plan");
+
+        assert!(matches!(plan.transport, ProtocolTransport::ImapSmtp));
+        assert_eq!(
+            plan.imap_endpoint.as_ref().expect("imap endpoint").host,
+            "imap.example.test"
+        );
+        assert_eq!(
+            plan.smtp_endpoint.as_ref().expect("smtp endpoint").host,
+            "smtp.example.test"
+        );
+        assert!(!plan.requires_oauth2());
+    }
+
+    #[test]
+    fn gmail_plan_requires_oauth2() {
+        let mut account = account_config(ProviderKind::Gmail);
+        account.auth_type = AuthType::OAuth2;
+        let plan = ProtocolConnectionPlan::from_account(&account).expect("gmail plan");
+
+        assert!(matches!(plan.transport, ProtocolTransport::GmailImapSmtp));
+        assert!(plan.requires_oauth2());
+        assert_eq!(
+            plan.imap_endpoint.as_ref().expect("gmail imap").host,
+            "imap.gmail.com"
+        );
     }
 
     fn account_config(provider: ProviderKind) -> AccountConfig {

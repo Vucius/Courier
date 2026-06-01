@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use courier_domain::SyncCursor;
 use courier_mime::{BodyKind, ParsedAttachment, parse_rfc822};
 use courier_proto::{
-    AccountConfig, AccountId, AccountState, AccountSummary, AttachmentId, AttachmentSummary,
-    AuthType, DraftId, DraftMessage, IdentityConfig, IdentityId, IdentitySummary, MailboxId,
-    MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind, ThreadId, ThreadSummary,
+    AccountConfig, AccountId, AccountState, AccountSummary, AttachmentId, AttachmentPreview,
+    AttachmentPreviewKind, AttachmentSummary, AuthType, ConflictSummary, DraftId, DraftMessage,
+    IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxRole, MailboxSummary,
+    MessageBody, MessageId, ProviderKind, SendQueueItem, TaskId, ThreadId, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -444,6 +445,60 @@ impl Storage {
         Ok(())
     }
 
+    pub fn reset_mailbox_for_uidvalidity_change(
+        &self,
+        mailbox_id: &MailboxId,
+    ) -> Result<Vec<MessageId>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let conflicted = local_pending_message_ids_for_mailbox(&transaction, mailbox_id)?;
+
+        for message_id in &conflicted {
+            transaction.execute(
+                "UPDATE messages SET conflict_state = 'conflicted' WHERE id = ?1",
+                params![message_id.0],
+            )?;
+        }
+
+        transaction.execute(
+            r#"
+            DELETE FROM message_search_fts
+            WHERE mailbox_id = ?1
+              AND message_id NOT IN (
+                  SELECT m.id
+                  FROM messages m
+                  WHERE m.conflict_state = 'conflicted'
+              )
+            "#,
+            params![mailbox_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            DELETE FROM message_mailboxes
+            WHERE mailbox_id = ?1
+              AND message_id NOT IN (
+                  SELECT m.id
+                  FROM messages m
+                  WHERE m.conflict_state = 'conflicted'
+              )
+            "#,
+            params![mailbox_id.0],
+        )?;
+        transaction.execute(
+            r#"
+            UPDATE mailboxes
+            SET last_uid = 0,
+                highest_modseq = NULL
+            WHERE id = ?1
+            "#,
+            params![mailbox_id.0],
+        )?;
+
+        transaction.commit()?;
+        self.recount_threads()?;
+        Ok(conflicted)
+    }
+
     pub fn upsert_thread(&self, thread: &ThreadSummary) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -727,6 +782,90 @@ impl Storage {
         Ok(())
     }
 
+    pub fn list_conflicts(&self) -> Result<Vec<ConflictSummary>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT m.id, m.thread_id, m.subject
+            FROM messages m
+            JOIN accounts a ON a.id = m.account_id
+            WHERE m.conflict_state = 'conflicted'
+              AND a.enabled = 1
+            ORDER BY m.timestamp DESC, m.id DESC
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ConflictSummary {
+                message_id: MessageId(row.get(0)?),
+                thread_id: ThreadId(row.get(1)?),
+                subject: row.get(2)?,
+                reason: "Remote change conflicted with pending local work".to_string(),
+            })
+        })?;
+
+        collect_rows(rows)
+    }
+
+    pub fn apply_remote_delete(
+        &self,
+        mailbox_id: &MailboxId,
+        message_id: &MessageId,
+    ) -> Result<bool> {
+        if self
+            .message_conflict_state(message_id)?
+            .is_some_and(|state| state == "local_pending")
+        {
+            self.mark_message_conflicted(message_id)?;
+            return Ok(false);
+        }
+
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM message_mailboxes WHERE mailbox_id = ?1 AND message_id = ?2",
+            params![mailbox_id.0, message_id.0],
+        )?;
+        connection.execute(
+            "DELETE FROM message_search_fts WHERE mailbox_id = ?1 AND message_id = ?2",
+            params![mailbox_id.0, message_id.0],
+        )?;
+        self.recount_threads()?;
+        Ok(true)
+    }
+
+    pub fn apply_remote_move(
+        &self,
+        source_mailbox_id: &MailboxId,
+        target_mailbox_id: &MailboxId,
+        message_id: &MessageId,
+    ) -> Result<bool> {
+        if self
+            .message_conflict_state(message_id)?
+            .is_some_and(|state| state == "local_pending")
+        {
+            self.mark_message_conflicted(message_id)?;
+            return Ok(false);
+        }
+
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM message_mailboxes WHERE mailbox_id = ?1 AND message_id = ?2",
+            params![source_mailbox_id.0, message_id.0],
+        )?;
+        connection.execute(
+            r#"
+            INSERT OR IGNORE INTO message_mailboxes (message_id, mailbox_id, remote_uid)
+            VALUES (?1, ?2, NULL)
+            "#,
+            params![message_id.0, target_mailbox_id.0],
+        )?;
+        connection.execute(
+            "UPDATE message_search_fts SET mailbox_id = ?2 WHERE mailbox_id = ?1 AND message_id = ?3",
+            params![source_mailbox_id.0, target_mailbox_id.0, message_id.0],
+        )?;
+        self.recount_threads()?;
+        Ok(true)
+    }
+
     pub fn list_attachments(&self, message_id: &MessageId) -> Result<Vec<StoredAttachment>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -748,6 +887,86 @@ impl Storage {
         })?;
 
         collect_rows(rows)
+    }
+
+    pub fn attachment_by_id(
+        &self,
+        attachment_id: &AttachmentId,
+    ) -> Result<Option<StoredAttachment>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                r#"
+                SELECT id, filename, mime_type, size, blob_path
+                FROM attachments
+                WHERE id = ?1
+                "#,
+                params![attachment_id.0],
+                |row| {
+                    Ok(StoredAttachment {
+                        id: AttachmentId(row.get(0)?),
+                        filename: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        size: row.get::<_, i64>(3)?.max(0) as u64,
+                        blob_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    pub fn attachment_preview(
+        &self,
+        attachment_id: &AttachmentId,
+        max_text_bytes: u64,
+    ) -> Result<Option<AttachmentPreview>> {
+        let Some(attachment) = self.attachment_by_id(attachment_id)? else {
+            return Ok(None);
+        };
+        let summary = AttachmentSummary::from(attachment.clone());
+        let Some(relative_path) = attachment.blob_path.as_ref() else {
+            return Ok(Some(AttachmentPreview {
+                attachment: summary,
+                kind: AttachmentPreviewKind::MissingBlob,
+                content: None,
+                path: None,
+                message: "Attachment file is not available locally".to_string(),
+            }));
+        };
+
+        let absolute_path = self.data_dir.join(relative_path);
+        let path = Some(absolute_path.to_string_lossy().into_owned());
+        let mime_type = attachment.mime_type.to_ascii_lowercase();
+
+        if mime_type.starts_with("text/") && attachment.size <= max_text_bytes {
+            let content = std::fs::read_to_string(&absolute_path)?;
+            return Ok(Some(AttachmentPreview {
+                attachment: summary,
+                kind: AttachmentPreviewKind::Text,
+                content: Some(content),
+                path,
+                message: "Text preview loaded".to_string(),
+            }));
+        }
+
+        if mime_type.starts_with("image/") {
+            return Ok(Some(AttachmentPreview {
+                attachment: summary,
+                kind: AttachmentPreviewKind::Image,
+                content: None,
+                path,
+                message: "Image attachment is ready for inline preview".to_string(),
+            }));
+        }
+
+        Ok(Some(AttachmentPreview {
+            attachment: summary,
+            kind: AttachmentPreviewKind::Unsupported,
+            content: None,
+            path,
+            message: "No inline preview is available for this attachment type".to_string(),
+        }))
     }
 
     pub fn mark_message_read(&self, message_id: &MessageId, read: bool) -> Result<()> {
@@ -983,6 +1202,51 @@ impl Storage {
             .map_err(Error::from)
     }
 
+    pub fn list_send_queue(&self) -> Result<Vec<SendQueueItem>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, payload, status, retry_count, last_error, run_at
+            FROM tasks
+            WHERE task_type = 'draft'
+              AND status IN ('pending', 'sending', 'failed', 'cancelled')
+            ORDER BY
+                CASE status
+                    WHEN 'sending' THEN 0
+                    WHEN 'pending' THEN 1
+                    WHEN 'failed' THEN 2
+                    ELSE 3
+                END,
+                run_at ASC,
+                id ASC
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let draft: DraftMessage = serde_json::from_str(&payload).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(SendQueueItem {
+                task_id: TaskId(format!("send:{id}")),
+                draft_id: DraftId(id),
+                account_id: draft.account_id,
+                to: draft.to,
+                subject: draft.subject,
+                status: row.get(2)?,
+                retry_count: row.get::<_, i64>(3)?.max(0) as u32,
+                last_error: row.get(4)?,
+                run_at: row.get(5)?,
+            })
+        })?;
+
+        collect_rows(rows)
+    }
+
     pub fn mark_draft_sending(&self, draft_id: &DraftId) -> Result<()> {
         self.mark_draft_status(draft_id, "sending")
     }
@@ -1022,6 +1286,26 @@ impl Storage {
             params![draft_id.0, error],
         )?;
         Ok(())
+    }
+
+    pub fn mark_draft_pending_now(&self, draft_id: &DraftId) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            UPDATE tasks
+            SET status = 'pending',
+                run_at = unixepoch(),
+                last_error = NULL
+            WHERE id = ?1
+              AND task_type = 'draft'
+            "#,
+            params![draft_id.0],
+        )?;
+        Ok(())
+    }
+
+    pub fn cancel_draft_send(&self, draft_id: &DraftId) -> Result<()> {
+        self.mark_draft_status(draft_id, "cancelled")
     }
 
     pub fn persist_sent_draft(
@@ -1582,6 +1866,27 @@ fn message_id_from_op_payload(payload: &str) -> Result<Option<MessageId>> {
         .get("message_id")
         .and_then(|value| value.as_str())
         .map(|value| MessageId(value.to_string())))
+}
+
+fn local_pending_message_ids_for_mailbox(
+    connection: &Connection,
+    mailbox_id: &MailboxId,
+) -> Result<Vec<MessageId>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT m.id
+        FROM messages m
+        JOIN message_mailboxes mm ON mm.message_id = m.id
+        WHERE mm.mailbox_id = ?1
+          AND m.conflict_state = 'local_pending'
+        ORDER BY m.timestamp DESC, m.id DESC
+        "#,
+    )?;
+    let rows = statement.query_map(params![mailbox_id.0], |row| {
+        Ok(MessageId(row.get::<_, String>(0)?))
+    })?;
+
+    collect_rows(rows)
 }
 
 fn has_pending_op_for_message(

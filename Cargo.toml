@@ -20,6 +20,15 @@ edition = "2024"
 license = "MIT"
 repository = ""
 
+[workspace.metadata.courier]
+app_name = "Courier"
+bundle_identifier = "dev.hephaestus.courier"
+publisher = "Hephaestus"
+summary = "Local-first desktop email client"
+data_dir_name = ".courier"
+config_schema = 1
+database_schema = 2
+
 [workspace.dependencies]
 anyhow = "1"
 courier-adapter = { path = "crates/courier-adapter" }

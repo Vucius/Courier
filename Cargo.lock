@@ -656,6 +656,7 @@ dependencies = [
  "courier-proto",
  "courier-render",
  "courier-search",
+ "courier-security",
  "courier-storage",
  "courier-sync",
  "thiserror 2.0.18",

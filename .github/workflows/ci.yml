@@ -46,12 +46,23 @@ jobs:
       - name: Build release desktop binary
         run: cargo build -p courier-ui --release --locked
 
+      - name: Stage release metadata
+        shell: bash
+        run: |
+          mkdir -p target/release/package
+          cp packaging/courier.app.toml target/release/package/
+          cp packaging/release-manifest.json target/release/package/
+          cp packaging/migrations.md target/release/package/
+          cp README.md LICENSE target/release/package/
+
       - name: Upload release binary (Windows)
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: courier-ui-windows
-          path: target/release/courier-ui.exe
+          path: |
+            target/release/courier-ui.exe
+            target/release/package/**
           if-no-files-found: error
 
       - name: Upload release binary (Linux)
@@ -59,5 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: courier-ui-linux
-          path: target/release/courier-ui
+          path: |
+            target/release/courier-ui
+            target/release/package/**
           if-no-files-found: error

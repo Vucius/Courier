@@ -2,13 +2,14 @@ use std::path::PathBuf;
 
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
-    AccountConfig, AccountId, AccountState, AuthType, DraftId, DraftMessage, EngineCommand,
+    AccountConfig, AccountId, AccountState, AttachmentId, AttachmentOpenRequest, AttachmentPreview,
+    AuthType, ConflictSummary, DesktopNotification, DraftId, DraftMessage, EngineCommand,
     EngineEvent, IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxSummary,
-    MessageBody, ProviderKind, ThreadId, ThreadSummary,
+    MessageBody, NotificationKind, ProviderKind, SendQueueItem, ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
-use iced::widget::{column, row};
+use iced::widget::{column, container, row, text};
 use iced::{Element, Length, Subscription, Task, Theme};
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,12 @@ pub enum Message {
     DraftSubjectChanged(String),
     DraftBodyChanged(String),
     SendDraft,
+    RetrySend(DraftId),
+    CancelSend(DraftId),
+    PreviewAttachment(AttachmentId),
+    OpenAttachment(AttachmentId),
+    DismissAttachmentNotice,
+    ClearNotifications,
     AccountEmailChanged(String),
     AccountImapHostChanged(String),
     AccountImapPortChanged(String),
@@ -55,6 +62,12 @@ pub struct App {
     selected_thread: Option<ThreadId>,
     selected_body: Option<MessageBody>,
     selected_render: Option<RenderTree>,
+    attachment_preview: Option<AttachmentPreview>,
+    attachment_open: Option<AttachmentOpenRequest>,
+    send_queue: Vec<SendQueueItem>,
+    conflicts: Vec<ConflictSummary>,
+    notifications: Vec<DesktopNotification>,
+    unread_notifications: u32,
     search_query: String,
     draft_to: String,
     draft_subject: String,
@@ -87,6 +100,12 @@ pub fn init() -> (App, Task<Message>) {
         selected_thread: None,
         selected_body: None,
         selected_render: None,
+        attachment_preview: None,
+        attachment_open: None,
+        send_queue: Vec::new(),
+        conflicts: Vec::new(),
+        notifications: Vec::new(),
+        unread_notifications: 0,
         search_query: String::new(),
         draft_to: String::new(),
         draft_subject: String::new(),
@@ -132,6 +151,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.selected_mailbox_name = name.clone();
             app.selected_body = None;
             app.selected_render = None;
+            app.attachment_preview = None;
+            app.attachment_open = None;
             app.selected_thread = None;
             app.status = format!("{name} selected");
 
@@ -152,6 +173,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             reset_account_form(app);
             app.selected_body = None;
             app.selected_render = None;
+            app.attachment_preview = None;
+            app.attachment_open = None;
             app.selected_thread = None;
             app.status = "Account setup ready".to_string();
             Task::none()
@@ -167,6 +190,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 let message_id = body.id.clone();
                 app.selected_body = None;
                 app.selected_render = None;
+                app.attachment_preview = None;
+                app.attachment_open = None;
                 app.selected_thread = None;
                 app.status = "Archive queued".to_string();
                 Task::perform(
@@ -202,6 +227,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 let message_id = body.id.clone();
                 app.selected_body = None;
                 app.selected_render = None;
+                app.attachment_preview = None;
+                app.attachment_open = None;
                 app.selected_thread = None;
                 app.status = "Move to trash queued".to_string();
                 Task::perform(
@@ -231,6 +258,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SelectThread(thread_id) => {
             app.account_setup_visible = false;
             app.selected_thread = Some(thread_id.clone());
+            app.attachment_preview = None;
+            app.attachment_open = None;
             app.status = "Loading message".to_string();
             let engine = app.engine.clone();
             Task::perform(
@@ -281,6 +310,61 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     |_| Message::SyncQueued,
                 )
             }
+        }
+        Message::RetrySend(draft_id) => {
+            let engine = app.engine.clone();
+            app.status = "Retrying send".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::RetrySend(draft_id)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::CancelSend(draft_id) => {
+            let engine = app.engine.clone();
+            app.status = "Cancelling send".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::CancelSend(draft_id)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::PreviewAttachment(attachment_id) => {
+            let engine = app.engine.clone();
+            app.status = "Loading attachment preview".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::PreviewAttachment(attachment_id))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::OpenAttachment(attachment_id) => {
+            let engine = app.engine.clone();
+            app.status = "Checking attachment policy".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::OpenAttachment(attachment_id))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::DismissAttachmentNotice => {
+            app.attachment_preview = None;
+            app.attachment_open = None;
+            Task::none()
+        }
+        Message::ClearNotifications => {
+            app.notifications.clear();
+            app.unread_notifications = 0;
+            app.status = "Notifications cleared".to_string();
+            Task::none()
         }
         Message::AccountEmailChanged(value) => {
             app.account_email = value;
@@ -485,12 +569,29 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .height(Length::Fill)
         .spacing(10)
     } else {
-        column![
-            crate::views::reader::view(app.selected_body.as_ref(), app.selected_render.as_ref()),
-            crate::views::composer::view(&app.draft_to, &app.draft_subject, &app.draft_body,)
-        ]
-        .height(Length::Fill)
-        .spacing(10)
+        let mut reader_stack = column![].height(Length::Fill).spacing(10);
+        if !app.conflicts.is_empty() {
+            reader_stack = reader_stack.push(conflicts_view(&app.conflicts));
+        }
+        if !app.notifications.is_empty() {
+            reader_stack = reader_stack.push(notifications_view(
+                &app.notifications,
+                app.unread_notifications,
+            ));
+        }
+        reader_stack = reader_stack.push(crate::views::reader::view(
+            app.selected_body.as_ref(),
+            app.selected_render.as_ref(),
+            app.attachment_preview.as_ref(),
+            app.attachment_open.as_ref(),
+        ));
+        reader_stack = reader_stack.push(crate::views::composer::view(
+            &app.draft_to,
+            &app.draft_subject,
+            &app.draft_body,
+            &app.send_queue,
+        ));
+        reader_stack
     };
 
     let left_actions = row![
@@ -504,6 +605,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
         crate::components::action_bar::button_text("Archive", Message::ArchiveSelected),
         crate::components::action_bar::button_text("Mark read", Message::MarkReadSelected),
         crate::components::action_bar::button_text("Trash", Message::TrashSelected),
+        crate::components::badge::count(app.unread_notifications),
+        crate::components::action_bar::button_text("Clear", Message::ClearNotifications),
         crate::components::status_bar::view(&app.status),
     ]
     .spacing(4)
@@ -539,10 +642,122 @@ pub fn theme(_app: &App) -> Theme {
     Theme::Light
 }
 
+fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> {
+    let mut content = column![
+        row![
+            crate::components::list::section_label("Sync conflicts"),
+            iced::widget::horizontal_space(),
+            crate::components::badge::count(conflicts.len().min(u32::MAX as usize) as u32),
+        ]
+        .align_y(iced::Alignment::Center)
+    ]
+    .spacing(6)
+    .padding([8, 12]);
+
+    for conflict in conflicts.iter().take(3) {
+        content = content.push(
+            row![
+                column![
+                    text(&conflict.subject).size(13).color(crate::theme::TEXT),
+                    text(&conflict.reason)
+                        .size(12)
+                        .color(crate::theme::TEXT_MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                crate::components::action_bar::button_text(
+                    "Open",
+                    Message::SelectThread(conflict.thread_id.clone()),
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+
+    container(content)
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+            border: iced::Border {
+                width: 1.0,
+                radius: 4.0.into(),
+                color: crate::theme::WARNING,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn notifications_view<'a>(
+    notifications: &'a [DesktopNotification],
+    unread: u32,
+) -> Element<'a, Message> {
+    let mut content = column![
+        row![
+            crate::components::list::section_label("Notifications"),
+            iced::widget::horizontal_space(),
+            crate::components::badge::count(unread),
+        ]
+        .align_y(iced::Alignment::Center)
+    ]
+    .spacing(6)
+    .padding([8, 12]);
+
+    for notification in notifications.iter().rev().take(3) {
+        content = content.push(
+            row![
+                crate::components::badge::pill(notification_kind_label(&notification.kind)),
+                column![
+                    text(&notification.title).size(13).color(crate::theme::TEXT),
+                    text(&notification.body)
+                        .size(12)
+                        .color(crate::theme::TEXT_MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+
+    container(content)
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+            border: iced::Border {
+                width: 1.0,
+                radius: 4.0.into(),
+                color: crate::theme::BORDER,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn notification_kind_label(kind: &NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::NewMail => "MAIL",
+        NotificationKind::Sync => "SYNC",
+        NotificationKind::Send => "SEND",
+        NotificationKind::Warning => "WARN",
+        NotificationKind::Error => "ERR",
+    }
+}
+
 fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
     match event {
         EngineEvent::Ready => {
             app.status = "Engine ready".to_string();
+            let engine = app.engine.clone();
+            return Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::ListSendQueue).await;
+                    let _ = engine.send(EngineCommand::ListConflicts).await;
+                },
+                |_| Message::SyncQueued,
+            );
         }
         EngineEvent::AccountsUpdated(accounts) => {
             app.accounts = accounts;
@@ -592,6 +807,45 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
             app.selected_thread = Some(body.thread_id.clone());
             app.selected_body = Some(body);
             app.status = "Message loaded".to_string();
+        }
+        EngineEvent::AttachmentPreviewLoaded(result) => match result {
+            Ok(preview) => {
+                app.attachment_open = None;
+                app.status = preview.message.clone();
+                app.attachment_preview = Some(preview);
+            }
+            Err(error) => {
+                app.attachment_preview = None;
+                app.status = error;
+            }
+        },
+        EngineEvent::AttachmentOpenPrepared(request) => {
+            app.attachment_preview = None;
+            app.status = if request.allowed {
+                format!("Attachment ready: {}", request.reason)
+            } else {
+                format!("Attachment blocked: {}", request.reason)
+            };
+            app.attachment_open = Some(request);
+        }
+        EngineEvent::SendQueueUpdated(queue) => {
+            app.send_queue = queue;
+            app.status = "Send queue updated".to_string();
+        }
+        EngineEvent::ConflictsUpdated(conflicts) => {
+            app.conflicts = conflicts;
+            if !app.conflicts.is_empty() {
+                app.status = format!("{} sync conflict(s)", app.conflicts.len());
+            }
+        }
+        EngineEvent::NotificationRaised(notification) => {
+            app.status = notification.title.clone();
+            app.notifications.push(notification);
+            app.unread_notifications = app.unread_notifications.saturating_add(1);
+            if app.notifications.len() > 20 {
+                let overflow = app.notifications.len() - 20;
+                app.notifications.drain(0..overflow);
+            }
         }
         EngineEvent::SendResult { result, .. } => {
             app.status = match result {

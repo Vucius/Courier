@@ -1,4 +1,6 @@
-use courier_proto::{AttachmentSummary, MessageBody};
+use courier_proto::{
+    AttachmentOpenRequest, AttachmentPreview, AttachmentPreviewKind, AttachmentSummary, MessageBody,
+};
 use courier_render::{ImageSource, RenderNode, RenderTree, TableCell};
 use courier_security::{AttachmentRisk, classify_attachment};
 use iced::font::{Style, Weight};
@@ -10,6 +12,8 @@ use crate::app::Message;
 pub fn view<'a>(
     body: Option<&'a MessageBody>,
     render_tree: Option<&'a RenderTree>,
+    attachment_preview: Option<&'a AttachmentPreview>,
+    attachment_open: Option<&'a AttachmentOpenRequest>,
 ) -> Element<'a, Message> {
     match body {
         Some(body) => {
@@ -38,7 +42,11 @@ pub fn view<'a>(
             .height(Length::Fill);
 
             if !body.attachments.is_empty() {
-                content = content.push(attachments_view(&body.attachments));
+                content = content.push(attachments_view(
+                    &body.attachments,
+                    attachment_preview,
+                    attachment_open,
+                ));
             }
 
             content = content.push(rendered_body);
@@ -52,7 +60,11 @@ pub fn view<'a>(
     }
 }
 
-fn attachments_view<'a>(attachments: &'a [AttachmentSummary]) -> Element<'a, Message> {
+fn attachments_view<'a>(
+    attachments: &'a [AttachmentSummary],
+    preview: Option<&'a AttachmentPreview>,
+    open_request: Option<&'a AttachmentOpenRequest>,
+) -> Element<'a, Message> {
     let mut content = column![crate::components::list::section_label("Attachments")]
         .spacing(6)
         .padding([8, 12]);
@@ -65,13 +77,126 @@ fn attachments_view<'a>(attachments: &'a [AttachmentSummary]) -> Element<'a, Mes
     }
 
     for attachment in attachments {
-        content = content.push(crate::components::attachment::chip(
-            attachment.filename.clone(),
-            attachment_detail(attachment),
-        ));
+        content = content.push(attachment_row(attachment));
+    }
+
+    if let Some(preview) = preview {
+        content = content.push(attachment_preview_view(preview));
+    }
+
+    if let Some(open_request) = open_request {
+        content = content.push(attachment_open_view(open_request));
     }
 
     content.into()
+}
+
+fn attachment_row<'a>(attachment: &'a AttachmentSummary) -> Element<'a, Message> {
+    row![
+        crate::components::attachment::chip(
+            attachment.filename.clone(),
+            attachment_detail(attachment),
+        ),
+        crate::components::action_bar::button_text(
+            "Preview",
+            Message::PreviewAttachment(attachment.id.clone()),
+        ),
+        crate::components::action_bar::button_text(
+            "Open",
+            Message::OpenAttachment(attachment.id.clone()),
+        ),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+fn attachment_preview_view<'a>(preview: &'a AttachmentPreview) -> Element<'a, Message> {
+    let mut content = column![
+        row![
+            crate::components::list::section_label("Attachment preview"),
+            iced::widget::horizontal_space(),
+            crate::components::action_bar::button_text(
+                "Dismiss",
+                Message::DismissAttachmentNotice,
+            ),
+        ]
+        .align_y(iced::Alignment::Center),
+        text(&preview.attachment.filename)
+            .size(13)
+            .color(crate::theme::TEXT),
+        text(&preview.message)
+            .size(12)
+            .color(crate::theme::TEXT_MUTED),
+    ]
+    .spacing(6);
+
+    match preview.kind {
+        AttachmentPreviewKind::Text => {
+            if let Some(content_text) = preview.content.as_ref() {
+                content = content.push(
+                    container(
+                        text(content_text)
+                            .size(12)
+                            .color(crate::theme::TEXT)
+                            .width(Length::Fill),
+                    )
+                    .padding(8)
+                    .width(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(crate::theme::SURFACE)),
+                        border: Border {
+                            width: 1.0,
+                            radius: 4.0.into(),
+                            color: crate::theme::BORDER,
+                        },
+                        ..container::Style::default()
+                    }),
+                );
+            }
+        }
+        AttachmentPreviewKind::Image => {
+            content = content.push(crate::components::attachment::image_placeholder(
+                preview.path.as_deref().unwrap_or("Image attachment"),
+            ));
+        }
+        AttachmentPreviewKind::Unsupported
+        | AttachmentPreviewKind::MissingBlob
+        | AttachmentPreviewKind::Blocked => {}
+    }
+
+    container(content)
+        .padding(8)
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(crate::theme::SURFACE_ALT)),
+            border: Border {
+                width: 1.0,
+                radius: 6.0.into(),
+                color: crate::theme::BORDER,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn attachment_open_view<'a>(request: &'a AttachmentOpenRequest) -> Element<'a, Message> {
+    let kind = if request.allowed {
+        crate::components::notice::NoticeKind::Success
+    } else {
+        crate::components::notice::NoticeKind::Error
+    };
+    let message = if request.allowed {
+        match request.path.as_ref() {
+            Some(path) => format!("Ready to open {} at {}", request.attachment.filename, path),
+            None => format!("{} has no local file to open", request.attachment.filename),
+        }
+    } else {
+        format!("{}: {}", request.attachment.filename, request.reason)
+    };
+
+    crate::components::notice::inline(kind, message)
 }
 
 fn attachment_detail(attachment: &AttachmentSummary) -> String {

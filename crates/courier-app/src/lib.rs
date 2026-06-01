@@ -2,11 +2,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use courier_proto::{
-    AccountConnectionTestResult, AccountId, AccountSummary, EndpointCheckResult, EngineCommand,
-    EngineEvent, MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind,
-    TaskId, ThreadId, ThreadSummary,
+    AccountConnectionTestResult, AccountId, AccountSummary, AttachmentOpenRequest,
+    DesktopNotification, EndpointCheckResult, EngineCommand, EngineEvent, MailboxId, MailboxRole,
+    MailboxSummary, MessageBody, MessageId, NotificationKind, ProviderKind, TaskId, ThreadId,
+    ThreadSummary,
 };
 use courier_search::SearchIndex;
+use courier_security::classify_attachment;
 use courier_storage::Storage;
 use courier_sync::SyncScheduler;
 use tokio::sync::{broadcast, mpsc};
@@ -119,11 +121,30 @@ impl EngineRuntime {
                             "sync queue flushed"
                         );
                         self.publish_snapshot(storage);
+                        self.publish_conflicts(storage);
                         for update in report.mailbox_updates {
                             let _ = self.event_tx.send(EngineEvent::NewMessages {
-                                mailbox_id: update.mailbox_id,
-                                messages: update.message_ids,
+                                mailbox_id: update.mailbox_id.clone(),
+                                messages: update.message_ids.clone(),
                             });
+                            if !update.message_ids.is_empty() {
+                                self.publish_notification(DesktopNotification {
+                                    id: format!(
+                                        "new-mail:{}:{}",
+                                        update.mailbox_id.0,
+                                        unix_timestamp()
+                                    ),
+                                    kind: NotificationKind::NewMail,
+                                    title: "New mail".to_string(),
+                                    body: format!(
+                                        "{} new message(s) arrived",
+                                        update.message_ids.len()
+                                    ),
+                                    account_id: Some(account_id.clone()),
+                                    message_ids: update.message_ids,
+                                    created_at: unix_timestamp(),
+                                });
+                            }
                         }
                         let _ = self.event_tx.send(EngineEvent::SyncProgress {
                             account_id,
@@ -131,6 +152,15 @@ impl EngineRuntime {
                         });
                     }
                     Err(error) => {
+                        self.publish_notification(DesktopNotification {
+                            id: format!("sync-error:{}", unix_timestamp()),
+                            kind: NotificationKind::Error,
+                            title: "Sync failed".to_string(),
+                            body: error.to_string(),
+                            account_id: Some(account_id),
+                            message_ids: Vec::new(),
+                            created_at: unix_timestamp(),
+                        });
                         let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
                     }
                 }
@@ -300,12 +330,14 @@ impl EngineRuntime {
                             "draft sent through sync scheduler"
                         );
                         self.publish_snapshot(storage);
+                        self.publish_send_queue(storage);
                         let _ = self.event_tx.send(EngineEvent::SendResult {
                             task_id: report.task_id,
                             result: Ok(()),
                         });
                     }
                     Err(error) => {
+                        self.publish_send_queue(storage);
                         let _ = self.event_tx.send(EngineEvent::SendResult {
                             task_id,
                             result: Err(error.to_string()),
@@ -314,11 +346,126 @@ impl EngineRuntime {
                 }
             }
             EngineCommand::SaveDraft(draft) => match storage.save_draft(&draft) {
-                Ok(()) => tracing::info!(draft_id = ?draft.id, "queued draft save"),
+                Ok(()) => {
+                    tracing::info!(draft_id = ?draft.id, "queued draft save");
+                    self.publish_send_queue(storage);
+                }
                 Err(error) => {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
                 }
             },
+            EngineCommand::ListSendQueue => {
+                self.publish_send_queue(storage);
+            }
+            EngineCommand::ListConflicts => {
+                self.publish_conflicts(storage);
+            }
+            EngineCommand::RetrySend(draft_id) => {
+                if let Err(error) = storage.mark_draft_pending_now(&draft_id) {
+                    let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                    return;
+                }
+                self.publish_send_queue(storage);
+                let task_id = TaskId(format!("send:{}", draft_id.0));
+                match sync.send_draft(draft_id).await {
+                    Ok(report) => {
+                        self.publish_snapshot(storage);
+                        self.publish_send_queue(storage);
+                        self.publish_notification(DesktopNotification {
+                            id: format!("send-ok:{}", report.task_id.0),
+                            kind: NotificationKind::Send,
+                            title: "Message sent".to_string(),
+                            body: format!("Draft {} was sent", report.draft_id.0),
+                            account_id: None,
+                            message_ids: vec![report.message_id.clone()],
+                            created_at: unix_timestamp(),
+                        });
+                        let _ = self.event_tx.send(EngineEvent::SendResult {
+                            task_id: report.task_id,
+                            result: Ok(()),
+                        });
+                    }
+                    Err(error) => {
+                        self.publish_send_queue(storage);
+                        self.publish_notification(DesktopNotification {
+                            id: format!("send-error:{}", task_id.0),
+                            kind: NotificationKind::Error,
+                            title: "Send failed".to_string(),
+                            body: error.to_string(),
+                            account_id: None,
+                            message_ids: Vec::new(),
+                            created_at: unix_timestamp(),
+                        });
+                        let _ = self.event_tx.send(EngineEvent::SendResult {
+                            task_id,
+                            result: Err(error.to_string()),
+                        });
+                    }
+                }
+            }
+            EngineCommand::CancelSend(draft_id) => match storage.cancel_draft_send(&draft_id) {
+                Ok(()) => {
+                    tracing::info!(draft_id = %draft_id.0, "cancelled draft send");
+                    self.publish_send_queue(storage);
+                }
+                Err(error) => {
+                    let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                }
+            },
+            EngineCommand::PreviewAttachment(attachment_id) => {
+                match storage.attachment_preview(&attachment_id, 64 * 1024) {
+                    Ok(Some(preview)) => {
+                        let _ = self
+                            .event_tx
+                            .send(EngineEvent::AttachmentPreviewLoaded(Ok(preview)));
+                    }
+                    Ok(None) => {
+                        let _ =
+                            self.event_tx
+                                .send(EngineEvent::AttachmentPreviewLoaded(Err(format!(
+                                    "Attachment not found: {}",
+                                    attachment_id.0
+                                ))));
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .event_tx
+                            .send(EngineEvent::AttachmentPreviewLoaded(Err(error.to_string())));
+                    }
+                }
+            }
+            EngineCommand::OpenAttachment(attachment_id) => {
+                match storage.attachment_by_id(&attachment_id) {
+                    Ok(Some(attachment)) => {
+                        let summary = courier_proto::AttachmentSummary::from(attachment.clone());
+                        let decision = classify_attachment(
+                            &summary.filename,
+                            &summary.mime_type,
+                            summary.size,
+                        );
+                        let path = attachment.blob_path.map(|path| {
+                            storage.data_dir().join(path).to_string_lossy().into_owned()
+                        });
+                        let _ = self.event_tx.send(EngineEvent::AttachmentOpenPrepared(
+                            AttachmentOpenRequest {
+                                attachment: summary,
+                                path,
+                                allowed: decision.can_open,
+                                reason: decision.reason,
+                            },
+                        ));
+                    }
+                    Ok(None) => {
+                        let _ = self.event_tx.send(EngineEvent::Error(format!(
+                            "Attachment not found: {}",
+                            attachment_id.0
+                        )));
+                    }
+                    Err(error) => {
+                        let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                    }
+                }
+            }
             EngineCommand::Snooze(message_id, run_at) => {
                 tracing::info!(?message_id, run_at, "queued snooze command");
             }
@@ -331,6 +478,46 @@ impl EngineRuntime {
                 let _ = self.event_tx.send(EngineEvent::ThreadsUpdated(results));
             }
         }
+    }
+
+    fn publish_send_queue(&self, storage: &Storage) {
+        match storage.list_send_queue() {
+            Ok(queue) => {
+                let _ = self.event_tx.send(EngineEvent::SendQueueUpdated(queue));
+            }
+            Err(error) => {
+                let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+    }
+
+    fn publish_conflicts(&self, storage: &Storage) {
+        match storage.list_conflicts() {
+            Ok(conflicts) => {
+                let conflict_count = conflicts.len();
+                let _ = self.event_tx.send(EngineEvent::ConflictsUpdated(conflicts));
+                if conflict_count > 0 {
+                    self.publish_notification(DesktopNotification {
+                        id: format!("conflicts:{}", unix_timestamp()),
+                        kind: NotificationKind::Warning,
+                        title: "Sync conflicts need review".to_string(),
+                        body: format!("{conflict_count} message conflict(s) are waiting"),
+                        account_id: None,
+                        message_ids: Vec::new(),
+                        created_at: unix_timestamp(),
+                    });
+                }
+            }
+            Err(error) => {
+                let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+    }
+
+    fn publish_notification(&self, notification: DesktopNotification) {
+        let _ = self
+            .event_tx
+            .send(EngineEvent::NotificationRaised(notification));
     }
 
     fn publish_snapshot(&self, storage: &Storage) {
@@ -411,6 +598,14 @@ async fn test_endpoint(host: &str, port: u16) -> EndpointCheckResult {
             error: Some("connection timed out".to_string()),
         },
     }
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .min(i64::MAX as u64) as i64
 }
 
 fn seed_demo_data(storage: &Storage) -> Result<()> {

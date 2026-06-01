@@ -46,6 +46,10 @@ pub struct SyncReport {
     pub pending_ops: usize,
     pub applied_ops: usize,
     pub remote_messages: usize,
+    pub remote_deleted: usize,
+    pub remote_moved: usize,
+    pub reset_mailboxes: usize,
+    pub conflicts: usize,
     pub mailbox_updates: Vec<MailboxSyncReport>,
 }
 
@@ -53,6 +57,10 @@ pub struct SyncReport {
 pub struct MailboxSyncReport {
     pub mailbox_id: MailboxId,
     pub message_ids: Vec<MessageId>,
+    pub deleted_messages: usize,
+    pub moved_messages: usize,
+    pub uidvalidity_reset: bool,
+    pub conflicts: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,12 +124,32 @@ where
             .iter()
             .map(|mailbox| mailbox.message_ids.len())
             .sum::<usize>();
+        let remote_deleted = mailbox_updates
+            .iter()
+            .map(|mailbox| mailbox.deleted_messages)
+            .sum::<usize>();
+        let remote_moved = mailbox_updates
+            .iter()
+            .map(|mailbox| mailbox.moved_messages)
+            .sum::<usize>();
+        let reset_mailboxes = mailbox_updates
+            .iter()
+            .filter(|mailbox| mailbox.uidvalidity_reset)
+            .count();
+        let conflicts = mailbox_updates
+            .iter()
+            .map(|mailbox| mailbox.conflicts)
+            .sum::<usize>();
 
         tracing::info!(
             ?account_id,
             pending_ops = pending_ops.len(),
             applied_ops = pending_ops.len(),
             remote_messages,
+            remote_deleted,
+            remote_moved,
+            reset_mailboxes,
+            conflicts,
             db = %self.storage.db_path().display(),
             "sync requested"
         );
@@ -131,6 +159,10 @@ where
             pending_ops: pending_ops.len(),
             applied_ops: pending_ops.len(),
             remote_messages,
+            remote_deleted,
+            remote_moved,
+            reset_mailboxes,
+            conflicts,
             mailbox_updates,
         })
     }
@@ -194,12 +226,19 @@ where
             .filter(|mailbox| mailbox.account_id == *account_id)
         {
             let cursor = self.storage.mailbox_sync_cursor(&mailbox.id)?;
-            let delta = self.remote.fetch_delta(mailbox.id.clone(), cursor).await?;
-            let message_ids = self.persist_remote_delta(account_id, &mailbox.id, delta)?;
-            if !message_ids.is_empty() {
+            let delta = self
+                .remote
+                .fetch_delta(mailbox.id.clone(), cursor.clone())
+                .await?;
+            let report = self.persist_remote_delta(account_id, &mailbox.id, cursor, delta)?;
+            if report.has_changes() {
                 mailbox_updates.push(MailboxSyncReport {
                     mailbox_id: mailbox.id,
-                    message_ids,
+                    message_ids: report.message_ids,
+                    deleted_messages: report.deleted_messages,
+                    moved_messages: report.moved_messages,
+                    uidvalidity_reset: report.uidvalidity_reset,
+                    conflicts: report.conflicts,
                 });
             }
         }
@@ -211,8 +250,45 @@ where
         &self,
         account_id: &AccountId,
         mailbox_id: &MailboxId,
+        previous_cursor: courier_domain::SyncCursor,
         delta: RemoteDelta,
-    ) -> Result<Vec<MessageId>> {
+    ) -> Result<DeltaPersistReport> {
+        let mut report = DeltaPersistReport::default();
+        if previous_cursor.validity_changed(delta.cursor.uid_validity) {
+            let conflicted = self
+                .storage
+                .reset_mailbox_for_uidvalidity_change(mailbox_id)?;
+            report.uidvalidity_reset = true;
+            report.conflicts += conflicted.len();
+            tracing::warn!(
+                mailbox_id = %mailbox_id.0,
+                old_uid_validity = previous_cursor.uid_validity,
+                new_uid_validity = delta.cursor.uid_validity,
+                conflicts = conflicted.len(),
+                "mailbox uidvalidity changed; local mailbox view reset"
+            );
+        }
+
+        for message_id in &delta.deleted_messages {
+            if self.storage.apply_remote_delete(mailbox_id, message_id)? {
+                report.deleted_messages += 1;
+            } else {
+                report.conflicts += 1;
+            }
+        }
+
+        for moved in &delta.moved_messages {
+            if self.storage.apply_remote_move(
+                mailbox_id,
+                &moved.target_mailbox_id,
+                &moved.message_id,
+            )? {
+                report.moved_messages += 1;
+            } else {
+                report.conflicts += 1;
+            }
+        }
+
         let mut message_ids = Vec::with_capacity(delta.new_message_count());
 
         for message in delta.messages {
@@ -225,7 +301,8 @@ where
         self.storage
             .update_mailbox_sync_cursor(mailbox_id, &delta.cursor)?;
 
-        Ok(message_ids)
+        report.message_ids = message_ids;
+        Ok(report)
     }
 
     fn persist_remote_message(
@@ -278,6 +355,25 @@ where
         let multiplier = 2_u64.saturating_pow(retry_count.min(16));
         let delay_ms = self.retry_policy.base_delay_ms.saturating_mul(multiplier);
         ((delay_ms.saturating_add(999)) / 1000).min(i64::MAX as u64) as i64
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeltaPersistReport {
+    message_ids: Vec<MessageId>,
+    deleted_messages: usize,
+    moved_messages: usize,
+    uidvalidity_reset: bool,
+    conflicts: usize,
+}
+
+impl DeltaPersistReport {
+    fn has_changes(&self) -> bool {
+        !self.message_ids.is_empty()
+            || self.deleted_messages > 0
+            || self.moved_messages > 0
+            || self.uidvalidity_reset
+            || self.conflicts > 0
     }
 }
 
@@ -504,6 +600,8 @@ mod tests {
                 timestamp: 1234,
                 read: false,
             }],
+            deleted_messages: Vec::new(),
+            moved_messages: Vec::new(),
         });
         let scheduler = SyncScheduler::with_remote(storage.clone(), remote);
         let report = scheduler
@@ -695,6 +793,8 @@ mod tests {
                 timestamp: 9,
                 read: false,
             }],
+            deleted_messages: Vec::new(),
+            moved_messages: Vec::new(),
         });
         let scheduler = SyncScheduler::with_remote(storage.clone(), remote);
         let report = scheduler

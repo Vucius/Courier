@@ -162,6 +162,73 @@ pub struct AttachmentSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AttachmentPreviewKind {
+    Text,
+    Image,
+    Unsupported,
+    MissingBlob,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentPreview {
+    pub attachment: AttachmentSummary,
+    pub kind: AttachmentPreviewKind,
+    pub content: Option<String>,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentOpenRequest {
+    pub attachment: AttachmentSummary,
+    pub path: Option<String>,
+    pub allowed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendQueueItem {
+    pub task_id: TaskId,
+    pub draft_id: DraftId,
+    pub account_id: AccountId,
+    pub to: Vec<String>,
+    pub subject: String,
+    pub status: String,
+    pub retry_count: u32,
+    pub last_error: Option<String>,
+    pub run_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictSummary {
+    pub message_id: MessageId,
+    pub thread_id: ThreadId,
+    pub subject: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NotificationKind {
+    NewMail,
+    Sync,
+    Send,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopNotification {
+    pub id: String,
+    pub kind: NotificationKind,
+    pub title: String,
+    pub body: String,
+    pub account_id: Option<AccountId>,
+    pub message_ids: Vec<MessageId>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DraftMessage {
     pub id: DraftId,
     pub account_id: AccountId,
@@ -192,6 +259,12 @@ pub enum EngineCommand {
     DeleteIdentity(IdentityId),
     SendMessage(DraftId),
     SaveDraft(DraftMessage),
+    ListSendQueue,
+    RetrySend(DraftId),
+    CancelSend(DraftId),
+    PreviewAttachment(AttachmentId),
+    OpenAttachment(AttachmentId),
+    ListConflicts,
     Snooze(MessageId, i64),
     Search(String),
 }
@@ -215,6 +288,11 @@ pub enum EngineEvent {
     },
     ThreadsUpdated(Vec<ThreadSummary>),
     MessageLoaded(MessageBody),
+    AttachmentPreviewLoaded(Result<AttachmentPreview, String>),
+    AttachmentOpenPrepared(AttachmentOpenRequest),
+    SendQueueUpdated(Vec<SendQueueItem>),
+    ConflictsUpdated(Vec<ConflictSummary>),
+    NotificationRaised(DesktopNotification),
     SendResult {
         task_id: TaskId,
         result: Result<(), String>,
