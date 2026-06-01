@@ -1,4 +1,6 @@
 use courier_security::sanitize_email_html;
+use ego_tree::NodeRef;
+use scraper::{ElementRef, Html, node::Node};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,16 +12,41 @@ pub enum ImageSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableCell {
+    pub header: bool,
+    pub nodes: Vec<RenderNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderNode {
     Text(String),
     Paragraph(Vec<RenderNode>),
+    Heading {
+        level: u8,
+        children: Vec<RenderNode>,
+    },
     Link {
         href: String,
         children: Vec<RenderNode>,
     },
     Image(ImageSource),
     BlockQuote(Vec<RenderNode>),
-    Table(Vec<RenderNode>),
+    List {
+        ordered: bool,
+        items: Vec<Vec<RenderNode>>,
+    },
+    Strong(Vec<RenderNode>),
+    Emphasis(Vec<RenderNode>),
+    HorizontalRule,
+    LineBreak,
+    Table {
+        rows: Vec<TableRow>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +60,7 @@ pub fn render_tree_from_html(input: &str) -> RenderTree {
     let mut nodes = html_nodes(&sanitized.html);
     if nodes.is_empty() {
         nodes.push(RenderNode::Paragraph(vec![RenderNode::Text(
-            text_from_html(&sanitized.html),
+            text_fallback(&sanitized.html),
         )]));
     }
 
@@ -54,157 +81,223 @@ pub fn render_tree_from_text(input: &str) -> RenderTree {
 }
 
 fn html_nodes(input: &str) -> Vec<RenderNode> {
-    let mut nodes = Vec::new();
-    let mut inline = Vec::new();
-    let mut rest = input;
+    let fragment = Html::parse_fragment(input);
+    block_children(fragment.root_element())
+}
 
-    while let Some(start) = rest.find('<') {
-        push_text(&mut inline, &rest[..start]);
-        let after_start = &rest[start..];
-        let Some(end) = after_start.find('>') else {
-            push_text(&mut inline, after_start);
-            rest = "";
-            break;
-        };
+fn block_children(element: ElementRef<'_>) -> Vec<RenderNode> {
+    wrap_inline_runs(raw_children(element))
+}
 
-        let tag = &after_start[..=end];
-        let lower_tag = tag.to_ascii_lowercase();
-        let after_tag = &after_start[end + 1..];
+fn raw_children(element: ElementRef<'_>) -> Vec<RenderNode> {
+    element.children().flat_map(node_to_nodes).collect()
+}
 
-        if lower_tag.starts_with("</p")
-            || lower_tag.starts_with("</div")
-            || lower_tag.starts_with("<br")
-            || lower_tag.starts_with("</tr")
-        {
-            flush_paragraph(&mut nodes, &mut inline);
-            rest = after_tag;
-            continue;
+fn inline_children(element: ElementRef<'_>) -> Vec<RenderNode> {
+    raw_children(element)
+}
+
+fn node_to_nodes(node: NodeRef<'_, Node>) -> Vec<RenderNode> {
+    match node.value() {
+        Node::Text(text) => normalized_text(text)
+            .map(RenderNode::Text)
+            .into_iter()
+            .collect(),
+        Node::Element(_) => {
+            let Some(element) = ElementRef::wrap(node) else {
+                return Vec::new();
+            };
+            element_to_nodes(element)
         }
+        _ => Vec::new(),
+    }
+}
 
-        if lower_tag.starts_with("<img") {
-            if let Some(source) = image_source_from_tag(tag) {
-                inline.push(RenderNode::Image(source));
+fn element_to_nodes(element: ElementRef<'_>) -> Vec<RenderNode> {
+    let name = element.value().name();
+
+    match name {
+        "html" | "body" | "main" | "article" | "section" | "div" | "center" => {
+            block_children(element)
+        }
+        "p" => vec![RenderNode::Paragraph(inline_children(element))],
+        "br" => vec![RenderNode::LineBreak],
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => vec![RenderNode::Heading {
+            level: heading_level(name),
+            children: inline_children(element),
+        }],
+        "a" => link_nodes(element),
+        "img" => image_source_from_element(element)
+            .map(RenderNode::Image)
+            .into_iter()
+            .collect(),
+        "blockquote" => vec![RenderNode::BlockQuote(block_children(element))],
+        "ul" | "ol" => vec![RenderNode::List {
+            ordered: name == "ol",
+            items: list_items(element),
+        }],
+        "li" => block_children(element),
+        "strong" | "b" => vec![RenderNode::Strong(inline_children(element))],
+        "em" | "i" => vec![RenderNode::Emphasis(inline_children(element))],
+        "hr" => vec![RenderNode::HorizontalRule],
+        "table" => vec![RenderNode::Table {
+            rows: table_rows(element),
+        }],
+        "thead" | "tbody" | "tfoot" => block_children(element),
+        "tr" => {
+            let row = table_row(element);
+            if row.cells.is_empty() {
+                Vec::new()
+            } else {
+                vec![RenderNode::Table { rows: vec![row] }]
             }
-            rest = after_tag;
-            continue;
         }
+        "td" | "th" => block_children(element),
+        "span" | "small" | "label" | "font" | "code" | "pre" => inline_children(element),
+        _ => block_children(element),
+    }
+}
 
-        if lower_tag.starts_with("<a ") || lower_tag.starts_with("<a>") {
-            let href = attr_value(tag, "href").unwrap_or_default();
-            if let Some(close) = after_tag.to_ascii_lowercase().find("</a>") {
-                let label = text_from_html(&after_tag[..close]);
-                if href.is_empty() {
-                    push_text(&mut inline, &label);
-                } else {
-                    inline.push(RenderNode::Link {
-                        href,
-                        children: vec![RenderNode::Text(label)],
-                    });
+fn link_nodes(element: ElementRef<'_>) -> Vec<RenderNode> {
+    let children = inline_children(element);
+    let href = element
+        .value()
+        .attr("href")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match href {
+        Some(href) => vec![RenderNode::Link {
+            href: href.to_string(),
+            children,
+        }],
+        None => children,
+    }
+}
+
+fn list_items(element: ElementRef<'_>) -> Vec<Vec<RenderNode>> {
+    element
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|child| child.value().name() == "li")
+        .map(block_children)
+        .filter(|nodes| !nodes.is_empty())
+        .collect()
+}
+
+fn table_rows(element: ElementRef<'_>) -> Vec<TableRow> {
+    let mut rows = Vec::new();
+    collect_table_rows(element, &mut rows);
+    rows
+}
+
+fn collect_table_rows(element: ElementRef<'_>, rows: &mut Vec<TableRow>) {
+    for child in element.children().filter_map(ElementRef::wrap) {
+        match child.value().name() {
+            "tr" => {
+                let row = table_row(child);
+                if !row.cells.is_empty() {
+                    rows.push(row);
                 }
-                rest = &after_tag[close + "</a>".len()..];
-                continue;
             }
+            "thead" | "tbody" | "tfoot" => collect_table_rows(child, rows),
+            _ => {}
         }
-
-        if lower_tag.starts_with("<blockquote") {
-            flush_paragraph(&mut nodes, &mut inline);
-            if let Some(close) = after_tag.to_ascii_lowercase().find("</blockquote>") {
-                nodes.push(RenderNode::BlockQuote(html_nodes(&after_tag[..close])));
-                rest = &after_tag[close + "</blockquote>".len()..];
-                continue;
-            }
-        }
-
-        rest = after_tag;
-    }
-
-    push_text(&mut inline, rest);
-    flush_paragraph(&mut nodes, &mut inline);
-
-    nodes
-}
-
-fn push_text(nodes: &mut Vec<RenderNode>, value: &str) {
-    let text = decode_entities(&text_from_html(value));
-    let text = text.trim();
-    if !text.is_empty() {
-        nodes.push(RenderNode::Text(text.to_string()));
     }
 }
 
-fn flush_paragraph(nodes: &mut Vec<RenderNode>, inline: &mut Vec<RenderNode>) {
+fn table_row(row: ElementRef<'_>) -> TableRow {
+    let cells = row
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter_map(|cell| match cell.value().name() {
+            "td" => Some(TableCell {
+                header: false,
+                nodes: block_children(cell),
+            }),
+            "th" => Some(TableCell {
+                header: true,
+                nodes: block_children(cell),
+            }),
+            _ => None,
+        })
+        .filter(|cell| !cell.nodes.is_empty())
+        .collect();
+
+    TableRow { cells }
+}
+
+fn wrap_inline_runs(nodes: Vec<RenderNode>) -> Vec<RenderNode> {
+    let mut output = Vec::new();
+    let mut inline = Vec::new();
+
+    for node in nodes {
+        if is_inline(&node) {
+            inline.push(node);
+        } else {
+            flush_inline(&mut output, &mut inline);
+            output.push(node);
+        }
+    }
+
+    flush_inline(&mut output, &mut inline);
+    output
+}
+
+fn flush_inline(output: &mut Vec<RenderNode>, inline: &mut Vec<RenderNode>) {
     if inline.is_empty() {
         return;
     }
 
-    nodes.push(RenderNode::Paragraph(std::mem::take(inline)));
+    output.push(RenderNode::Paragraph(std::mem::take(inline)));
 }
 
-fn image_source_from_tag(tag: &str) -> Option<ImageSource> {
-    if tag.contains("data-courier-remote-image=\"blocked\"") {
+fn is_inline(node: &RenderNode) -> bool {
+    matches!(
+        node,
+        RenderNode::Text(_)
+            | RenderNode::Link { .. }
+            | RenderNode::Image(_)
+            | RenderNode::Strong(_)
+            | RenderNode::Emphasis(_)
+            | RenderNode::LineBreak
+    )
+}
+
+fn heading_level(name: &str) -> u8 {
+    name.trim_start_matches('h')
+        .parse::<u8>()
+        .unwrap_or(2)
+        .clamp(1, 6)
+}
+
+fn image_source_from_element(element: ElementRef<'_>) -> Option<ImageSource> {
+    if element.value().attr("data-courier-remote-image") == Some("blocked") {
         return Some(ImageSource::RemoteUrl("blocked".to_string()));
     }
 
-    let src = attr_value(tag, "src")?;
+    let src = element.value().attr("src")?.trim();
     if src.starts_with("cid:") {
         Some(ImageSource::Cid(src.trim_start_matches("cid:").to_string()))
     } else if src.starts_with("http://") || src.starts_with("https://") {
-        Some(ImageSource::RemoteUrl(src))
+        Some(ImageSource::RemoteUrl(src.to_string()))
     } else if src.starts_with("attachment:") {
         Some(ImageSource::Attachment(
             src.trim_start_matches("attachment:").to_string(),
         ))
     } else {
-        Some(ImageSource::LocalPath(src))
+        Some(ImageSource::LocalPath(src.to_string()))
     }
 }
 
-fn attr_value(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let needle = format!("{name}=");
-    let start = lower.find(&needle)? + needle.len();
-    let quote = tag[start..].chars().next()?;
-
-    match quote {
-        '"' | '\'' => {
-            let value_start = start + quote.len_utf8();
-            let value_end = tag[value_start..].find(quote)? + value_start;
-            Some(tag[value_start..value_end].to_string())
-        }
-        _ => {
-            let value_end = tag[start..]
-                .find(|ch: char| ch.is_whitespace() || ch == '>')
-                .map(|end| start + end)
-                .unwrap_or_else(|| tag.len().saturating_sub(1));
-            Some(tag[start..value_end].to_string())
-        }
-    }
+fn normalized_text(input: &str) -> Option<String> {
+    let text = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() { None } else { Some(text) }
 }
 
-fn text_from_html(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut in_tag = false;
-
-    for ch in input.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => output.push(ch),
-            _ => {}
-        }
-    }
-
-    output
-}
-
-fn decode_entities(input: &str) -> String {
-    input
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+fn text_fallback(input: &str) -> String {
+    let fragment = Html::parse_fragment(input);
+    fragment.root_element().text().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -227,6 +320,35 @@ mod tests {
             &tree.nodes[0],
             RenderNode::Paragraph(nodes) if nodes.iter().any(|node| matches!(node, RenderNode::Link { href, .. } if href == "https://example.test"))
         ));
+    }
+
+    #[test]
+    fn html_render_tree_preserves_lists_tables_and_inline_formatting() {
+        let tree = render_tree_from_html(
+            r#"
+            <h2>Digest</h2>
+            <p><strong>Ship</strong> <em>today</em></p>
+            <ul><li>One</li><li><a href="https://example.test/two">Two</a></li></ul>
+            <table><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody><tr><td>Courier</td><td>Ready</td></tr></tbody></table>
+            <hr>
+            "#,
+        );
+
+        assert!(matches!(
+            tree.nodes.first(),
+            Some(RenderNode::Heading { level: 2, .. })
+        ));
+        assert!(tree.nodes.iter().any(
+            |node| matches!(node, RenderNode::List { ordered: false, items } if items.len() == 2)
+        ));
+        assert!(tree.nodes.iter().any(
+            |node| matches!(node, RenderNode::Table { rows } if rows.len() == 2 && rows[0].cells[0].header)
+        ));
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|node| matches!(node, RenderNode::HorizontalRule))
+        );
     }
 
     #[test]

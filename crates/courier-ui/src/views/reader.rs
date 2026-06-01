@@ -1,9 +1,9 @@
 use courier_proto::{AttachmentSummary, MessageBody};
-use courier_render::{ImageSource, RenderNode, RenderTree};
+use courier_render::{ImageSource, RenderNode, RenderTree, TableCell};
 use courier_security::{AttachmentRisk, classify_attachment};
-use iced::Element;
-use iced::Length;
+use iced::font::{Style, Weight};
 use iced::widget::{column, container, row, scrollable, text};
+use iced::{Background, Border, Element, Font, Length};
 
 use crate::app::Message;
 
@@ -164,6 +164,15 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
             }
             line.into()
         }
+        RenderNode::Heading { level, children } => text(children_text(children))
+            .size(heading_size(*level))
+            .color(crate::theme::TEXT)
+            .font(Font {
+                weight: Weight::Semibold,
+                ..Font::DEFAULT
+            })
+            .width(Length::Fill)
+            .into(),
         RenderNode::Link { href, children } => {
             let label = children_text(children);
             column![
@@ -179,15 +188,53 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
             for child in children {
                 quote = quote.push(render_node(child));
             }
-            container(quote).width(Length::Fill).into()
+            container(quote)
+                .padding([8, 10])
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(crate::theme::SURFACE_ALT)),
+                    border: Border {
+                        width: 1.0,
+                        radius: 4.0.into(),
+                        color: crate::theme::BORDER,
+                    },
+                    ..container::Style::default()
+                })
+                .into()
         }
-        RenderNode::Table(children) => {
-            let mut table = column![].spacing(4).width(Length::Fill);
-            for child in children {
-                table = table.push(render_node(child));
+        RenderNode::List { ordered, items } => {
+            let mut list = column![].spacing(6).width(Length::Fill);
+            for (index, item) in items.iter().enumerate() {
+                let marker = if *ordered {
+                    format!("{}.", index + 1)
+                } else {
+                    "-".to_string()
+                };
+                let mut item_body = column![].spacing(4).width(Length::Fill);
+                for node in item {
+                    item_body = item_body.push(render_node(node));
+                }
+                list = list.push(
+                    row![
+                        text(marker)
+                            .size(14)
+                            .color(crate::theme::TEXT_MUTED)
+                            .width(Length::Fixed(24.0)),
+                        item_body,
+                    ]
+                    .spacing(6)
+                    .width(Length::Fill),
+                );
             }
-            table.into()
+            list.into()
         }
+        RenderNode::Strong(children) => render_styled_inline(children, Weight::Bold, Style::Normal),
+        RenderNode::Emphasis(children) => {
+            render_styled_inline(children, Weight::Normal, Style::Italic)
+        }
+        RenderNode::HorizontalRule => crate::components::surface::divider(),
+        RenderNode::LineBreak => text("").height(Length::Fixed(6.0)).into(),
+        RenderNode::Table { rows } => table_view(rows),
     }
 }
 
@@ -202,7 +249,89 @@ fn render_inline_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
                 .into()
         }
         RenderNode::Image(source) => image_label(source),
+        RenderNode::Strong(children) => {
+            inline_text(children, Weight::Bold, Style::Normal, crate::theme::TEXT)
+        }
+        RenderNode::Emphasis(children) => {
+            inline_text(children, Weight::Normal, Style::Italic, crate::theme::TEXT)
+        }
+        RenderNode::LineBreak => text(" ").width(Length::Fixed(1.0)).into(),
         other => render_node(other),
+    }
+}
+
+fn render_styled_inline<'a>(
+    children: &'a [RenderNode],
+    weight: Weight,
+    style: Style,
+) -> Element<'a, Message> {
+    inline_text(children, weight, style, crate::theme::TEXT)
+}
+
+fn inline_text<'a>(
+    children: &'a [RenderNode],
+    weight: Weight,
+    style: Style,
+    color: iced::Color,
+) -> Element<'a, Message> {
+    text(children_text(children))
+        .size(14)
+        .color(color)
+        .font(Font {
+            weight,
+            style,
+            ..Font::DEFAULT
+        })
+        .into()
+}
+
+fn table_view<'a>(rows: &'a [courier_render::TableRow]) -> Element<'a, Message> {
+    let mut table = column![].spacing(0).width(Length::Fill);
+
+    for row_data in rows {
+        let mut table_row = row![].spacing(0).width(Length::Fill);
+        for cell in &row_data.cells {
+            table_row = table_row.push(table_cell(cell));
+        }
+        table = table.push(table_row);
+    }
+
+    table.into()
+}
+
+fn table_cell<'a>(cell: &'a TableCell) -> Element<'a, Message> {
+    let mut content = column![].spacing(4).width(Length::Fill);
+    for node in &cell.nodes {
+        content = content.push(render_node(node));
+    }
+
+    let background = if cell.header {
+        crate::theme::SURFACE_ALT
+    } else {
+        crate::theme::SURFACE
+    };
+
+    container(content)
+        .padding(8)
+        .width(Length::FillPortion(1))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(background)),
+            border: Border {
+                width: 1.0,
+                radius: 0.0.into(),
+                color: crate::theme::BORDER,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn heading_size(level: u8) -> u16 {
+    match level {
+        1 => 22,
+        2 => 19,
+        3 => 17,
+        _ => 15,
     }
 }
 
@@ -223,7 +352,14 @@ fn children_text(children: &[RenderNode]) -> String {
     children
         .iter()
         .filter_map(|node| match node {
-            RenderNode::Text(value) => Some(value.as_str()),
+            RenderNode::Text(value) => Some(value.clone()),
+            RenderNode::Link { children, .. }
+            | RenderNode::Strong(children)
+            | RenderNode::Emphasis(children)
+            | RenderNode::Paragraph(children)
+            | RenderNode::Heading { children, .. } => Some(children_text(children)),
+            RenderNode::Image(_) => Some("[image]".to_string()),
+            RenderNode::LineBreak => Some("\n".to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()

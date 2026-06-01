@@ -41,6 +41,8 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+ego-tree = "0.11"
+scraper = "0.27"
 
 [profile.release]
 lto = "thin"

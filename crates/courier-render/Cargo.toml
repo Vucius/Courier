@@ -7,4 +7,6 @@ license.workspace = true
 [dependencies]
 courier-mime.workspace = true
 courier-security.workspace = true
+ego-tree.workspace = true
+scraper.workspace = true
 serde.workspace = true
