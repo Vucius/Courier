@@ -87,6 +87,14 @@ CREATE TABLE IF NOT EXISTS contacts (
     UNIQUE(account_id, email)
 );
 
+CREATE TABLE IF NOT EXISTS identities (
+    id          TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(id),
+    name        TEXT NOT NULL,
+    email       TEXT NOT NULL,
+    reply_to    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS labels (
     id          TEXT PRIMARY KEY,
     account_id  TEXT NOT NULL REFERENCES accounts(id),

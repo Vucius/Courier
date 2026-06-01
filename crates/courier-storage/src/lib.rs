@@ -6,8 +6,8 @@ use courier_domain::SyncCursor;
 use courier_mime::{BodyKind, ParsedAttachment, parse_rfc822};
 use courier_proto::{
     AccountConfig, AccountId, AccountState, AccountSummary, AttachmentId, AttachmentSummary,
-    AuthType, DraftId, DraftMessage, MailboxId, MailboxRole, MailboxSummary, MessageBody,
-    MessageId, ProviderKind, ThreadId, ThreadSummary,
+    AuthType, DraftId, DraftMessage, IdentityConfig, IdentityId, IdentitySummary, MailboxId,
+    MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind, ThreadId, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -124,8 +124,7 @@ impl Storage {
                 imap_port = excluded.imap_port,
                 smtp_host = excluded.smtp_host,
                 smtp_port = excluded.smtp_port,
-                auth_type = excluded.auth_type,
-                enabled = 1
+                auth_type = excluded.auth_type
             "#,
             params![
                 account.id.0,
@@ -141,22 +140,82 @@ impl Storage {
         self.ensure_standard_mailboxes(&account.id)
     }
 
+    pub fn upsert_identity(&self, identity: &IdentityConfig) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            INSERT INTO identities (id, account_id, name, email, reply_to)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                account_id = excluded.account_id,
+                name = excluded.name,
+                email = excluded.email,
+                reply_to = excluded.reply_to
+            "#,
+            params![
+                identity.id.0,
+                identity.account_id.0,
+                identity.name,
+                identity.email,
+                identity.reply_to,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_identities(&self) -> Result<Vec<IdentitySummary>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, account_id, name, email, reply_to
+            FROM identities
+            ORDER BY account_id, name COLLATE NOCASE, email COLLATE NOCASE, id
+            "#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(IdentitySummary {
+                id: IdentityId(row.get(0)?),
+                account_id: AccountId(row.get(1)?),
+                name: row.get(2)?,
+                email: row.get(3)?,
+                reply_to: row.get(4)?,
+            })
+        })?;
+
+        collect_rows(rows)
+    }
+
+    pub fn delete_identity(&self, identity_id: &IdentityId) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM identities WHERE id = ?1",
+            params![identity_id.0],
+        )?;
+        Ok(())
+    }
+
     pub fn list_accounts(&self) -> Result<Vec<AccountState>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             r#"
-            SELECT id, email, provider, enabled
+            SELECT id, email, provider, imap_host, imap_port, smtp_host, smtp_port, auth_type, enabled
             FROM accounts
             ORDER BY email COLLATE NOCASE, id
             "#,
         )?;
         let rows = statement.query_map([], |row| {
             let provider: String = row.get(2)?;
+            let auth_type: String = row.get(7)?;
             Ok(AccountState {
                 id: AccountId(row.get(0)?),
                 email: row.get(1)?,
                 provider: provider_from_str(&provider),
-                enabled: row.get::<_, i64>(3)? != 0,
+                imap_host: row.get(3)?,
+                imap_port: non_negative_u32(row.get::<_, i64>(4)?).min(u16::MAX.into()) as u16,
+                smtp_host: row.get(5)?,
+                smtp_port: non_negative_u32(row.get::<_, i64>(6)?).min(u16::MAX.into()) as u16,
+                auth_type: auth_type_from_str(&auth_type),
+                enabled: row.get::<_, i64>(8)? != 0,
             })
         })?;
 
@@ -226,6 +285,10 @@ impl Storage {
         )?;
         transaction.execute(
             "DELETE FROM contacts WHERE account_id = ?1",
+            params![account_id.0],
+        )?;
+        transaction.execute(
+            "DELETE FROM identities WHERE account_id = ?1",
             params![account_id.0],
         )?;
         transaction.execute(
@@ -1315,6 +1378,13 @@ fn auth_type_to_str(auth_type: &AuthType) -> &'static str {
     }
 }
 
+fn auth_type_from_str(auth_type: &str) -> AuthType {
+    match auth_type {
+        "oauth2" => AuthType::OAuth2,
+        _ => AuthType::Password,
+    }
+}
+
 fn mailbox_role_to_str(role: &MailboxRole) -> &'static str {
     match role {
         MailboxRole::Inbox => "inbox",
@@ -1791,10 +1861,26 @@ mod tests {
         storage
             .upsert_account_config(&account)
             .expect("upsert account config");
+        let identity = IdentityConfig {
+            id: IdentityId("identity:configured:primary".to_string()),
+            account_id: account.id.clone(),
+            name: "Configured Sender".to_string(),
+            email: "alias@example.test".to_string(),
+            reply_to: Some("reply@example.test".to_string()),
+        };
+        storage.upsert_identity(&identity).expect("upsert identity");
+        let identities = storage.list_identities().expect("list identities");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].name, "Configured Sender");
+        assert_eq!(identities[0].email, "alias@example.test");
 
         let accounts = storage.list_accounts().expect("list accounts");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].email, "configured@example.test");
+        assert_eq!(accounts[0].imap_host, "imap.example.test");
+        assert_eq!(accounts[0].imap_port, 993);
+        assert_eq!(accounts[0].smtp_host, "smtp.example.test");
+        assert_eq!(accounts[0].smtp_port, 587);
         assert!(accounts[0].enabled);
 
         let mailboxes = storage.list_mailboxes().expect("list mailboxes");
@@ -1836,6 +1922,23 @@ mod tests {
                 .is_empty()
         );
 
+        let edited_account = AccountConfig {
+            email: "edited@example.test".to_string(),
+            imap_host: "imap.edited.example.test".to_string(),
+            ..account.clone()
+        };
+        storage
+            .upsert_account_config(&edited_account)
+            .expect("edit account config");
+        let edited = storage
+            .list_accounts()
+            .expect("list edited account")
+            .pop()
+            .expect("edited account exists");
+        assert_eq!(edited.email, "edited@example.test");
+        assert_eq!(edited.imap_host, "imap.edited.example.test");
+        assert!(!edited.enabled);
+
         storage
             .set_account_enabled(&account.id, true)
             .expect("enable account");
@@ -1849,6 +1952,12 @@ mod tests {
 
         storage.delete_account(&account.id).expect("delete account");
         assert!(storage.list_accounts().expect("list accounts").is_empty());
+        assert!(
+            storage
+                .list_identities()
+                .expect("list identities")
+                .is_empty()
+        );
         assert!(storage.list_mailboxes().expect("list mailboxes").is_empty());
 
         std::fs::remove_dir_all(data_dir).expect("remove test data");

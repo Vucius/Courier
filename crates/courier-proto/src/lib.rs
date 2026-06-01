@@ -79,7 +79,30 @@ pub struct AccountState {
     pub id: AccountId,
     pub email: String,
     pub provider: ProviderKind,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub auth_type: AuthType,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    pub id: IdentityId,
+    pub account_id: AccountId,
+    pub name: String,
+    pub email: String,
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentitySummary {
+    pub id: IdentityId,
+    pub account_id: AccountId,
+    pub name: String,
+    pub email: String,
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +172,8 @@ pub enum EngineCommand {
     SaveAccount(AccountConfig),
     SetAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
+    SaveIdentity(IdentityConfig),
+    DeleteIdentity(IdentityId),
     SendMessage(DraftId),
     SaveDraft(DraftMessage),
     Snooze(MessageId, i64),
@@ -159,6 +184,8 @@ pub enum EngineCommand {
 pub enum EngineEvent {
     Ready,
     AccountsUpdated(Vec<AccountState>),
+    IdentitiesUpdated(Vec<IdentitySummary>),
+    IdentitySaved(IdentitySummary),
     MailboxesUpdated(Vec<MailboxSummary>),
     AccountSaved(AccountSummary),
     SyncProgress {

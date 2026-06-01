@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
     AccountConfig, AccountId, AccountState, AuthType, DraftId, DraftMessage, EngineCommand,
-    EngineEvent, MailboxId, MailboxSummary, MessageBody, ProviderKind, ThreadId, ThreadSummary,
+    EngineEvent, IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxSummary,
+    MessageBody, ProviderKind, ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
@@ -33,13 +34,19 @@ pub enum Message {
     AccountSmtpHostChanged(String),
     AccountSmtpPortChanged(String),
     SaveAccount,
+    EditAccount(AccountId),
     ToggleAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
+    IdentityNameChanged(String),
+    IdentityEmailChanged(String),
+    SaveIdentity,
+    DeleteIdentity(IdentityId),
 }
 
 pub struct App {
     engine: EngineHandle,
     accounts: Vec<AccountState>,
+    identities: Vec<IdentitySummary>,
     mailboxes: Vec<MailboxSummary>,
     threads: Vec<ThreadSummary>,
     selected_mailbox_id: Option<MailboxId>,
@@ -52,11 +59,14 @@ pub struct App {
     draft_subject: String,
     draft_body: String,
     account_setup_visible: bool,
+    editing_account_id: Option<AccountId>,
     account_email: String,
     account_imap_host: String,
     account_imap_port: String,
     account_smtp_host: String,
     account_smtp_port: String,
+    identity_name: String,
+    identity_email: String,
     status: String,
 }
 
@@ -67,6 +77,7 @@ pub fn init() -> (App, Task<Message>) {
     let app = App {
         engine,
         accounts: Vec::new(),
+        identities: Vec::new(),
         mailboxes: Vec::new(),
         threads: Vec::new(),
         selected_mailbox_id: None,
@@ -79,11 +90,14 @@ pub fn init() -> (App, Task<Message>) {
         draft_subject: String::new(),
         draft_body: String::new(),
         account_setup_visible: false,
+        editing_account_id: None,
         account_email: String::new(),
         account_imap_host: String::new(),
         account_imap_port: "993".to_string(),
         account_smtp_host: String::new(),
         account_smtp_port: "587".to_string(),
+        identity_name: String::new(),
+        identity_email: String::new(),
         status: "Engine starting".to_string(),
     };
 
@@ -131,6 +145,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::AddAccount => {
             app.account_setup_visible = true;
+            app.editing_account_id = None;
+            reset_account_form(app);
             app.selected_body = None;
             app.selected_render = None;
             app.selected_thread = None;
@@ -294,7 +310,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SaveAccount => match account_config_from_form(app) {
             Ok(account) => {
                 let engine = app.engine.clone();
-                app.status = "Saving account".to_string();
+                app.status = if app.editing_account_id.is_some() {
+                    "Updating account".to_string()
+                } else {
+                    "Saving account".to_string()
+                };
                 Task::perform(
                     async move {
                         let _ = engine.send(EngineCommand::SaveAccount(account)).await;
@@ -307,6 +327,28 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::EditAccount(account_id) => {
+            if let Some(account) = app
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+            {
+                app.account_setup_visible = true;
+                app.editing_account_id = Some(account.id);
+                app.account_email = account.email;
+                app.account_imap_host = account.imap_host;
+                app.account_imap_port = account.imap_port.to_string();
+                app.account_smtp_host = account.smtp_host;
+                app.account_smtp_port = account.smtp_port.to_string();
+                app.identity_name.clear();
+                app.identity_email.clear();
+                app.status = "Editing account".to_string();
+            } else {
+                app.status = "Account no longer exists".to_string();
+            }
+            Task::none()
+        }
         Message::ToggleAccountEnabled(account_id, enabled) => {
             let engine = app.engine.clone();
             app.status = if enabled {
@@ -329,6 +371,42 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::perform(
                 async move {
                     let _ = engine.send(EngineCommand::DeleteAccount(account_id)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::IdentityNameChanged(value) => {
+            app.identity_name = value;
+            Task::none()
+        }
+        Message::IdentityEmailChanged(value) => {
+            app.identity_email = value;
+            Task::none()
+        }
+        Message::SaveIdentity => match identity_config_from_form(app) {
+            Ok(identity) => {
+                let engine = app.engine.clone();
+                app.status = "Saving identity".to_string();
+                Task::perform(
+                    async move {
+                        let _ = engine.send(EngineCommand::SaveIdentity(identity)).await;
+                    },
+                    |_| Message::SyncQueued,
+                )
+            }
+            Err(error) => {
+                app.status = error;
+                Task::none()
+            }
+        },
+        Message::DeleteIdentity(identity_id) => {
+            let engine = app.engine.clone();
+            app.status = "Deleting identity".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::DeleteIdentity(identity_id))
+                        .await;
                 },
                 |_| Message::SyncQueued,
             )
@@ -367,11 +445,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let reader = if app.account_setup_visible {
         column![crate::views::account_setup::view(
             &app.accounts,
+            &app.identities,
+            app.editing_account_id.as_ref(),
             &app.account_email,
             &app.account_imap_host,
             &app.account_imap_port,
             &app.account_smtp_host,
             &app.account_smtp_port,
+            &app.identity_name,
+            &app.identity_email,
         )]
         .height(Length::Fill)
         .spacing(10)
@@ -439,13 +521,24 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
             app.accounts = accounts;
             app.status = "Accounts loaded".to_string();
         }
+        EngineEvent::IdentitiesUpdated(identities) => {
+            app.identities = identities;
+            app.status = "Identities loaded".to_string();
+        }
         EngineEvent::MailboxesUpdated(mailboxes) => {
             app.mailboxes = mailboxes;
             app.status = "Mailboxes loaded".to_string();
         }
         EngineEvent::AccountSaved(account) => {
             app.account_setup_visible = false;
+            app.editing_account_id = None;
+            reset_account_form(app);
             app.status = format!("Account saved: {}", account.email);
+        }
+        EngineEvent::IdentitySaved(identity) => {
+            app.identity_name.clear();
+            app.identity_email.clear();
+            app.status = format!("Identity saved: {}", identity.email);
         }
         EngineEvent::SyncProgress { progress, .. } => {
             app.status = format!("Sync {:.0}%", progress * 100.0);
@@ -525,15 +618,67 @@ fn account_config_from_form(app: &App) -> Result<AccountConfig, String> {
     let smtp_port = parse_port(&app.account_smtp_port, "SMTP")?;
 
     Ok(AccountConfig {
-        id: AccountId(format!("account:{}", safe_identifier(email))),
+        id: app
+            .editing_account_id
+            .clone()
+            .unwrap_or_else(|| AccountId(format!("account:{}", safe_identifier(email)))),
         email: email.to_string(),
-        provider: ProviderKind::GenericImap,
+        provider: edited_account(app)
+            .map(|account| account.provider.clone())
+            .unwrap_or(ProviderKind::GenericImap),
         imap_host: imap_host.to_string(),
         imap_port,
         smtp_host: smtp_host.to_string(),
         smtp_port,
-        auth_type: AuthType::Password,
+        auth_type: edited_account(app)
+            .map(|account| account.auth_type.clone())
+            .unwrap_or(AuthType::Password),
     })
+}
+
+fn edited_account(app: &App) -> Option<&AccountState> {
+    let account_id = app.editing_account_id.as_ref()?;
+    app.accounts
+        .iter()
+        .find(|account| account.id == *account_id)
+}
+
+fn identity_config_from_form(app: &App) -> Result<IdentityConfig, String> {
+    let account_id = app
+        .editing_account_id
+        .clone()
+        .ok_or_else(|| "Edit an account before adding an identity".to_string())?;
+    let name = app.identity_name.trim();
+    let email = app.identity_email.trim();
+
+    if name.is_empty() {
+        return Err("Enter an identity display name".to_string());
+    }
+    if email.is_empty() || !email.contains('@') {
+        return Err("Enter a valid identity email".to_string());
+    }
+
+    Ok(IdentityConfig {
+        id: IdentityId(format!(
+            "identity:{}:{}",
+            safe_identifier(&account_id.0),
+            safe_identifier(email)
+        )),
+        account_id,
+        name: name.to_string(),
+        email: email.to_string(),
+        reply_to: None,
+    })
+}
+
+fn reset_account_form(app: &mut App) {
+    app.account_email.clear();
+    app.account_imap_host.clear();
+    app.account_imap_port = "993".to_string();
+    app.account_smtp_host.clear();
+    app.account_smtp_port = "587".to_string();
+    app.identity_name.clear();
+    app.identity_email.clear();
 }
 
 fn parse_port(value: &str, label: &str) -> Result<u16, String> {

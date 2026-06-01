@@ -242,6 +242,39 @@ impl EngineRuntime {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
                 }
             },
+            EngineCommand::SaveIdentity(identity) => match storage.upsert_identity(&identity) {
+                Ok(()) => {
+                    tracing::info!(
+                        identity_id = %identity.id.0,
+                        account_id = %identity.account_id.0,
+                        "saved sending identity"
+                    );
+                    self.publish_snapshot(storage);
+                    let _ = self.event_tx.send(EngineEvent::IdentitySaved(
+                        courier_proto::IdentitySummary {
+                            id: identity.id,
+                            account_id: identity.account_id,
+                            name: identity.name,
+                            email: identity.email,
+                            reply_to: identity.reply_to,
+                        },
+                    ));
+                }
+                Err(error) => {
+                    let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                }
+            },
+            EngineCommand::DeleteIdentity(identity_id) => {
+                match storage.delete_identity(&identity_id) {
+                    Ok(()) => {
+                        tracing::info!(identity_id = %identity_id.0, "deleted sending identity");
+                        self.publish_snapshot(storage);
+                    }
+                    Err(error) => {
+                        let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                    }
+                }
+            }
             EngineCommand::SendMessage(draft_id) => {
                 let task_id = TaskId(format!("send:{}", draft_id.0));
                 match sync.send_draft(draft_id).await {
@@ -290,6 +323,17 @@ impl EngineRuntime {
         match storage.list_accounts() {
             Ok(accounts) => {
                 let _ = self.event_tx.send(EngineEvent::AccountsUpdated(accounts));
+            }
+            Err(error) => {
+                let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+
+        match storage.list_identities() {
+            Ok(identities) => {
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::IdentitiesUpdated(identities));
             }
             Err(error) => {
                 let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
