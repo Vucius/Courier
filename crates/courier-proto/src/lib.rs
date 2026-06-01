@@ -63,6 +63,18 @@ pub struct AccountSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountConfig {
+    pub id: AccountId,
+    pub email: String,
+    pub provider: ProviderKind,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub auth_type: AuthType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxSummary {
     pub id: MailboxId,
     pub account_id: AccountId,
@@ -91,6 +103,16 @@ pub struct MessageBody {
     pub to: Vec<String>,
     pub content_type: String,
     pub body: String,
+    pub attachments: Vec<AttachmentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentSummary {
+    pub id: AttachmentId,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub blob_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +138,7 @@ pub enum EngineCommand {
     MarkRead(MessageId, bool),
     ArchiveMessage(MessageId),
     MoveToTrash(MessageId),
+    SaveAccount(AccountConfig),
     SendMessage(DraftId),
     SaveDraft(DraftMessage),
     Snooze(MessageId, i64),
@@ -126,6 +149,7 @@ pub enum EngineCommand {
 pub enum EngineEvent {
     Ready,
     MailboxesUpdated(Vec<MailboxSummary>),
+    AccountSaved(AccountSummary),
     SyncProgress {
         account_id: AccountId,
         progress: f32,

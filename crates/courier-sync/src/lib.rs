@@ -161,7 +161,20 @@ where
                 })
             }
             Err(error) => {
-                self.storage.mark_draft_failed(&draft_id)?;
+                let retry_count = self
+                    .storage
+                    .draft_retry_count(&draft_id)?
+                    .unwrap_or_default();
+                let error_message = error.to_string();
+                if retry_count + 1 >= self.retry_policy.max_retries {
+                    self.storage.mark_draft_failed(&draft_id, &error_message)?;
+                } else {
+                    self.storage.mark_draft_retry(
+                        &draft_id,
+                        &error_message,
+                        unix_timestamp() + self.retry_delay_seconds(retry_count),
+                    )?;
+                }
                 Err(error.into())
             }
         }
@@ -201,8 +214,10 @@ where
         let mut message_ids = Vec::with_capacity(delta.new_message_count());
 
         for message in delta.messages {
-            message_ids.push(message.id.clone());
-            self.persist_remote_message(account_id, mailbox_id, message)?;
+            let message_id = message.id.clone();
+            if self.persist_remote_message(account_id, mailbox_id, message)? {
+                message_ids.push(message_id);
+            }
         }
 
         self.storage
@@ -216,7 +231,21 @@ where
         account_id: &AccountId,
         mailbox_id: &MailboxId,
         message: RemoteMessage,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self
+            .storage
+            .message_conflict_state(&message.id)?
+            .is_some_and(|state| state == "local_pending")
+        {
+            tracing::warn!(
+                message_id = %message.id.0,
+                account_id = %account_id.0,
+                "remote delta conflicted with pending local change"
+            );
+            self.storage.mark_message_conflicted(&message.id)?;
+            return Ok(false);
+        }
+
         let thread = ThreadSummary {
             id: message.thread_id.clone(),
             account_id: account_id.clone(),
@@ -234,12 +263,19 @@ where
             to: message.to,
             content_type: message.content_type,
             body: message.body,
+            attachments: Vec::new(),
         };
 
         self.storage.upsert_thread(&thread)?;
         self.storage.upsert_message(mailbox_id, &thread, &body)?;
 
-        Ok(())
+        Ok(true)
+    }
+
+    fn retry_delay_seconds(&self, retry_count: u32) -> i64 {
+        let multiplier = 2_u64.saturating_pow(retry_count.min(16));
+        let delay_ms = self.retry_policy.base_delay_ms.saturating_mul(multiplier);
+        ((delay_ms.saturating_add(999)) / 1000).min(i64::MAX as u64) as i64
     }
 }
 
@@ -273,6 +309,14 @@ fn remote_op_from_queued_op(op: &QueuedOp) -> Result<RemoteOp> {
         }
         other => Err(Error::UnsupportedQueuedOp(other.to_string())),
     }
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .min(i64::MAX as u64) as i64
 }
 
 fn outgoing_message_from_draft(draft: &DraftMessage) -> OutgoingMessage {
@@ -323,7 +367,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use courier_adapter::{NoopRemote, RemoteDelta, RemoteMessage, RemoteOp};
+    use courier_adapter::{
+        MailRemote, NoopRemote, OutgoingMessage, RemoteDelta, RemoteMessage, RemoteOp, SendResult,
+    };
     use courier_domain::SyncCursor;
     use courier_proto::{
         AccountId, AccountSummary, DraftId, DraftMessage, MailboxId, MailboxRole, MailboxSummary,
@@ -367,6 +413,7 @@ mod tests {
             to: vec!["sync@example.test".to_string()],
             content_type: "text/plain".to_string(),
             body: "Local operation acknowledgement test.".to_string(),
+            attachments: Vec::new(),
         };
 
         storage.upsert_account(&account).expect("upsert account");
@@ -397,6 +444,12 @@ mod tests {
                 .pending_ops()
                 .expect("pending after sync")
                 .is_empty()
+        );
+        assert_eq!(
+            storage
+                .message_conflict_state(&body.id)
+                .expect("conflict state after sync"),
+            Some("none".to_string())
         );
         assert_eq!(
             remote.applied_ops(),
@@ -491,6 +544,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_now_marks_conflict_without_overwriting_local_pending_message() {
+        let data_dir = test_data_dir("remote-conflict");
+        let storage = Storage::open(&data_dir).expect("open storage");
+        storage.initialize().expect("initialize storage");
+
+        let account = AccountSummary {
+            id: AccountId("account:conflict".to_string()),
+            email: "conflict@example.test".to_string(),
+            provider: ProviderKind::GenericImap,
+        };
+        let mailbox = MailboxSummary {
+            id: MailboxId("account:conflict:inbox".to_string()),
+            account_id: account.id.clone(),
+            name: "Inbox".to_string(),
+            role: MailboxRole::Inbox,
+            unread_count: 1,
+        };
+        let thread = ThreadSummary {
+            id: ThreadId("thread:conflict".to_string()),
+            account_id: account.id.clone(),
+            subject: "Local subject".to_string(),
+            sender: "sender@example.test".to_string(),
+            snippet: "Local snippet".to_string(),
+            unread: true,
+            last_message_ts: 7,
+        };
+        let body = MessageBody {
+            id: MessageId("message:conflict".to_string()),
+            thread_id: thread.id.clone(),
+            subject: thread.subject.clone(),
+            from: thread.sender.clone(),
+            to: vec!["conflict@example.test".to_string()],
+            content_type: "text/plain".to_string(),
+            body: "Local body should remain.".to_string(),
+            attachments: Vec::new(),
+        };
+
+        storage.upsert_account(&account).expect("upsert account");
+        storage.upsert_mailbox(&mailbox).expect("upsert mailbox");
+        storage.upsert_thread(&thread).expect("upsert thread");
+        storage
+            .upsert_message(&mailbox.id, &thread, &body)
+            .expect("upsert message");
+        storage
+            .mark_message_read(&body.id, true)
+            .expect("mark local pending");
+
+        let scheduler = SyncScheduler::with_remote(storage.clone(), NoopRemote::default());
+        let persisted = scheduler
+            .persist_remote_message(
+                &account.id,
+                &mailbox.id,
+                RemoteMessage {
+                    id: body.id.clone(),
+                    thread_id: thread.id.clone(),
+                    subject: "Remote subject".to_string(),
+                    from: "remote@example.test".to_string(),
+                    to: vec!["conflict@example.test".to_string()],
+                    snippet: "Remote snippet".to_string(),
+                    body: "Remote body should not overwrite.".to_string(),
+                    content_type: "text/plain".to_string(),
+                    timestamp: 9,
+                    read: false,
+                },
+            )
+            .expect("persist remote message");
+
+        assert!(!persisted);
+        assert_eq!(
+            storage
+                .message_conflict_state(&body.id)
+                .expect("conflict state"),
+            Some("conflicted".to_string())
+        );
+        let loaded = storage
+            .load_message_for_thread(&thread.id)
+            .expect("load message")
+            .expect("message exists");
+        assert_eq!(loaded.body, "Local body should remain.");
+
+        std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn sync_now_applies_confirmed_remote_delta_after_clearing_local_pending() {
+        let data_dir = test_data_dir("remote-confirmed-delta");
+        let storage = Storage::open(&data_dir).expect("open storage");
+        storage.initialize().expect("initialize storage");
+
+        let account = AccountSummary {
+            id: AccountId("account:confirmed".to_string()),
+            email: "confirmed@example.test".to_string(),
+            provider: ProviderKind::GenericImap,
+        };
+        let mailbox = MailboxSummary {
+            id: MailboxId("account:confirmed:inbox".to_string()),
+            account_id: account.id.clone(),
+            name: "Inbox".to_string(),
+            role: MailboxRole::Inbox,
+            unread_count: 1,
+        };
+        let thread = ThreadSummary {
+            id: ThreadId("thread:confirmed".to_string()),
+            account_id: account.id.clone(),
+            subject: "Local subject".to_string(),
+            sender: "sender@example.test".to_string(),
+            snippet: "Local snippet".to_string(),
+            unread: true,
+            last_message_ts: 7,
+        };
+        let body = MessageBody {
+            id: MessageId("message:confirmed".to_string()),
+            thread_id: thread.id.clone(),
+            subject: thread.subject.clone(),
+            from: thread.sender.clone(),
+            to: vec!["confirmed@example.test".to_string()],
+            content_type: "text/plain".to_string(),
+            body: "Local body should be replaced after writeback confirmation.".to_string(),
+            attachments: Vec::new(),
+        };
+
+        storage.upsert_account(&account).expect("upsert account");
+        storage.upsert_mailbox(&mailbox).expect("upsert mailbox");
+        storage.upsert_thread(&thread).expect("upsert thread");
+        storage
+            .upsert_message(&mailbox.id, &thread, &body)
+            .expect("upsert message");
+        storage
+            .mark_message_read(&body.id, true)
+            .expect("mark local pending");
+
+        let remote = NoopRemote::with_delta(RemoteDelta {
+            cursor: SyncCursor {
+                uid_validity: 1,
+                last_uid: 2,
+                highest_modseq: None,
+            },
+            messages: vec![RemoteMessage {
+                id: body.id.clone(),
+                thread_id: thread.id.clone(),
+                subject: "Remote subject".to_string(),
+                from: "remote@example.test".to_string(),
+                to: vec!["confirmed@example.test".to_string()],
+                snippet: "Remote snippet".to_string(),
+                body: "Remote body can update after writeback.".to_string(),
+                content_type: "text/plain".to_string(),
+                timestamp: 9,
+                read: false,
+            }],
+        });
+        let scheduler = SyncScheduler::with_remote(storage.clone(), remote);
+        let report = scheduler
+            .sync_now(account.id.clone())
+            .await
+            .expect("sync now");
+
+        assert_eq!(report.remote_messages, 1);
+        assert_eq!(report.mailbox_updates.len(), 1);
+        assert_eq!(
+            storage
+                .message_conflict_state(&body.id)
+                .expect("conflict state"),
+            Some("none".to_string())
+        );
+        let loaded = storage
+            .load_message_for_thread(&thread.id)
+            .expect("load message")
+            .expect("message exists");
+        assert_eq!(loaded.body, "Remote body can update after writeback.");
+
+        std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[tokio::test]
     async fn send_draft_uses_remote_and_persists_sent_copy() {
         let data_dir = test_data_dir("send-draft");
         let storage = Storage::open(&data_dir).expect("open storage");
@@ -546,6 +773,94 @@ mod tests {
         assert!(!sent_threads[0].unread);
 
         std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn send_draft_requeues_failures_until_retry_limit() {
+        let data_dir = test_data_dir("send-retry");
+        let storage = Storage::open(&data_dir).expect("open storage");
+        storage.initialize().expect("initialize storage");
+
+        let account = AccountSummary {
+            id: AccountId("account:retry".to_string()),
+            email: "retry@example.test".to_string(),
+            provider: ProviderKind::GenericImap,
+        };
+        let draft = DraftMessage {
+            id: DraftId("draft:retry".to_string()),
+            account_id: account.id.clone(),
+            to: vec!["receiver@example.test".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Retry pipeline".to_string(),
+            body: "This send should be retried.".to_string(),
+            attachments: Vec::new(),
+        };
+
+        storage.upsert_account(&account).expect("upsert account");
+        storage.save_draft(&draft).expect("save draft");
+
+        let scheduler = SyncScheduler::with_remote(storage.clone(), FailingRemote);
+
+        for attempt in 1..=scheduler.retry_policy().max_retries {
+            let result = scheduler.send_draft(draft.id.clone()).await;
+            assert!(result.is_err());
+
+            let status = storage
+                .draft_status(&draft.id)
+                .expect("draft status")
+                .expect("draft status exists");
+            let retry_count = storage
+                .draft_retry_count(&draft.id)
+                .expect("draft retry count")
+                .expect("draft retry count exists");
+
+            if attempt < scheduler.retry_policy().max_retries {
+                assert_eq!(status, "pending");
+                assert_eq!(retry_count, attempt);
+            } else {
+                assert_eq!(status, "failed");
+                assert_eq!(retry_count, scheduler.retry_policy().max_retries);
+            }
+        }
+
+        std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingRemote;
+
+    impl MailRemote for FailingRemote {
+        fn list_mailboxes(
+            &self,
+        ) -> impl std::future::Future<
+            Output = courier_adapter::Result<Vec<courier_adapter::RemoteMailbox>>,
+        > + Send {
+            async { Ok(Vec::new()) }
+        }
+
+        fn fetch_delta(
+            &self,
+            _mailbox: MailboxId,
+            cursor: SyncCursor,
+        ) -> impl std::future::Future<Output = courier_adapter::Result<RemoteDelta>> + Send
+        {
+            async move { Ok(RemoteDelta::empty(cursor)) }
+        }
+
+        fn apply_ops(
+            &self,
+            _ops: Vec<RemoteOp>,
+        ) -> impl std::future::Future<Output = courier_adapter::Result<()>> + Send {
+            async { Ok(()) }
+        }
+
+        fn send_message(
+            &self,
+            _message: OutgoingMessage,
+        ) -> impl std::future::Future<Output = courier_adapter::Result<SendResult>> + Send {
+            async { Err(courier_adapter::Error::NotImplemented("smtp send_message")) }
+        }
     }
 
     fn test_data_dir(name: &str) -> PathBuf {

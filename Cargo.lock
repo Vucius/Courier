@@ -755,6 +755,7 @@ dependencies = [
  "courier-app",
  "courier-proto",
  "courier-render",
+ "courier-security",
  "iced",
  "tokio",
  "tracing-subscriber",

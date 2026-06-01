@@ -14,6 +14,21 @@ pub enum LinkClickPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentRisk {
+    Low,
+    Caution,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentDecision {
+    pub risk: AttachmentRisk,
+    pub can_preview: bool,
+    pub can_open: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SanitizedHtml {
     pub html: String,
     pub blocked_remote_images: bool,
@@ -49,6 +64,44 @@ pub fn redact_email(value: &str) -> String {
 
 pub fn redact_token(_: &str) -> &'static str {
     "[redacted-token]"
+}
+
+pub fn classify_attachment(filename: &str, mime_type: &str, size: u64) -> AttachmentDecision {
+    let extension = filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime_type = mime_type.to_ascii_lowercase();
+
+    if is_blocked_extension(&extension) {
+        return AttachmentDecision {
+            risk: AttachmentRisk::Blocked,
+            can_preview: false,
+            can_open: false,
+            reason: "Executable attachment blocked".to_string(),
+        };
+    }
+
+    if is_caution_extension(&extension) || is_caution_mime(&mime_type) {
+        return AttachmentDecision {
+            risk: AttachmentRisk::Caution,
+            can_preview: false,
+            can_open: true,
+            reason: "Review before opening".to_string(),
+        };
+    }
+
+    let can_preview = is_previewable_mime(&mime_type) && size <= 10 * 1024 * 1024;
+    AttachmentDecision {
+        risk: AttachmentRisk::Low,
+        can_preview,
+        can_open: true,
+        reason: if can_preview {
+            "Preview available".to_string()
+        } else {
+            "Open with system app".to_string()
+        },
+    }
 }
 
 fn strip_tag_blocks(input: &str, tag: &str) -> String {
@@ -328,6 +381,49 @@ fn strip_remote_src_from_tag(tag: &str) -> String {
     clean
 }
 
+fn is_blocked_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "exe"
+            | "msi"
+            | "bat"
+            | "cmd"
+            | "com"
+            | "scr"
+            | "ps1"
+            | "vbs"
+            | "js"
+            | "jar"
+            | "sh"
+            | "app"
+            | "dmg"
+    )
+}
+
+fn is_caution_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "zip" | "rar" | "7z" | "tar" | "gz" | "docm" | "xlsm" | "pptm"
+    )
+}
+
+fn is_caution_mime(mime_type: &str) -> bool {
+    mime_type.contains("application/zip")
+        || mime_type.contains("application/x-7z")
+        || mime_type.contains("application/x-rar")
+        || mime_type.contains("application/vnd.ms-excel.sheet.macroenabled")
+        || mime_type.contains("application/vnd.ms-word.document.macroenabled")
+}
+
+fn is_previewable_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("text/")
+        || mime_type == "application/pdf"
+        || mime_type == "image/png"
+        || mime_type == "image/jpeg"
+        || mime_type == "image/gif"
+        || mime_type == "image/webp"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +460,32 @@ mod tests {
         assert!(!sanitized.html.contains("style"));
         assert!(!sanitized.html.contains("onclick"));
         assert!(!sanitized.html.contains("alert with spaces"));
+    }
+
+    #[test]
+    fn attachment_policy_blocks_executables() {
+        let decision = classify_attachment("invoice.exe", "application/octet-stream", 42);
+
+        assert_eq!(decision.risk, AttachmentRisk::Blocked);
+        assert!(!decision.can_open);
+        assert!(!decision.can_preview);
+    }
+
+    #[test]
+    fn attachment_policy_allows_safe_previewable_files() {
+        let decision = classify_attachment("note.txt", "text/plain", 42);
+
+        assert_eq!(decision.risk, AttachmentRisk::Low);
+        assert!(decision.can_open);
+        assert!(decision.can_preview);
+    }
+
+    #[test]
+    fn attachment_policy_marks_archives_for_review() {
+        let decision = classify_attachment("payload.zip", "application/zip", 42);
+
+        assert_eq!(decision.risk, AttachmentRisk::Caution);
+        assert!(decision.can_open);
+        assert!(!decision.can_preview);
     }
 }

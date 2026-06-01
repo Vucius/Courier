@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use courier_domain::SyncCursor;
 use courier_mime::{BodyKind, ParsedAttachment, parse_rfc822};
 use courier_proto::{
-    AccountId, AccountSummary, AttachmentId, AuthType, DraftId, DraftMessage, MailboxId,
-    MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind, ThreadId, ThreadSummary,
+    AccountConfig, AccountId, AccountSummary, AttachmentId, AttachmentSummary, AuthType, DraftId,
+    DraftMessage, MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId, ProviderKind,
+    ThreadId, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -50,6 +51,20 @@ pub struct StoredAttachment {
     pub blob_path: Option<PathBuf>,
 }
 
+impl From<StoredAttachment> for AttachmentSummary {
+    fn from(attachment: StoredAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            filename: attachment.filename,
+            mime_type: attachment.mime_type,
+            size: attachment.size,
+            blob_path: attachment
+                .blob_path
+                .map(|path| path.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 impl Storage {
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
@@ -64,6 +79,7 @@ impl Storage {
         let connection = rusqlite::Connection::open(&db_path)?;
         connection.execute_batch(include_str!("../../../migrations/001_init.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/002_search.sql"))?;
+        ensure_tasks_retry_columns(&connection)?;
 
         tracing::info!(path = %db_path.display(), "courier storage initialized");
         Ok(())
@@ -88,6 +104,51 @@ impl Storage {
                 auth_type_to_str(&AuthType::Password),
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn upsert_account_config(&self, account: &AccountConfig) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            INSERT INTO accounts (
+                id, email, provider, imap_host, imap_port, smtp_host, smtp_port, auth_type, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
+            ON CONFLICT(id) DO UPDATE SET
+                email = excluded.email,
+                provider = excluded.provider,
+                imap_host = excluded.imap_host,
+                imap_port = excluded.imap_port,
+                smtp_host = excluded.smtp_host,
+                smtp_port = excluded.smtp_port,
+                auth_type = excluded.auth_type
+            "#,
+            params![
+                account.id.0,
+                account.email,
+                provider_to_str(&account.provider),
+                account.imap_host,
+                i64::from(account.imap_port),
+                account.smtp_host,
+                i64::from(account.smtp_port),
+                auth_type_to_str(&account.auth_type),
+            ],
+        )?;
+        self.ensure_standard_mailboxes(&account.id)
+    }
+
+    pub fn ensure_standard_mailboxes(&self, account_id: &AccountId) -> Result<()> {
+        let connection = self.connection()?;
+        for role in [
+            MailboxRole::Inbox,
+            MailboxRole::Sent,
+            MailboxRole::Drafts,
+            MailboxRole::Archive,
+            MailboxRole::Trash,
+        ] {
+            ensure_mailbox_for_role(&connection, account_id, &role)?;
+        }
         Ok(())
     }
 
@@ -343,6 +404,7 @@ impl Storage {
                 BodyKind::Html => "text/html".to_string(),
             },
             body: parsed.body.content,
+            attachments: Vec::new(),
         };
 
         self.upsert_thread(&thread)?;
@@ -414,7 +476,7 @@ impl Storage {
 
     pub fn load_message_for_thread(&self, thread_id: &ThreadId) -> Result<Option<MessageBody>> {
         let connection = self.connection()?;
-        connection
+        let mut body = connection
             .query_row(
                 r#"
                 SELECT
@@ -442,11 +504,43 @@ impl Storage {
                         to: split_recipients(&to),
                         content_type: row.get(5)?,
                         body: row.get(6)?,
+                        attachments: Vec::new(),
                     })
                 },
             )
             .optional()
+            .map_err(Error::from)?;
+
+        if let Some(body) = body.as_mut() {
+            body.attachments = self
+                .list_attachments(&body.id)?
+                .into_iter()
+                .map(AttachmentSummary::from)
+                .collect();
+        }
+
+        Ok(body)
+    }
+
+    pub fn message_conflict_state(&self, message_id: &MessageId) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT conflict_state FROM messages WHERE id = ?1",
+                params![message_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
             .map_err(Error::from)
+    }
+
+    pub fn mark_message_conflicted(&self, message_id: &MessageId) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE messages SET conflict_state = 'conflicted' WHERE id = ?1",
+            params![message_id.0],
+        )?;
+        Ok(())
     }
 
     pub fn list_attachments(&self, message_id: &MessageId) -> Result<Vec<StoredAttachment>> {
@@ -578,11 +672,44 @@ impl Storage {
     }
 
     pub fn mark_op_completed(&self, op_id: i64) -> Result<()> {
-        let connection = self.connection()?;
-        connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let message_id = {
+            let op_payload = transaction
+                .query_row(
+                    "SELECT payload FROM op_queue WHERE id = ?1",
+                    params![op_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+
+            op_payload
+                .as_deref()
+                .map(message_id_from_op_payload)
+                .transpose()?
+                .flatten()
+        };
+
+        transaction.execute(
             "UPDATE op_queue SET status = 'done', last_error = NULL WHERE id = ?1",
             params![op_id],
         )?;
+
+        if let Some(message_id) = message_id {
+            if !has_pending_op_for_message(&transaction, &message_id, op_id)? {
+                transaction.execute(
+                    r#"
+                    UPDATE messages
+                    SET conflict_state = 'none'
+                    WHERE id = ?1
+                      AND conflict_state = 'local_pending'
+                    "#,
+                    params![message_id.0],
+                )?;
+            }
+        }
+
+        transaction.commit()?;
         Ok(())
     }
 
@@ -655,6 +782,23 @@ impl Storage {
             .map_err(Error::from)
     }
 
+    pub fn draft_retry_count(&self, draft_id: &DraftId) -> Result<Option<u32>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                r#"
+                SELECT retry_count
+                FROM tasks
+                WHERE id = ?1
+                  AND task_type = 'draft'
+                "#,
+                params![draft_id.0],
+                |row| Ok(row.get::<_, i64>(0)?.max(0) as u32),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
     pub fn mark_draft_sending(&self, draft_id: &DraftId) -> Result<()> {
         self.mark_draft_status(draft_id, "sending")
     }
@@ -663,8 +807,37 @@ impl Storage {
         self.mark_draft_status(draft_id, "done")
     }
 
-    pub fn mark_draft_failed(&self, draft_id: &DraftId) -> Result<()> {
-        self.mark_draft_status(draft_id, "failed")
+    pub fn mark_draft_retry(&self, draft_id: &DraftId, error: &str, run_at: i64) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            UPDATE tasks
+            SET status = 'pending',
+                retry_count = retry_count + 1,
+                last_error = ?2,
+                run_at = ?3
+            WHERE id = ?1
+              AND task_type = 'draft'
+            "#,
+            params![draft_id.0, error, run_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_draft_failed(&self, draft_id: &DraftId, error: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            UPDATE tasks
+            SET status = 'failed',
+                retry_count = retry_count + 1,
+                last_error = ?2
+            WHERE id = ?1
+              AND task_type = 'draft'
+            "#,
+            params![draft_id.0, error],
+        )?;
+        Ok(())
     }
 
     pub fn persist_sent_draft(
@@ -705,6 +878,7 @@ impl Storage {
             to: draft.to.clone(),
             content_type: "text/plain".to_string(),
             body: draft.body.clone(),
+            attachments: Vec::new(),
         };
 
         self.upsert_thread(&thread)?;
@@ -1194,6 +1368,62 @@ fn queue_op(
     Ok(connection.last_insert_rowid())
 }
 
+fn message_id_from_op_payload(payload: &str) -> Result<Option<MessageId>> {
+    let value: serde_json::Value = serde_json::from_str(payload)?;
+    Ok(value
+        .get("message_id")
+        .and_then(|value| value.as_str())
+        .map(|value| MessageId(value.to_string())))
+}
+
+fn has_pending_op_for_message(
+    connection: &Connection,
+    message_id: &MessageId,
+    excluded_op_id: i64,
+) -> Result<bool> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT payload
+        FROM op_queue
+        WHERE status = 'pending'
+          AND id <> ?1
+        "#,
+    )?;
+    let rows = statement.query_map(params![excluded_op_id], |row| row.get::<_, String>(0))?;
+
+    for row in rows {
+        if message_id_from_op_payload(&row?)?.as_ref() == Some(message_id) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn ensure_tasks_retry_columns(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "tasks", "retry_count")? {
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "tasks", "last_error")? {
+        connection.execute("ALTER TABLE tasks ADD COLUMN last_error TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn build_fts_query(query: &str) -> String {
     query
         .split_whitespace()
@@ -1255,6 +1485,7 @@ mod tests {
             to: vec!["tester@example.test".to_string()],
             content_type: "text/plain".to_string(),
             body: "The local storage roadmap is searchable.".to_string(),
+            attachments: Vec::new(),
         };
 
         storage.upsert_account(&account).expect("upsert account");
@@ -1393,6 +1624,58 @@ mod tests {
     }
 
     #[test]
+    fn account_config_creates_standard_mailboxes() {
+        let data_dir = test_data_dir("account-config");
+        let storage = Storage::open(&data_dir).expect("open storage");
+        storage.initialize().expect("initialize storage");
+
+        let account = AccountConfig {
+            id: AccountId("account:configured".to_string()),
+            email: "configured@example.test".to_string(),
+            provider: ProviderKind::GenericImap,
+            imap_host: "imap.example.test".to_string(),
+            imap_port: 993,
+            smtp_host: "smtp.example.test".to_string(),
+            smtp_port: 587,
+            auth_type: AuthType::Password,
+        };
+
+        storage
+            .upsert_account_config(&account)
+            .expect("upsert account config");
+
+        let mailboxes = storage.list_mailboxes().expect("list mailboxes");
+        assert_eq!(mailboxes.len(), 5);
+        assert!(
+            mailboxes
+                .iter()
+                .any(|mailbox| matches!(mailbox.role, MailboxRole::Inbox))
+        );
+        assert!(
+            mailboxes
+                .iter()
+                .any(|mailbox| matches!(mailbox.role, MailboxRole::Sent))
+        );
+        assert!(
+            mailboxes
+                .iter()
+                .any(|mailbox| matches!(mailbox.role, MailboxRole::Drafts))
+        );
+        assert!(
+            mailboxes
+                .iter()
+                .any(|mailbox| matches!(mailbox.role, MailboxRole::Archive))
+        );
+        assert!(
+            mailboxes
+                .iter()
+                .any(|mailbox| matches!(mailbox.role, MailboxRole::Trash))
+        );
+
+        std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
+
+    #[test]
     fn raw_message_import_persists_body_raw_and_attachments() {
         let data_dir = test_data_dir("raw-import");
         let storage = Storage::open(&data_dir).expect("open storage");
@@ -1451,6 +1734,10 @@ SGVsbG8=
             .expect("message exists");
         assert_eq!(body.content_type, "text/html");
         assert_eq!(body.body, "<p>Imported HTML body</p>");
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].filename, "note.txt");
+        assert_eq!(body.attachments[0].mime_type, "text/plain");
+        assert_eq!(body.attachments[0].size, 5);
 
         let attachments = storage
             .list_attachments(&message_id)

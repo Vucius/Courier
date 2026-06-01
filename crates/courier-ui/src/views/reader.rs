@@ -1,5 +1,6 @@
-use courier_proto::MessageBody;
+use courier_proto::{AttachmentSummary, MessageBody};
 use courier_render::{ImageSource, RenderNode, RenderTree};
+use courier_security::{AttachmentRisk, classify_attachment};
 use iced::Element;
 use iced::Length;
 use iced::widget::{column, container, row, scrollable, text};
@@ -18,34 +19,102 @@ pub fn view<'a>(
                 body.to.join(", ")
             };
             let rendered_body = render_tree_view(render_tree, &body.body);
-
-            container(
-                column![
-                    crate::components::surface::header(
-                        &body.subject,
-                        crate::components::action_bar::button_text("Reply", Message::Compose),
-                    ),
-                    crate::components::surface::divider(),
-                    row![
-                        crate::components::avatar::view(&body.from, false),
-                        crate::components::list::metadata_rows(vec![
-                            ("From", body.from.clone()),
-                            ("To", recipients),
-                        ]),
-                    ]
-                    .spacing(10)
-                    .padding(12),
-                    rendered_body,
+            let mut content = column![
+                crate::components::surface::header(
+                    &body.subject,
+                    crate::components::action_bar::button_text("Reply", Message::Compose),
+                ),
+                crate::components::surface::divider(),
+                row![
+                    crate::components::avatar::view(&body.from, false),
+                    crate::components::list::metadata_rows(vec![
+                        ("From", body.from.clone()),
+                        ("To", recipients),
+                    ]),
                 ]
-                .height(Length::Fill),
-            )
-            .height(Length::FillPortion(3))
-            .into()
+                .spacing(10)
+                .padding(12),
+            ]
+            .height(Length::Fill);
+
+            if !body.attachments.is_empty() {
+                content = content.push(attachments_view(&body.attachments));
+            }
+
+            content = content.push(rendered_body);
+
+            container(content).height(Length::FillPortion(3)).into()
         }
         None => crate::components::empty_state::view(
             "Select a message",
             "The message body and reply actions will appear here.",
         ),
+    }
+}
+
+fn attachments_view<'a>(attachments: &'a [AttachmentSummary]) -> Element<'a, Message> {
+    let mut content = column![crate::components::list::section_label("Attachments")]
+        .spacing(6)
+        .padding([8, 12]);
+
+    if let Some(notice) = attachment_policy_notice(attachments) {
+        content = content.push(crate::components::notice::inline(
+            crate::components::notice::NoticeKind::Warning,
+            notice,
+        ));
+    }
+
+    for attachment in attachments {
+        content = content.push(crate::components::attachment::chip(
+            attachment.filename.clone(),
+            attachment_detail(attachment),
+        ));
+    }
+
+    content.into()
+}
+
+fn attachment_detail(attachment: &AttachmentSummary) -> String {
+    let decision =
+        classify_attachment(&attachment.filename, &attachment.mime_type, attachment.size);
+    format!(
+        "{} - {} - {}",
+        attachment.mime_type,
+        format_size(attachment.size),
+        decision.reason
+    )
+}
+
+fn attachment_policy_notice(attachments: &[AttachmentSummary]) -> Option<&'static str> {
+    let mut has_caution = false;
+    for attachment in attachments {
+        match classify_attachment(&attachment.filename, &attachment.mime_type, attachment.size).risk
+        {
+            AttachmentRisk::Blocked => {
+                return Some("One or more attachments are blocked by policy.");
+            }
+            AttachmentRisk::Caution => has_caution = true,
+            AttachmentRisk::Low => {}
+        }
+    }
+
+    if has_caution {
+        Some("Review attachment details before opening.")
+    } else {
+        None
+    }
+}
+
+fn format_size(size: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+
+    if size >= MIB {
+        format!("{:.1} MB", size as f64 / MIB as f64)
+    } else if size >= KIB {
+        format!("{:.1} KB", size as f64 / KIB as f64)
+    } else {
+        format!("{size} B")
     }
 }
 

@@ -115,5 +115,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_type   TEXT NOT NULL,
     payload     TEXT NOT NULL,
     run_at      INTEGER NOT NULL,
-    status      TEXT DEFAULT 'pending'
+    status      TEXT DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT
 );

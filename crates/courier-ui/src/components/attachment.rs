@@ -3,12 +3,12 @@ use iced::{Alignment, Background, Border, Element, Length};
 
 use crate::app::Message;
 
-pub fn chip<'a>(name: &'a str, detail: &'a str) -> Element<'a, Message> {
+pub fn chip<'a>(name: impl Into<String>, detail: impl Into<String>) -> Element<'a, Message> {
     container(
         row![
             crate::components::badge::role("FILE"),
-            text(name).size(13).color(crate::theme::TEXT),
-            text(detail).size(12).color(crate::theme::TEXT_MUTED),
+            text(name.into()).size(13).color(crate::theme::TEXT),
+            text(detail.into()).size(12).color(crate::theme::TEXT_MUTED),
         ]
         .spacing(8)
         .align_y(Alignment::Center),

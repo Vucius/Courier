@@ -198,6 +198,26 @@ impl EngineRuntime {
                     }
                 }
             }
+            EngineCommand::SaveAccount(account) => match storage.upsert_account_config(&account) {
+                Ok(()) => {
+                    tracing::info!(
+                        account_id = %account.id.0,
+                        email = %account.email,
+                        "saved account configuration"
+                    );
+                    self.publish_snapshot(storage);
+                    let _ = self
+                        .event_tx
+                        .send(EngineEvent::AccountSaved(AccountSummary {
+                            id: account.id,
+                            email: account.email,
+                            provider: account.provider,
+                        }));
+                }
+                Err(error) => {
+                    let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                }
+            },
             EngineCommand::SendMessage(draft_id) => {
                 let task_id = TaskId(format!("send:{}", draft_id.0));
                 match sync.send_draft(draft_id).await {
@@ -391,6 +411,7 @@ fn demo_threads(account_id: AccountId) -> Vec<(ThreadSummary, MessageBody)> {
                     to: vec!["you@example.test".to_string()],
                     content_type: content_type.to_string(),
                     body: body.to_string(),
+                    attachments: Vec::new(),
                 };
                 (thread, body)
             },

@@ -9,6 +9,7 @@ anyhow.workspace = true
 courier-app.workspace = true
 courier-proto.workspace = true
 courier-render.workspace = true
+courier-security.workspace = true
 iced.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

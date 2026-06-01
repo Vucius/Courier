@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
-    AccountId, DraftId, DraftMessage, EngineCommand, EngineEvent, MailboxId, MailboxSummary,
-    MessageBody, ThreadId, ThreadSummary,
+    AccountConfig, AccountId, AuthType, DraftId, DraftMessage, EngineCommand, EngineEvent,
+    MailboxId, MailboxSummary, MessageBody, ProviderKind, ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
@@ -16,6 +16,7 @@ pub enum Message {
     SyncQueued,
     EngineEvent(EngineEvent),
     MailboxSelected(Option<MailboxId>, String),
+    AddAccount,
     Compose,
     ArchiveSelected,
     MarkReadSelected,
@@ -26,6 +27,12 @@ pub enum Message {
     DraftSubjectChanged(String),
     DraftBodyChanged(String),
     SendDraft,
+    AccountEmailChanged(String),
+    AccountImapHostChanged(String),
+    AccountImapPortChanged(String),
+    AccountSmtpHostChanged(String),
+    AccountSmtpPortChanged(String),
+    SaveAccount,
 }
 
 pub struct App {
@@ -41,6 +48,12 @@ pub struct App {
     draft_to: String,
     draft_subject: String,
     draft_body: String,
+    account_setup_visible: bool,
+    account_email: String,
+    account_imap_host: String,
+    account_imap_port: String,
+    account_smtp_host: String,
+    account_smtp_port: String,
     status: String,
 }
 
@@ -61,6 +74,12 @@ pub fn init() -> (App, Task<Message>) {
         draft_to: String::new(),
         draft_subject: String::new(),
         draft_body: String::new(),
+        account_setup_visible: false,
+        account_email: String::new(),
+        account_imap_host: String::new(),
+        account_imap_port: "993".to_string(),
+        account_smtp_host: String::new(),
+        account_smtp_port: "587".to_string(),
         status: "Engine starting".to_string(),
     };
 
@@ -87,6 +106,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::EngineEvent(event) => handle_engine_event(app, event),
         Message::MailboxSelected(mailbox_id, name) => {
+            app.account_setup_visible = false;
             app.selected_mailbox_id = mailbox_id.clone();
             app.selected_mailbox_name = name.clone();
             app.selected_body = None;
@@ -105,7 +125,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 |_| Message::SyncQueued,
             )
         }
+        Message::AddAccount => {
+            app.account_setup_visible = true;
+            app.selected_body = None;
+            app.selected_render = None;
+            app.selected_thread = None;
+            app.status = "Account setup ready".to_string();
+            Task::none()
+        }
         Message::Compose => {
+            app.account_setup_visible = false;
             app.status = "Draft ready".to_string();
             Task::none()
         }
@@ -177,6 +206,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::SelectThread(thread_id) => {
+            app.account_setup_visible = false;
             app.selected_thread = Some(thread_id.clone());
             app.status = "Loading message".to_string();
             let engine = app.engine.clone();
@@ -229,6 +259,50 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 )
             }
         }
+        Message::AccountEmailChanged(value) => {
+            app.account_email = value;
+            if let Some(domain) = account_domain(&app.account_email) {
+                if app.account_imap_host.trim().is_empty() {
+                    app.account_imap_host = format!("imap.{domain}");
+                }
+                if app.account_smtp_host.trim().is_empty() {
+                    app.account_smtp_host = format!("smtp.{domain}");
+                }
+            }
+            Task::none()
+        }
+        Message::AccountImapHostChanged(value) => {
+            app.account_imap_host = value;
+            Task::none()
+        }
+        Message::AccountImapPortChanged(value) => {
+            app.account_imap_port = value;
+            Task::none()
+        }
+        Message::AccountSmtpHostChanged(value) => {
+            app.account_smtp_host = value;
+            Task::none()
+        }
+        Message::AccountSmtpPortChanged(value) => {
+            app.account_smtp_port = value;
+            Task::none()
+        }
+        Message::SaveAccount => match account_config_from_form(app) {
+            Ok(account) => {
+                let engine = app.engine.clone();
+                app.status = "Saving account".to_string();
+                Task::perform(
+                    async move {
+                        let _ = engine.send(EngineCommand::SaveAccount(account)).await;
+                    },
+                    |_| Message::SyncQueued,
+                )
+            }
+            Err(error) => {
+                app.status = error;
+                Task::none()
+            }
+        },
     }
 }
 
@@ -260,15 +334,28 @@ pub fn view(app: &App) -> Element<'_, Message> {
         app.selected_thread.as_ref(),
         &app.selected_mailbox_name,
     );
-    let reader = column![
-        crate::views::reader::view(app.selected_body.as_ref(), app.selected_render.as_ref()),
-        crate::views::composer::view(&app.draft_to, &app.draft_subject, &app.draft_body,)
-    ]
-    .height(Length::Fill)
-    .spacing(10);
+    let reader = if app.account_setup_visible {
+        column![crate::views::account_setup::view(
+            &app.account_email,
+            &app.account_imap_host,
+            &app.account_imap_port,
+            &app.account_smtp_host,
+            &app.account_smtp_port,
+        )]
+        .height(Length::Fill)
+        .spacing(10)
+    } else {
+        column![
+            crate::views::reader::view(app.selected_body.as_ref(), app.selected_render.as_ref()),
+            crate::views::composer::view(&app.draft_to, &app.draft_subject, &app.draft_body,)
+        ]
+        .height(Length::Fill)
+        .spacing(10)
+    };
 
     let left_actions = row![
         crate::components::action_bar::button_primary("Compose", Message::Compose),
+        crate::components::action_bar::button_toolbar("Account", Message::AddAccount),
         crate::components::action_bar::button_toolbar("Sync", Message::SyncNow),
     ]
     .spacing(8);
@@ -320,6 +407,10 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
         EngineEvent::MailboxesUpdated(mailboxes) => {
             app.mailboxes = mailboxes;
             app.status = "Mailboxes loaded".to_string();
+        }
+        EngineEvent::AccountSaved(account) => {
+            app.account_setup_visible = false;
+            app.status = format!("Account saved: {}", account.email);
         }
         EngineEvent::SyncProgress { progress, .. } => {
             app.status = format!("Sync {:.0}%", progress * 100.0);
@@ -377,6 +468,66 @@ fn split_csv(value: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn account_config_from_form(app: &App) -> Result<AccountConfig, String> {
+    let email = app.account_email.trim();
+    let imap_host = app.account_imap_host.trim();
+    let smtp_host = app.account_smtp_host.trim();
+
+    if email.is_empty() || !email.contains('@') {
+        return Err("Enter a valid email address".to_string());
+    }
+    if imap_host.is_empty() {
+        return Err("Enter an IMAP host".to_string());
+    }
+    if smtp_host.is_empty() {
+        return Err("Enter an SMTP host".to_string());
+    }
+
+    let imap_port = parse_port(&app.account_imap_port, "IMAP")?;
+    let smtp_port = parse_port(&app.account_smtp_port, "SMTP")?;
+
+    Ok(AccountConfig {
+        id: AccountId(format!("account:{}", safe_identifier(email))),
+        email: email.to_string(),
+        provider: ProviderKind::GenericImap,
+        imap_host: imap_host.to_string(),
+        imap_port,
+        smtp_host: smtp_host.to_string(),
+        smtp_port,
+        auth_type: AuthType::Password,
+    })
+}
+
+fn parse_port(value: &str, label: &str) -> Result<u16, String> {
+    value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("Enter a valid {label} port"))
+}
+
+fn account_domain(email: &str) -> Option<String> {
+    let (_, domain) = email.trim().split_once('@')?;
+    let domain = domain.trim();
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain.to_string())
+    }
+}
+
+fn safe_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 

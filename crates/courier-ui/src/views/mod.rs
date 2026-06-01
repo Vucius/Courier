@@ -1,3 +1,4 @@
+pub mod account_setup;
 pub mod composer;
 pub mod mailbox_list;
 pub mod reader;
