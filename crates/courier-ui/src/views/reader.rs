@@ -1,10 +1,11 @@
 use courier_proto::{
-    AttachmentOpenRequest, AttachmentPreview, AttachmentPreviewKind, AttachmentSummary, MessageBody,
+    AttachmentOpenRequest, AttachmentPreview, AttachmentPreviewKind, AttachmentSummary,
+    AttachmentTransfer, AttachmentTransferStatus, MessageBody,
 };
 use courier_render::{ImageSource, RenderNode, RenderTree, TableCell};
 use courier_security::{AttachmentRisk, classify_attachment};
 use iced::font::{Style, Weight};
-use iced::widget::{column, container, row, scrollable, text};
+use iced::widget::{column, container, progress_bar, row, scrollable, text};
 use iced::{Background, Border, Element, Font, Length};
 
 use crate::app::Message;
@@ -14,6 +15,7 @@ pub fn view<'a>(
     render_tree: Option<&'a RenderTree>,
     attachment_preview: Option<&'a AttachmentPreview>,
     attachment_open: Option<&'a AttachmentOpenRequest>,
+    attachment_transfers: &'a [AttachmentTransfer],
 ) -> Element<'a, Message> {
     match body {
         Some(body) => {
@@ -46,6 +48,7 @@ pub fn view<'a>(
                     &body.attachments,
                     attachment_preview,
                     attachment_open,
+                    attachment_transfers,
                 ));
             }
 
@@ -64,6 +67,7 @@ fn attachments_view<'a>(
     attachments: &'a [AttachmentSummary],
     preview: Option<&'a AttachmentPreview>,
     open_request: Option<&'a AttachmentOpenRequest>,
+    transfers: &'a [AttachmentTransfer],
 ) -> Element<'a, Message> {
     let mut content = column![crate::components::list::section_label("Attachments")]
         .spacing(6)
@@ -77,7 +81,10 @@ fn attachments_view<'a>(
     }
 
     for attachment in attachments {
-        content = content.push(attachment_row(attachment));
+        let transfer = transfers
+            .iter()
+            .find(|transfer| transfer.attachment.id == attachment.id);
+        content = content.push(attachment_row(attachment, transfer));
     }
 
     if let Some(preview) = preview {
@@ -91,23 +98,83 @@ fn attachments_view<'a>(
     content.into()
 }
 
-fn attachment_row<'a>(attachment: &'a AttachmentSummary) -> Element<'a, Message> {
-    row![
-        crate::components::attachment::chip(
-            attachment.filename.clone(),
-            attachment_detail(attachment),
-        ),
-        crate::components::action_bar::button_text(
-            "Preview",
-            Message::PreviewAttachment(attachment.id.clone()),
-        ),
-        crate::components::action_bar::button_text(
-            "Open",
-            Message::OpenAttachment(attachment.id.clone()),
-        ),
+fn attachment_row<'a>(
+    attachment: &'a AttachmentSummary,
+    transfer: Option<&'a AttachmentTransfer>,
+) -> Element<'a, Message> {
+    let progress = transfer
+        .map(|transfer| transfer.progress)
+        .unwrap_or_else(|| {
+            if attachment.blob_path.is_some() {
+                1.0
+            } else {
+                0.0
+            }
+        });
+    let message = transfer
+        .map(|transfer| transfer.message.as_str())
+        .unwrap_or_else(|| {
+            if attachment.blob_path.is_some() {
+                "Available locally"
+            } else {
+                "Not downloaded"
+            }
+        });
+
+    let mut actions = row![].spacing(6);
+    match transfer.map(|transfer| &transfer.status) {
+        Some(AttachmentTransferStatus::Downloading) => {
+            actions = actions.push(crate::components::action_bar::button_text(
+                "Cancel",
+                Message::CancelAttachmentDownload(attachment.id.clone()),
+            ));
+        }
+        Some(AttachmentTransferStatus::Failed | AttachmentTransferStatus::Cancelled)
+        | Some(AttachmentTransferStatus::Missing)
+        | None
+            if attachment.blob_path.is_none() =>
+        {
+            actions = actions.push(crate::components::action_bar::button_text(
+                "Download",
+                Message::DownloadAttachment(attachment.id.clone()),
+            ));
+            actions = actions.push(crate::components::action_bar::button_text(
+                "Retry",
+                Message::RetryAttachmentDownload(attachment.id.clone()),
+            ));
+        }
+        _ => {
+            actions = actions.push(crate::components::action_bar::button_text(
+                "Preview",
+                Message::PreviewAttachment(attachment.id.clone()),
+            ));
+            actions = actions.push(crate::components::action_bar::button_text(
+                "Open",
+                Message::OpenAttachment(attachment.id.clone()),
+            ));
+        }
+    }
+
+    column![
+        row![
+            crate::components::attachment::chip(
+                attachment.filename.clone(),
+                attachment_detail(attachment),
+            ),
+            actions,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
+        row![
+            progress_bar(0.0..=1.0, progress.clamp(0.0, 1.0)).width(Length::Fixed(160.0)),
+            text(message).size(12).color(crate::theme::TEXT_MUTED),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
     ]
-    .spacing(6)
-    .align_y(iced::Alignment::Center)
+    .spacing(4)
     .width(Length::Fill)
     .into()
 }
@@ -196,7 +263,23 @@ fn attachment_open_view<'a>(request: &'a AttachmentOpenRequest) -> Element<'a, M
         format!("{}: {}", request.attachment.filename, request.reason)
     };
 
-    crate::components::notice::inline(kind, message)
+    let mut content = row![
+        crate::components::notice::inline(kind, message),
+        iced::widget::horizontal_space(),
+        crate::components::action_bar::button_text("Dismiss", Message::DismissAttachmentNotice),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center)
+    .width(Length::Fill);
+
+    if request.allowed && request.path.is_some() {
+        content = content.push(crate::components::action_bar::button_text(
+            "Open now",
+            Message::ConfirmOpenAttachment(request.attachment.id.clone()),
+        ));
+    }
+
+    content.into()
 }
 
 fn attachment_detail(attachment: &AttachmentSummary) -> String {
@@ -282,6 +365,8 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
             .color(crate::theme::TEXT)
             .width(Length::Fill)
             .into(),
+        RenderNode::Code(value) => code_inline(value),
+        RenderNode::Preformatted(value) => preformatted_block(value),
         RenderNode::Paragraph(children) => {
             let mut line = row![].spacing(4).width(Length::Fill);
             for child in children {
@@ -366,6 +451,8 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
 fn render_inline_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
     match node {
         RenderNode::Text(value) => text(value).size(14).color(crate::theme::TEXT).into(),
+        RenderNode::Code(value) => code_inline(value),
+        RenderNode::Preformatted(value) => preformatted_block(value),
         RenderNode::Link { href, children } => {
             let label = children_text(children);
             text(format!("{label} ({href})"))
@@ -408,6 +495,53 @@ fn inline_text<'a>(
             ..Font::DEFAULT
         })
         .into()
+}
+
+fn code_inline<'a>(value: &'a str) -> Element<'a, Message> {
+    container(
+        text(value)
+            .size(13)
+            .color(crate::theme::TEXT)
+            .font(Font::MONOSPACE),
+    )
+    .padding([2, 5])
+    .style(|_| container::Style {
+        background: Some(Background::Color(crate::theme::SURFACE_ALT)),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: crate::theme::BORDER,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn preformatted_block<'a>(value: &'a str) -> Element<'a, Message> {
+    container(
+        scrollable(
+            text(value)
+                .size(13)
+                .color(crate::theme::TEXT)
+                .font(Font::MONOSPACE),
+        )
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        }),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(Background::Color(crate::theme::SURFACE_ALT)),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: crate::theme::BORDER,
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn table_view<'a>(rows: &'a [courier_render::TableRow]) -> Element<'a, Message> {
@@ -478,6 +612,7 @@ fn children_text(children: &[RenderNode]) -> String {
         .iter()
         .filter_map(|node| match node {
             RenderNode::Text(value) => Some(value.clone()),
+            RenderNode::Code(value) | RenderNode::Preformatted(value) => Some(value.clone()),
             RenderNode::Link { children, .. }
             | RenderNode::Strong(children)
             | RenderNode::Emphasis(children)

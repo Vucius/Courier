@@ -71,6 +71,13 @@ pub struct SendReport {
     pub remote_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendQueueRunReport {
+    pub attempted: usize,
+    pub sent: Vec<SendReport>,
+    pub failed: Vec<(DraftId, String)>,
+}
+
 impl SyncScheduler<NoopRemote> {
     pub fn new(storage: Storage) -> Self {
         Self::with_remote(storage, NoopRemote::default())
@@ -212,6 +219,25 @@ where
                 Err(error.into())
             }
         }
+    }
+
+    pub async fn send_due_drafts(&self, now: i64, limit: usize) -> Result<SendQueueRunReport> {
+        let draft_ids = self.storage.due_draft_ids(now, limit)?;
+        let mut sent = Vec::new();
+        let mut failed = Vec::new();
+
+        for draft_id in draft_ids {
+            match self.send_draft(draft_id.clone()).await {
+                Ok(report) => sent.push(report),
+                Err(error) => failed.push((draft_id, error.to_string())),
+            }
+        }
+
+        Ok(SendQueueRunReport {
+            attempted: sent.len() + failed.len(),
+            sent,
+            failed,
+        })
     }
 
     async fn pull_remote_mailbox_deltas(

@@ -121,6 +121,55 @@ pub struct AccountConnectionTestResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuth2ClientConfig {
+    pub provider: ProviderKind,
+    pub client_id: String,
+    pub auth_url: String,
+    pub token_url: String,
+    pub scopes: Vec<String>,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuth2AuthorizationRequest {
+    pub account_id: AccountId,
+    pub provider: ProviderKind,
+    pub auth_url: String,
+    pub redirect_uri: String,
+    pub state: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuth2Callback {
+    pub account_id: AccountId,
+    pub code: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CredentialKind {
+    Password,
+    OAuthAccessToken,
+    OAuthRefreshToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRef {
+    pub account_id: AccountId,
+    pub kind: CredentialKind,
+    pub service: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialStoreStatus {
+    pub available: bool,
+    pub backend: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxSummary {
     pub id: MailboxId,
     pub account_id: AccountId,
@@ -187,6 +236,23 @@ pub struct AttachmentOpenRequest {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentTransferStatus {
+    Ready,
+    Missing,
+    Downloading,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentTransfer {
+    pub attachment: AttachmentSummary,
+    pub status: AttachmentTransferStatus,
+    pub progress: f32,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendQueueItem {
     pub task_id: TaskId,
@@ -200,6 +266,13 @@ pub struct SendQueueItem {
     pub run_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    KeepLocal,
+    AcceptRemote,
+    RequeueLocal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictSummary {
     pub message_id: MessageId,
@@ -208,7 +281,7 @@ pub struct ConflictSummary {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationKind {
     NewMail,
     Sync,
@@ -255,6 +328,9 @@ pub enum EngineCommand {
     SetAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
     TestAccountConnection(AccountConfig),
+    BeginOAuth2(AccountId),
+    CompleteOAuth2(OAuth2Callback),
+    CredentialStatus,
     SaveIdentity(IdentityConfig),
     DeleteIdentity(IdentityId),
     SendMessage(DraftId),
@@ -262,9 +338,15 @@ pub enum EngineCommand {
     ListSendQueue,
     RetrySend(DraftId),
     CancelSend(DraftId),
+    RunDueSendQueue,
     PreviewAttachment(AttachmentId),
     OpenAttachment(AttachmentId),
+    ConfirmOpenAttachment(AttachmentId),
+    DownloadAttachment(AttachmentId),
+    CancelAttachmentDownload(AttachmentId),
+    RetryAttachmentDownload(AttachmentId),
     ListConflicts,
+    ResolveConflict(MessageId, ConflictResolution),
     Snooze(MessageId, i64),
     Search(String),
 }
@@ -278,6 +360,9 @@ pub enum EngineEvent {
     MailboxesUpdated(Vec<MailboxSummary>),
     AccountSaved(AccountSummary),
     AccountConnectionTested(AccountConnectionTestResult),
+    OAuth2AuthorizationStarted(Result<OAuth2AuthorizationRequest, String>),
+    OAuth2Completed(Result<CredentialRef, String>),
+    CredentialStoreChecked(CredentialStoreStatus),
     SyncProgress {
         account_id: AccountId,
         progress: f32,
@@ -290,6 +375,8 @@ pub enum EngineEvent {
     MessageLoaded(MessageBody),
     AttachmentPreviewLoaded(Result<AttachmentPreview, String>),
     AttachmentOpenPrepared(AttachmentOpenRequest),
+    AttachmentOpenExecuted(Result<AttachmentOpenRequest, String>),
+    AttachmentTransfersUpdated(Vec<AttachmentTransfer>),
     SendQueueUpdated(Vec<SendQueueItem>),
     ConflictsUpdated(Vec<ConflictSummary>),
     NotificationRaised(DesktopNotification),

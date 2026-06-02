@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 courier-domain.workspace = true
+courier-credential.workspace = true
 courier-proto.workspace = true
+courier-provider.workspace = true
 courier-render.workspace = true
 courier-search.workspace = true
 courier-security.workspace = true

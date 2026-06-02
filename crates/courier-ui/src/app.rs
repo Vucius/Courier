@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
     AccountConfig, AccountId, AccountState, AttachmentId, AttachmentOpenRequest, AttachmentPreview,
-    AuthType, ConflictSummary, DesktopNotification, DraftId, DraftMessage, EngineCommand,
-    EngineEvent, IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxSummary,
-    MessageBody, NotificationKind, ProviderKind, SendQueueItem, ThreadId, ThreadSummary,
+    AttachmentTransfer, AuthType, ConflictResolution, ConflictSummary, DesktopNotification,
+    DraftId, DraftMessage, EngineCommand, EngineEvent, IdentityConfig, IdentityId, IdentitySummary,
+    MailboxId, MailboxSummary, MessageBody, MessageId, NotificationKind, ProviderKind,
+    SendQueueItem, ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
@@ -33,8 +34,13 @@ pub enum Message {
     CancelSend(DraftId),
     PreviewAttachment(AttachmentId),
     OpenAttachment(AttachmentId),
+    ConfirmOpenAttachment(AttachmentId),
+    DownloadAttachment(AttachmentId),
+    CancelAttachmentDownload(AttachmentId),
+    RetryAttachmentDownload(AttachmentId),
     DismissAttachmentNotice,
     ClearNotifications,
+    ResolveConflict(MessageId, ConflictResolution),
     AccountEmailChanged(String),
     AccountImapHostChanged(String),
     AccountImapPortChanged(String),
@@ -42,6 +48,7 @@ pub enum Message {
     AccountSmtpPortChanged(String),
     SaveAccount,
     TestAccountConnection,
+    BeginOAuth2(AccountId),
     EditAccount(AccountId),
     ToggleAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
@@ -64,6 +71,7 @@ pub struct App {
     selected_render: Option<RenderTree>,
     attachment_preview: Option<AttachmentPreview>,
     attachment_open: Option<AttachmentOpenRequest>,
+    attachment_transfers: Vec<AttachmentTransfer>,
     send_queue: Vec<SendQueueItem>,
     conflicts: Vec<ConflictSummary>,
     notifications: Vec<DesktopNotification>,
@@ -102,6 +110,7 @@ pub fn init() -> (App, Task<Message>) {
         selected_render: None,
         attachment_preview: None,
         attachment_open: None,
+        attachment_transfers: Vec::new(),
         send_queue: Vec::new(),
         conflicts: Vec::new(),
         notifications: Vec::new(),
@@ -303,9 +312,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.status = "Draft queued for send".to_string();
                 Task::perform(
                     async move {
-                        let draft_id = draft.id.clone();
                         let _ = engine.send(EngineCommand::SaveDraft(draft)).await;
-                        let _ = engine.send(EngineCommand::SendMessage(draft_id)).await;
                     },
                     |_| Message::SyncQueued,
                 )
@@ -355,6 +362,54 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 |_| Message::SyncQueued,
             )
         }
+        Message::ConfirmOpenAttachment(attachment_id) => {
+            let engine = app.engine.clone();
+            app.status = "Opening attachment".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::ConfirmOpenAttachment(attachment_id))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::DownloadAttachment(attachment_id) => {
+            let engine = app.engine.clone();
+            app.status = "Downloading attachment".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::DownloadAttachment(attachment_id))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::CancelAttachmentDownload(attachment_id) => {
+            let engine = app.engine.clone();
+            app.status = "Cancelling attachment download".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::CancelAttachmentDownload(attachment_id))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::RetryAttachmentDownload(attachment_id) => {
+            let engine = app.engine.clone();
+            app.status = "Retrying attachment download".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::RetryAttachmentDownload(attachment_id))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
         Message::DismissAttachmentNotice => {
             app.attachment_preview = None;
             app.attachment_open = None;
@@ -365,6 +420,18 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.unread_notifications = 0;
             app.status = "Notifications cleared".to_string();
             Task::none()
+        }
+        Message::ResolveConflict(message_id, resolution) => {
+            let engine = app.engine.clone();
+            app.status = "Resolving conflict".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::ResolveConflict(message_id, resolution))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
         }
         Message::AccountEmailChanged(value) => {
             app.account_email = value;
@@ -434,6 +501,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::none()
             }
         },
+        Message::BeginOAuth2(account_id) => {
+            let engine = app.engine.clone();
+            app.status = "Preparing OAuth2 authorization".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::BeginOAuth2(account_id)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
         Message::EditAccount(account_id) => {
             if let Some(account) = app
                 .accounts
@@ -584,6 +661,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             app.selected_render.as_ref(),
             app.attachment_preview.as_ref(),
             app.attachment_open.as_ref(),
+            &app.attachment_transfers,
         ));
         reader_stack = reader_stack.push(crate::views::composer::view(
             &app.draft_to,
@@ -668,6 +746,27 @@ fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> 
                 crate::components::action_bar::button_text(
                     "Open",
                     Message::SelectThread(conflict.thread_id.clone()),
+                ),
+                crate::components::action_bar::button_text(
+                    "Keep",
+                    Message::ResolveConflict(
+                        conflict.message_id.clone(),
+                        ConflictResolution::KeepLocal,
+                    ),
+                ),
+                crate::components::action_bar::button_text(
+                    "Accept",
+                    Message::ResolveConflict(
+                        conflict.message_id.clone(),
+                        ConflictResolution::AcceptRemote,
+                    ),
+                ),
+                crate::components::action_bar::button_text(
+                    "Requeue",
+                    Message::ResolveConflict(
+                        conflict.message_id.clone(),
+                        ConflictResolution::RequeueLocal,
+                    ),
                 ),
             ]
             .spacing(8)
@@ -755,6 +854,8 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 async move {
                     let _ = engine.send(EngineCommand::ListSendQueue).await;
                     let _ = engine.send(EngineCommand::ListConflicts).await;
+                    let _ = engine.send(EngineCommand::CredentialStatus).await;
+                    let _ = engine.send(EngineCommand::RunDueSendQueue).await;
                 },
                 |_| Message::SyncQueued,
             );
@@ -785,6 +886,25 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 "Connection test passed".to_string()
             } else {
                 "Connection test failed".to_string()
+            };
+        }
+        EngineEvent::OAuth2AuthorizationStarted(result) => {
+            app.status = match result {
+                Ok(request) => format!("OAuth2 authorization ready: {}", request.auth_url),
+                Err(error) => format!("OAuth2 setup failed: {error}"),
+            };
+        }
+        EngineEvent::OAuth2Completed(result) => {
+            app.status = match result {
+                Ok(reference) => format!("OAuth2 credential stored: {}", reference.key),
+                Err(error) => format!("OAuth2 incomplete: {error}"),
+            };
+        }
+        EngineEvent::CredentialStoreChecked(status) => {
+            app.status = if status.available {
+                format!("Credential store ready: {}", status.backend)
+            } else {
+                status.message
             };
         }
         EngineEvent::IdentitySaved(identity) => {
@@ -827,6 +947,20 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 format!("Attachment blocked: {}", request.reason)
             };
             app.attachment_open = Some(request);
+        }
+        EngineEvent::AttachmentOpenExecuted(result) => match result {
+            Ok(request) => {
+                app.attachment_preview = None;
+                app.attachment_open = None;
+                app.status = format!("Opened attachment: {}", request.attachment.filename);
+            }
+            Err(error) => {
+                app.status = format!("Attachment open failed: {error}");
+            }
+        },
+        EngineEvent::AttachmentTransfersUpdated(transfers) => {
+            app.attachment_transfers = transfers;
+            app.status = "Attachment transfer state updated".to_string();
         }
         EngineEvent::SendQueueUpdated(queue) => {
             app.send_queue = queue;

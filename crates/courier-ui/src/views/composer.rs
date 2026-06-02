@@ -67,14 +67,34 @@ fn send_queue_row<'a>(item: &'a SendQueueItem) -> Element<'a, Message> {
         item.subject.as_str()
     };
     let detail = format!(
-        "{} - attempt {}{}",
+        "{} - {} - attempt {}{}",
         item.status,
+        send_timing_label(item),
         item.retry_count,
         item.last_error
             .as_ref()
             .map(|error| format!(" - {error}"))
             .unwrap_or_default()
     );
+
+    let mut actions = row![].spacing(6);
+    if item.status == "failed" || item.status == "cancelled" {
+        actions = actions.push(crate::components::action_bar::button_text(
+            "Retry",
+            Message::RetrySend(item.draft_id.clone()),
+        ));
+    }
+    if item.status == "pending" || item.status == "failed" {
+        let label = if item.status == "pending" {
+            "Undo"
+        } else {
+            "Cancel"
+        };
+        actions = actions.push(crate::components::action_bar::button_text(
+            label,
+            Message::CancelSend(item.draft_id.clone()),
+        ));
+    }
 
     row![
         column![
@@ -86,17 +106,20 @@ fn send_queue_row<'a>(item: &'a SendQueueItem) -> Element<'a, Message> {
         ]
         .spacing(3)
         .width(Length::Fill),
-        crate::components::action_bar::button_text(
-            "Retry",
-            Message::RetrySend(item.draft_id.clone()),
-        ),
-        crate::components::action_bar::button_text(
-            "Cancel",
-            Message::CancelSend(item.draft_id.clone()),
-        ),
+        actions,
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center)
     .width(Length::Fill)
     .into()
+}
+
+fn send_timing_label(item: &SendQueueItem) -> String {
+    if item.status == "pending" && item.retry_count == 0 {
+        "undo window".to_string()
+    } else if item.status == "pending" {
+        "scheduled retry".to_string()
+    } else {
+        "manual action".to_string()
+    }
 }

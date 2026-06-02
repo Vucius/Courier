@@ -1,4 +1,4 @@
-use courier_proto::{AccountId, AccountState, IdentitySummary, ProviderKind};
+use courier_proto::{AccountId, AccountState, AuthType, IdentitySummary, ProviderKind};
 use iced::widget::{column, container, row, text};
 use iced::{Alignment, Element, Length};
 
@@ -230,7 +230,7 @@ fn account_row<'a>(account: &'a AccountState, editing: bool) -> Element<'a, Mess
     let toggle_label = if account.enabled { "Disable" } else { "Enable" };
     let toggle_value = !account.enabled;
 
-    row![
+    let mut actions = row![
         crate::components::badge::role(provider_code(&account.provider)),
         column![
             text(&account.email).size(14).color(crate::theme::TEXT),
@@ -242,19 +242,28 @@ fn account_row<'a>(account: &'a AccountState, editing: bool) -> Element<'a, Mess
             "Edit",
             Message::EditAccount(account.id.clone()),
         ),
-        crate::components::action_bar::button_text(
-            toggle_label,
-            Message::ToggleAccountEnabled(account.id.clone(), toggle_value),
-        ),
-        crate::components::action_bar::button_text(
-            "Delete",
-            Message::DeleteAccount(account.id.clone()),
-        ),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
-    .width(Length::Fill)
-    .into()
+    .width(Length::Fill);
+
+    if matches!(account.auth_type, AuthType::OAuth2) {
+        actions = actions.push(crate::components::action_bar::button_text(
+            "OAuth2",
+            Message::BeginOAuth2(account.id.clone()),
+        ));
+    }
+
+    actions
+        .push(crate::components::action_bar::button_text(
+            toggle_label,
+            Message::ToggleAccountEnabled(account.id.clone(), toggle_value),
+        ))
+        .push(crate::components::action_bar::button_text(
+            "Delete",
+            Message::DeleteAccount(account.id.clone()),
+        ))
+        .into()
 }
 
 fn provider_code(provider: &ProviderKind) -> &'static str {

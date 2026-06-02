@@ -6,6 +6,7 @@ members = [
     "crates/courier-mime",
     "crates/courier-render",
     "crates/courier-security",
+    "crates/courier-credential",
     "crates/courier-provider",
     "crates/courier-adapter",
     "crates/courier-sync",
@@ -33,6 +34,7 @@ database_schema = 2
 anyhow = "1"
 courier-adapter = { path = "crates/courier-adapter" }
 courier-app = { path = "crates/courier-app" }
+courier-credential = { path = "crates/courier-credential" }
 courier-domain = { path = "crates/courier-domain" }
 courier-mime = { path = "crates/courier-mime" }
 courier-proto = { path = "crates/courier-proto" }

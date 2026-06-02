@@ -652,8 +652,10 @@ dependencies = [
 name = "courier-app"
 version = "0.1.0"
 dependencies = [
+ "courier-credential",
  "courier-domain",
  "courier-proto",
+ "courier-provider",
  "courier-render",
  "courier-search",
  "courier-security",
@@ -662,6 +664,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "courier-credential"
+version = "0.1.0"
+dependencies = [
+ "courier-proto",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -6,14 +6,17 @@ use courier_domain::SyncCursor;
 use courier_mime::{BodyKind, ParsedAttachment, parse_rfc822};
 use courier_proto::{
     AccountConfig, AccountId, AccountState, AccountSummary, AttachmentId, AttachmentPreview,
-    AttachmentPreviewKind, AttachmentSummary, AuthType, ConflictSummary, DraftId, DraftMessage,
-    IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxRole, MailboxSummary,
-    MessageBody, MessageId, ProviderKind, SendQueueItem, TaskId, ThreadId, ThreadSummary,
+    AttachmentPreviewKind, AttachmentSummary, AttachmentTransfer, AttachmentTransferStatus,
+    AuthType, ConflictResolution, ConflictSummary, DraftId, DraftMessage, IdentityConfig,
+    IdentityId, IdentitySummary, MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId,
+    ProviderKind, SendQueueItem, TaskId, ThreadId, ThreadSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+const UNDO_SEND_SECONDS: i64 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -782,6 +785,28 @@ impl Storage {
         Ok(())
     }
 
+    pub fn resolve_conflict(
+        &self,
+        message_id: &MessageId,
+        resolution: ConflictResolution,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let next_state = match resolution {
+            ConflictResolution::KeepLocal | ConflictResolution::RequeueLocal => "local_pending",
+            ConflictResolution::AcceptRemote => "none",
+        };
+        connection.execute(
+            r#"
+            UPDATE messages
+            SET conflict_state = ?2
+            WHERE id = ?1
+              AND conflict_state = 'conflicted'
+            "#,
+            params![message_id.0, next_state],
+        )?;
+        Ok(())
+    }
+
     pub fn list_conflicts(&self) -> Result<Vec<ConflictSummary>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -916,6 +941,27 @@ impl Storage {
             .map_err(Error::from)
     }
 
+    pub fn attachment_transfer(
+        &self,
+        attachment_id: &AttachmentId,
+    ) -> Result<Option<AttachmentTransfer>> {
+        self.attachment_by_id(attachment_id).map(|attachment| {
+            attachment.map(|attachment| self.attachment_transfer_from(attachment))
+        })
+    }
+
+    pub fn attachment_transfers_for_message(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<Vec<AttachmentTransfer>> {
+        self.list_attachments(message_id).map(|attachments| {
+            attachments
+                .into_iter()
+                .map(|attachment| self.attachment_transfer_from(attachment))
+                .collect()
+        })
+    }
+
     pub fn attachment_preview(
         &self,
         attachment_id: &AttachmentId,
@@ -967,6 +1013,36 @@ impl Storage {
             path,
             message: "No inline preview is available for this attachment type".to_string(),
         }))
+    }
+
+    fn attachment_transfer_from(&self, attachment: StoredAttachment) -> AttachmentTransfer {
+        let summary = AttachmentSummary::from(attachment.clone());
+        match attachment.blob_path.as_ref() {
+            Some(relative_path) => {
+                let absolute_path = self.data_dir.join(relative_path);
+                if absolute_path.exists() {
+                    AttachmentTransfer {
+                        attachment: summary,
+                        status: AttachmentTransferStatus::Ready,
+                        progress: 1.0,
+                        message: "Available locally".to_string(),
+                    }
+                } else {
+                    AttachmentTransfer {
+                        attachment: summary,
+                        status: AttachmentTransferStatus::Missing,
+                        progress: 0.0,
+                        message: "Attachment file is missing from local storage".to_string(),
+                    }
+                }
+            }
+            None => AttachmentTransfer {
+                attachment: summary,
+                status: AttachmentTransferStatus::Missing,
+                progress: 0.0,
+                message: "Attachment has not been downloaded".to_string(),
+            },
+        }
     }
 
     pub fn mark_message_read(&self, message_id: &MessageId, read: bool) -> Result<()> {
@@ -1133,16 +1209,17 @@ impl Storage {
 
     pub fn save_draft(&self, draft: &DraftMessage) -> Result<()> {
         let connection = self.connection()?;
+        let run_at = unix_timestamp().saturating_add(UNDO_SEND_SECONDS);
         connection.execute(
             r#"
             INSERT INTO tasks (id, task_type, payload, run_at, status)
-            VALUES (?1, 'draft', ?2, unixepoch(), 'pending')
+            VALUES (?1, 'draft', ?2, ?3, 'pending')
             ON CONFLICT(id) DO UPDATE SET
                 payload = excluded.payload,
                 run_at = excluded.run_at,
                 status = excluded.status
             "#,
-            params![draft.id.0, draft_payload(draft)?],
+            params![draft.id.0, draft_payload(draft)?, run_at],
         )?;
         Ok(())
     }
@@ -1247,6 +1324,36 @@ impl Storage {
         collect_rows(rows)
     }
 
+    pub fn due_draft_ids(&self, now: i64, limit: usize) -> Result<Vec<DraftId>> {
+        let connection = self.connection()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let enabled_accounts = enabled_account_ids(&connection)?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, payload
+            FROM tasks
+            WHERE task_type = 'draft'
+              AND status = 'pending'
+              AND run_at <= ?1
+            ORDER BY run_at ASC, id ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let mut rows = statement.query(params![now, limit])?;
+        let mut draft_ids = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let draft: DraftMessage = serde_json::from_str(&payload)?;
+            if enabled_accounts.contains(&draft.account_id.0) {
+                draft_ids.push(DraftId(id));
+            }
+        }
+
+        Ok(draft_ids)
+    }
+
     pub fn mark_draft_sending(&self, draft_id: &DraftId) -> Result<()> {
         self.mark_draft_status(draft_id, "sending")
     }
@@ -1305,7 +1412,18 @@ impl Storage {
     }
 
     pub fn cancel_draft_send(&self, draft_id: &DraftId) -> Result<()> {
-        self.mark_draft_status(draft_id, "cancelled")
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            UPDATE tasks
+            SET status = 'cancelled'
+            WHERE id = ?1
+              AND task_type = 'draft'
+              AND status IN ('pending', 'failed')
+            "#,
+            params![draft_id.0],
+        )?;
+        Ok(())
     }
 
     pub fn persist_sent_draft(
@@ -1947,6 +2065,16 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
     Ok(false)
 }
 
+fn enabled_account_ids(connection: &Connection) -> Result<HashSet<String>> {
+    let mut statement = connection.prepare("SELECT id FROM accounts WHERE enabled = 1")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut account_ids = HashSet::new();
+    for row in rows {
+        account_ids.insert(row?);
+    }
+    Ok(account_ids)
+}
+
 fn build_fts_query(query: &str) -> String {
     query
         .split_whitespace()
@@ -1972,6 +2100,77 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn initialize_upgrades_older_runtime_schema() {
+        let data_dir = test_data_dir("schema-upgrade");
+        let storage = Storage::open(&data_dir).expect("open storage");
+
+        {
+            let connection = Connection::open(storage.db_path()).expect("open old database");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE accounts (
+                        id          TEXT PRIMARY KEY,
+                        email       TEXT NOT NULL,
+                        provider    TEXT NOT NULL,
+                        imap_host   TEXT NOT NULL,
+                        imap_port   INTEGER NOT NULL DEFAULT 993,
+                        smtp_host   TEXT NOT NULL,
+                        smtp_port   INTEGER NOT NULL DEFAULT 587,
+                        auth_type   TEXT NOT NULL,
+                        created_at  INTEGER NOT NULL
+                    );
+                    CREATE TABLE tasks (
+                        id          TEXT PRIMARY KEY,
+                        task_type   TEXT NOT NULL,
+                        payload     TEXT NOT NULL,
+                        run_at      INTEGER NOT NULL,
+                        status      TEXT DEFAULT 'pending'
+                    );
+                    INSERT INTO accounts (
+                        id, email, provider, imap_host, smtp_host, auth_type, created_at
+                    )
+                    VALUES (
+                        'account:old', 'old@example.test', 'generic-imap',
+                        'imap.example.test', 'smtp.example.test', 'password', 1
+                    );
+                    "#,
+                )
+                .expect("seed old schema");
+        }
+
+        storage.initialize().expect("upgrade storage");
+
+        let connection = Connection::open(storage.db_path()).expect("reopen upgraded database");
+        assert!(table_has_column(&connection, "accounts", "enabled").expect("accounts schema"));
+        assert!(table_has_column(&connection, "tasks", "retry_count").expect("tasks schema"));
+        assert!(table_has_column(&connection, "tasks", "last_error").expect("tasks schema"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT enabled FROM accounts WHERE id = 'account:old'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("old account enabled default"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'message_search_fts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("fts table exists"),
+            1
+        );
+
+        drop(connection);
+        std::fs::remove_dir_all(data_dir).expect("remove test data");
+    }
 
     #[test]
     fn storage_roundtrip_and_search() {

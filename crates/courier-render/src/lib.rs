@@ -25,6 +25,8 @@ pub struct TableRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenderNode {
     Text(String),
+    Code(String),
+    Preformatted(String),
     Paragraph(Vec<RenderNode>),
     Heading {
         level: u8,
@@ -153,8 +155,28 @@ fn element_to_nodes(element: ElementRef<'_>) -> Vec<RenderNode> {
             }
         }
         "td" | "th" => block_children(element),
-        "span" | "small" | "label" | "font" | "code" | "pre" => inline_children(element),
+        "pre" => preformatted_node(element).into_iter().collect(),
+        "code" => code_node(element).into_iter().collect(),
+        "span" | "small" | "label" | "font" => inline_children(element),
         _ => block_children(element),
+    }
+}
+
+fn preformatted_node(element: ElementRef<'_>) -> Option<RenderNode> {
+    let text = preserved_text(element).trim_matches('\n').to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(RenderNode::Preformatted(text))
+    }
+}
+
+fn code_node(element: ElementRef<'_>) -> Option<RenderNode> {
+    let text = preserved_text(element);
+    if text.is_empty() {
+        None
+    } else {
+        Some(RenderNode::Code(text))
     }
 }
 
@@ -256,6 +278,7 @@ fn is_inline(node: &RenderNode) -> bool {
     matches!(
         node,
         RenderNode::Text(_)
+            | RenderNode::Code(_)
             | RenderNode::Link { .. }
             | RenderNode::Image(_)
             | RenderNode::Strong(_)
@@ -287,6 +310,25 @@ fn image_source_from_element(element: ElementRef<'_>) -> Option<ImageSource> {
         ))
     } else {
         Some(ImageSource::LocalPath(src.to_string()))
+    }
+}
+
+fn preserved_text(element: ElementRef<'_>) -> String {
+    let mut output = String::new();
+    push_preserved_text(*element, &mut output);
+    output
+}
+
+fn push_preserved_text(node: NodeRef<'_, Node>, output: &mut String) {
+    match node.value() {
+        Node::Text(text) => output.push_str(text),
+        Node::Element(element) if element.name() == "br" => output.push('\n'),
+        Node::Element(_) => {
+            for child in node.children() {
+                push_preserved_text(child, output);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -349,6 +391,29 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node, RenderNode::HorizontalRule))
         );
+    }
+
+    #[test]
+    fn html_render_tree_preserves_code_whitespace() {
+        let tree = render_tree_from_html(
+            r#"
+            <p>Run <code>cargo   check</code> first.</p>
+            <pre>
+fn main() {
+    println!("ready");
+}
+</pre>
+            "#,
+        );
+
+        assert!(matches!(
+            &tree.nodes[0],
+            RenderNode::Paragraph(nodes)
+                if matches!(nodes.get(1), Some(RenderNode::Code(value)) if value == "cargo   check")
+        ));
+        assert!(tree.nodes.iter().any(
+            |node| matches!(node, RenderNode::Preformatted(value) if value.contains("    println!") && value.contains('\n'))
+        ));
     }
 
     #[test]
