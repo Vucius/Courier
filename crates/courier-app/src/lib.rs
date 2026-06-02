@@ -2,23 +2,34 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use courier_credential::{CredentialStore, UnsupportedCredentialStore, credential_ref};
+use courier_adapter::{AttachmentFetchRequest, MailRemote, NoopRemote};
+use courier_credential::{
+    CredentialStore, OsCredentialStore, account_credential_refs, credential_ref,
+};
 use courier_proto::{
     AccountConnectionTestResult, AccountId, AccountSummary, AttachmentId, AttachmentOpenRequest,
-    AttachmentSummary, AttachmentTransfer, AttachmentTransferStatus, CredentialKind,
-    DesktopNotification, EndpointCheckResult, EngineCommand, EngineEvent, MailboxId, MailboxRole,
-    MailboxSummary, MessageBody, MessageId, NotificationKind, OAuth2AuthorizationRequest,
-    OAuth2Callback, ProviderKind, TaskId, ThreadId, ThreadSummary,
+    AttachmentSummary, AttachmentTransfer, AttachmentTransferStatus, AuthType, CredentialKind,
+    CredentialSecret, DesktopNotification, EndpointCheckResult, EngineCommand, EngineEvent,
+    MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId, NotificationKind,
+    OAuth2AuthorizationRequest, OAuth2Callback, OAuth2ClientConfig, ProviderKind, TaskId, ThreadId,
+    ThreadSummary,
 };
-use courier_provider::{authorization_url, oauth2_client_config};
+use courier_provider::oauth2_client_config;
 use courier_search::SearchIndex;
 use courier_security::classify_attachment;
 use courier_storage::Storage;
 use courier_sync::SyncScheduler;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    basic::BasicClient,
+};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 pub type Result<T> = std::result::Result<T, Error>;
+type ReadyOAuth2Client =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -56,16 +67,18 @@ pub fn spawn_engine(config: EngineConfig) -> (EngineHandle, JoinHandle<Result<()
     let (command_tx, command_rx) = mpsc::channel(128);
     let (event_tx, _) = broadcast::channel(256);
     let handle = EngineHandle {
-        command_tx,
+        command_tx: command_tx.clone(),
         event_tx: event_tx.clone(),
     };
 
     let runtime = EngineRuntime {
         config,
         event_tx,
+        command_tx: command_tx.clone(),
         command_rx,
         notifications: NotificationPolicy::default(),
         attachment_transfers: HashMap::new(),
+        pending_oauth2: HashMap::new(),
     };
     let join = tokio::spawn(runtime.run());
 
@@ -81,9 +94,17 @@ pub struct AttachmentService;
 struct EngineRuntime {
     config: EngineConfig,
     event_tx: broadcast::Sender<EngineEvent>,
+    command_tx: mpsc::Sender<EngineCommand>,
     command_rx: mpsc::Receiver<EngineCommand>,
     notifications: NotificationPolicy,
     attachment_transfers: HashMap<String, AttachmentTransfer>,
+    pending_oauth2: HashMap<String, PendingOAuth2>,
+}
+
+struct PendingOAuth2 {
+    config: OAuth2ClientConfig,
+    state: String,
+    pkce_verifier: PkceCodeVerifier,
 }
 
 #[derive(Default)]
@@ -166,6 +187,14 @@ impl EngineRuntime {
                     account_id: account_id.clone(),
                     progress: 0.25,
                 });
+
+                if let Err(error) = self.refresh_oauth2_if_needed(storage, &account_id).await {
+                    tracing::warn!(
+                        account_id = %account_id.0,
+                        error = %error,
+                        "oauth2 token refresh failed before sync"
+                    );
+                }
 
                 match sync.sync_now(account_id.clone()).await {
                     Ok(report) => {
@@ -324,6 +353,17 @@ impl EngineRuntime {
             }
             EngineCommand::DeleteAccount(account_id) => match storage.delete_account(&account_id) {
                 Ok(()) => {
+                    let store = OsCredentialStore::new();
+                    for reference in account_credential_refs(account_id.clone()) {
+                        if let Err(error) = store.delete_secret(&reference) {
+                            tracing::warn!(
+                                account_id = %account_id.0,
+                                credential_key = %reference.key,
+                                error = %error,
+                                "failed to delete account credential"
+                            );
+                        }
+                    }
                     tracing::info!(account_id = %account_id.0, "deleted account");
                     self.publish_snapshot(storage);
                 }
@@ -346,28 +386,29 @@ impl EngineRuntime {
             EngineCommand::BeginOAuth2(account_id) => {
                 let result = self.begin_oauth2(storage, account_id);
                 if let Ok(request) = result.as_ref() {
-                    start_oauth2_loopback_listener(request.clone(), self.event_tx.clone());
+                    start_oauth2_loopback_listener(
+                        request.clone(),
+                        self.command_tx.clone(),
+                        self.event_tx.clone(),
+                    );
                 }
                 let _ = self
                     .event_tx
                     .send(EngineEvent::OAuth2AuthorizationStarted(result));
             }
             EngineCommand::CompleteOAuth2(callback) => {
-                let reference = credential_ref(
-                    callback.account_id,
-                    CredentialKind::OAuthRefreshToken,
-                    "courier-oauth2",
-                );
-                let _ = self.event_tx.send(EngineEvent::OAuth2Completed(Err(format!(
-                    "Token exchange is not implemented yet; reserved credential key {}",
-                    reference.key
-                ))));
+                let result = self.complete_oauth2(callback).await;
+                let _ = self.event_tx.send(EngineEvent::OAuth2Completed(result));
             }
             EngineCommand::CredentialStatus => {
-                let store = UnsupportedCredentialStore;
+                let store = OsCredentialStore::new();
                 let _ = self
                     .event_tx
                     .send(EngineEvent::CredentialStoreChecked(store.status()));
+            }
+            EngineCommand::SaveCredentialSecret(secret) => {
+                let result = save_credential_secret(secret);
+                let _ = self.event_tx.send(EngineEvent::CredentialSaved(result));
             }
             EngineCommand::SaveIdentity(identity) => match storage.upsert_identity(&identity) {
                 Ok(()) => {
@@ -590,22 +631,7 @@ impl EngineRuntime {
             }
             EngineCommand::DownloadAttachment(attachment_id) => {
                 self.mark_attachment_downloading(storage, &attachment_id);
-                match storage.attachment_transfer(&attachment_id) {
-                    Ok(Some(mut transfer)) => {
-                        if matches!(transfer.status, AttachmentTransferStatus::Missing) {
-                            transfer.status = AttachmentTransferStatus::Failed;
-                            transfer.progress = 0.0;
-                            transfer.message =
-                                "Remote attachment fetch waits for a real protocol adapter"
-                                    .to_string();
-                        }
-                        self.upsert_attachment_transfer(transfer);
-                    }
-                    Ok(None) => publish_attachment_missing(&self.event_tx, &attachment_id),
-                    Err(error) => {
-                        let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
-                    }
-                }
+                self.fetch_attachment(storage, &attachment_id).await;
             }
             EngineCommand::CancelAttachmentDownload(attachment_id) => {
                 match storage.attachment_transfer(&attachment_id) {
@@ -623,22 +649,7 @@ impl EngineRuntime {
             }
             EngineCommand::RetryAttachmentDownload(attachment_id) => {
                 self.mark_attachment_downloading(storage, &attachment_id);
-                match storage.attachment_transfer(&attachment_id) {
-                    Ok(Some(mut transfer)) => {
-                        if matches!(transfer.status, AttachmentTransferStatus::Missing) {
-                            transfer.status = AttachmentTransferStatus::Failed;
-                            transfer.progress = 0.0;
-                            transfer.message =
-                                "Remote attachment fetch waits for a real protocol adapter"
-                                    .to_string();
-                        }
-                        self.upsert_attachment_transfer(transfer);
-                    }
-                    Ok(None) => publish_attachment_missing(&self.event_tx, &attachment_id),
-                    Err(error) => {
-                        let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
-                    }
-                }
+                self.fetch_attachment(storage, &attachment_id).await;
             }
             EngineCommand::Snooze(message_id, run_at) => {
                 tracing::info!(?message_id, run_at, "queued snooze command");
@@ -689,12 +700,53 @@ impl EngineRuntime {
             Ok(Some(mut transfer)) => {
                 transfer.status = AttachmentTransferStatus::Downloading;
                 transfer.progress = 0.25;
-                transfer.message = "Checking local attachment availability".to_string();
+                transfer.message = "Preparing remote attachment fetch".to_string();
                 self.upsert_attachment_transfer(transfer);
             }
             Ok(None) => publish_attachment_missing(&self.event_tx, attachment_id),
             Err(error) => {
                 let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+            }
+        }
+    }
+
+    async fn fetch_attachment(&mut self, storage: &Storage, attachment_id: &AttachmentId) {
+        let transfer = match storage.attachment_transfer(attachment_id) {
+            Ok(Some(transfer)) => transfer,
+            Ok(None) => {
+                publish_attachment_missing(&self.event_tx, attachment_id);
+                return;
+            }
+            Err(error) => {
+                let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                return;
+            }
+        };
+
+        let request = AttachmentFetchRequest {
+            attachment_id: transfer.attachment.id.clone(),
+            filename: transfer.attachment.filename.clone(),
+            expected_size: transfer.attachment.size,
+        };
+        let remote = NoopRemote::default();
+
+        match remote.fetch_attachment(request).await {
+            Ok(result) => {
+                let mut completed = transfer;
+                completed.status = AttachmentTransferStatus::Ready;
+                completed.progress = 1.0;
+                completed.message = format!(
+                    "Fetched {} byte(s) from remote attachment worker",
+                    result.bytes.len()
+                );
+                self.upsert_attachment_transfer(completed);
+            }
+            Err(error) => {
+                let mut failed = transfer;
+                failed.status = AttachmentTransferStatus::Failed;
+                failed.progress = 0.0;
+                failed.message = error.to_string();
+                self.upsert_attachment_transfer(failed);
             }
         }
     }
@@ -759,7 +811,7 @@ impl EngineRuntime {
     }
 
     fn begin_oauth2(
-        &self,
+        &mut self,
         storage: &Storage,
         account_id: AccountId,
     ) -> std::result::Result<OAuth2AuthorizationRequest, String> {
@@ -778,16 +830,153 @@ impl EngineRuntime {
             return Err("OAuth2 authorization URL is not configured for this provider".to_string());
         }
         let state = format!("{}:{}", account.id.0, unix_timestamp());
-        let auth_url = authorization_url(&config, &state);
+        let client = oauth2_client_from_config(&config)?;
+        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut authorization = client
+            .authorize_url(|| CsrfToken::new(state.clone()))
+            .set_pkce_challenge(pkce_challenge);
+        for scope in &config.scopes {
+            authorization = authorization.add_scope(Scope::new(scope.clone()));
+        }
+        let (auth_url, csrf_token) = authorization.url();
+        self.pending_oauth2.insert(
+            account.id.0.clone(),
+            PendingOAuth2 {
+                config: config.clone(),
+                state: csrf_token.secret().clone(),
+                pkce_verifier,
+            },
+        );
 
         Ok(OAuth2AuthorizationRequest {
             account_id: account.id,
             provider: account.provider,
-            auth_url,
+            auth_url: auth_url.to_string(),
             redirect_uri: redirect_uri.to_string(),
-            state,
+            state: csrf_token.secret().clone(),
             scopes: config.scopes,
         })
+    }
+
+    async fn complete_oauth2(
+        &mut self,
+        callback: OAuth2Callback,
+    ) -> std::result::Result<courier_proto::CredentialRef, String> {
+        let Some(pending) = self.pending_oauth2.remove(&callback.account_id.0) else {
+            return Err(format!(
+                "No pending OAuth2 authorization for account {}",
+                callback.account_id.0
+            ));
+        };
+
+        if callback.state != pending.state {
+            return Err("OAuth2 callback state did not match the pending request".to_string());
+        }
+
+        let client = oauth2_client_from_config(&pending.config)?;
+        let http_client = oauth2::reqwest::ClientBuilder::new()
+            .redirect(oauth2::reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("OAuth2 HTTP client setup failed: {error}"))?;
+        let token = client
+            .exchange_code(AuthorizationCode::new(callback.code))
+            .set_pkce_verifier(pending.pkce_verifier)
+            .request_async(&http_client)
+            .await
+            .map_err(|error| format!("OAuth2 token exchange failed: {error}"))?;
+
+        let store = OsCredentialStore::new();
+        let access_ref = credential_ref(
+            callback.account_id.clone(),
+            CredentialKind::OAuthAccessToken,
+            "dev.hephaestus.courier.oauth2",
+        );
+        store
+            .put_secret(&access_ref, token.access_token().secret())
+            .map_err(|error| format!("OAuth2 access token storage failed: {error}"))?;
+
+        let refresh_ref = credential_ref(
+            callback.account_id,
+            CredentialKind::OAuthRefreshToken,
+            "dev.hephaestus.courier.oauth2",
+        );
+        let refresh_token = token
+            .refresh_token()
+            .ok_or_else(|| "OAuth2 provider did not return a refresh token".to_string())?;
+        store
+            .put_secret(&refresh_ref, refresh_token.secret())
+            .map_err(|error| format!("OAuth2 refresh token storage failed: {error}"))?;
+
+        Ok(refresh_ref)
+    }
+
+    async fn refresh_oauth2_if_needed(
+        &self,
+        storage: &Storage,
+        account_id: &AccountId,
+    ) -> std::result::Result<Option<courier_proto::CredentialRef>, String> {
+        let Some(account) = storage
+            .list_accounts()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|account| account.id == *account_id)
+        else {
+            return Ok(None);
+        };
+
+        if !matches!(account.auth_type, AuthType::OAuth2) {
+            return Ok(None);
+        }
+
+        let redirect_uri = "http://127.0.0.1:48176/oauth/callback";
+        let client_id = std::env::var("COURIER_OAUTH_CLIENT_ID")
+            .unwrap_or_else(|_| "configure-client-id".to_string());
+        let config = oauth2_client_config(&account.provider, client_id, redirect_uri)
+            .ok_or_else(|| "OAuth2 is not configured for this provider".to_string())?;
+        if config.token_url.is_empty() {
+            return Err("OAuth2 token URL is not configured for this provider".to_string());
+        }
+
+        let store = OsCredentialStore::new();
+        let refresh_ref = credential_ref(
+            account.id.clone(),
+            CredentialKind::OAuthRefreshToken,
+            "dev.hephaestus.courier.oauth2",
+        );
+        let Some(refresh_token) = store
+            .get_secret(&refresh_ref)
+            .map_err(|error| format!("OAuth2 refresh token lookup failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+
+        let client = oauth2_client_from_config(&config)?;
+        let http_client = oauth2::reqwest::ClientBuilder::new()
+            .redirect(oauth2::reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("OAuth2 HTTP client setup failed: {error}"))?;
+        let token = client
+            .exchange_refresh_token(&RefreshToken::new(refresh_token))
+            .request_async(&http_client)
+            .await
+            .map_err(|error| format!("OAuth2 token refresh failed: {error}"))?;
+
+        let access_ref = credential_ref(
+            account.id.clone(),
+            CredentialKind::OAuthAccessToken,
+            "dev.hephaestus.courier.oauth2",
+        );
+        store
+            .put_secret(&access_ref, token.access_token().secret())
+            .map_err(|error| format!("OAuth2 access token storage failed: {error}"))?;
+
+        if let Some(new_refresh_token) = token.refresh_token() {
+            store
+                .put_secret(&refresh_ref, new_refresh_token.secret())
+                .map_err(|error| format!("OAuth2 refresh token rotation failed: {error}"))?;
+        }
+
+        Ok(Some(access_ref))
     }
 
     fn publish_conflicts(&mut self, storage: &Storage) {
@@ -901,17 +1090,51 @@ async fn test_endpoint(host: &str, port: u16) -> EndpointCheckResult {
     }
 }
 
+fn oauth2_client_from_config(
+    config: &OAuth2ClientConfig,
+) -> std::result::Result<ReadyOAuth2Client, String> {
+    Ok(BasicClient::new(ClientId::new(config.client_id.clone()))
+        .set_auth_uri(AuthUrl::new(config.auth_url.clone()).map_err(|error| error.to_string())?)
+        .set_token_uri(TokenUrl::new(config.token_url.clone()).map_err(|error| error.to_string())?)
+        .set_redirect_uri(
+            RedirectUrl::new(config.redirect_uri.clone()).map_err(|error| error.to_string())?,
+        ))
+}
+
+fn save_credential_secret(
+    secret: CredentialSecret,
+) -> std::result::Result<courier_proto::CredentialRef, String> {
+    if secret.secret.trim().is_empty() {
+        return Err("Credential secret is empty".to_string());
+    }
+
+    let store = OsCredentialStore::new();
+    store
+        .put_secret(&secret.reference, &secret.secret)
+        .map_err(|error| format!("Credential storage failed: {error}"))?;
+
+    Ok(secret.reference)
+}
+
 fn start_oauth2_loopback_listener(
     request: OAuth2AuthorizationRequest,
+    command_tx: mpsc::Sender<EngineCommand>,
     event_tx: broadcast::Sender<EngineEvent>,
 ) {
     tokio::spawn(async move {
         match listen_for_oauth2_callback(request).await {
             Ok(callback) => {
-                let _ = event_tx.send(EngineEvent::OAuth2Completed(Err(format!(
-                    "Authorization code received for {}; token exchange is not implemented yet",
-                    callback.account_id.0
-                ))));
+                let account_id = callback.account_id.clone();
+                if command_tx
+                    .send(EngineCommand::CompleteOAuth2(callback))
+                    .await
+                    .is_err()
+                {
+                    let _ = event_tx.send(EngineEvent::OAuth2Completed(Err(format!(
+                        "Authorization code received for {}, but the engine command channel is closed",
+                        account_id.0
+                    ))));
+                }
             }
             Err(error) => {
                 let _ = event_tx.send(EngineEvent::OAuth2Completed(Err(error)));

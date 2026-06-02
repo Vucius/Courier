@@ -5,7 +5,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use courier_domain::SyncCursor;
-use courier_proto::{AccountConfig, AuthType, MailboxId, MessageId, ProviderKind, ThreadId};
+use courier_proto::{
+    AccountConfig, AttachmentId, AuthType, CredentialKind, CredentialRef, MailboxId, MessageId,
+    ProviderKind, ThreadId,
+};
 use courier_provider::{
     AuthMechanism, ProviderCapabilities, ProviderEndpoint, TransportSecurity, capabilities_for,
 };
@@ -104,6 +107,19 @@ pub struct SendResult {
     pub remote_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentFetchRequest {
+    pub attachment_id: AttachmentId,
+    pub filename: String,
+    pub expected_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentFetchResult {
+    pub attachment_id: AttachmentId,
+    pub bytes: Vec<u8>,
+}
+
 pub trait MailRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send;
     fn fetch_delta(
@@ -116,6 +132,10 @@ pub trait MailRemote {
         &self,
         message: OutgoingMessage,
     ) -> impl Future<Output = Result<SendResult>> + Send;
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +179,7 @@ pub struct ProtocolConnectionPlan {
     pub smtp_endpoint: Option<ProviderEndpoint>,
     pub jmap_endpoint: Option<ProviderEndpoint>,
     pub auth_mechanisms: Vec<AuthMechanism>,
+    pub credential_refs: Vec<CredentialRef>,
 }
 
 fn auth_supported(account: &AccountConfig, auth_mechanisms: &[AuthMechanism]) -> bool {
@@ -211,6 +232,7 @@ fn fallback_plan(account: &AccountConfig, transport: ProtocolTransport) -> Proto
         smtp_endpoint: capabilities.smtp_endpoint.clone(),
         jmap_endpoint: capabilities.jmap_endpoint.clone(),
         auth_mechanisms: capabilities.auth_mechanisms.clone(),
+        credential_refs: credential_refs_for_account(account),
         capabilities,
     }
 }
@@ -252,11 +274,51 @@ impl ProtocolConnectionPlan {
             smtp_endpoint,
             jmap_endpoint,
             auth_mechanisms,
+            credential_refs: credential_refs_for_account(account),
         })
     }
 
     pub fn requires_oauth2(&self) -> bool {
         !self.capabilities.supports_password && self.capabilities.supports_oauth2
+    }
+}
+
+fn credential_refs_for_account(account: &AccountConfig) -> Vec<CredentialRef> {
+    match &account.auth_type {
+        AuthType::Password => vec![protocol_credential_ref(
+            account,
+            CredentialKind::Password,
+            "dev.hephaestus.courier.password",
+            "password",
+        )],
+        AuthType::OAuth2 => vec![
+            protocol_credential_ref(
+                account,
+                CredentialKind::OAuthAccessToken,
+                "dev.hephaestus.courier.oauth2",
+                "oauth-access-token",
+            ),
+            protocol_credential_ref(
+                account,
+                CredentialKind::OAuthRefreshToken,
+                "dev.hephaestus.courier.oauth2",
+                "oauth-refresh-token",
+            ),
+        ],
+    }
+}
+
+fn protocol_credential_ref(
+    account: &AccountConfig,
+    kind: CredentialKind,
+    service: &str,
+    key_kind: &str,
+) -> CredentialRef {
+    CredentialRef {
+        account_id: account.id.clone(),
+        kind,
+        service: service.to_string(),
+        key: format!("{}:{key_kind}", account.id.0),
     }
 }
 
@@ -434,6 +496,16 @@ impl MailRemote for NoopRemote {
             Ok(SendResult { remote_id })
         }
     }
+
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
+        async move {
+            let _ = request;
+            Err(Error::NotImplemented("noop fetch_attachment"))
+        }
+    }
 }
 
 impl MailRemote for ConfiguredRemote {
@@ -495,6 +567,22 @@ impl MailRemote for ConfiguredRemote {
             }
         }
     }
+
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
+        let remote = self.clone();
+        async move {
+            match remote {
+                ConfiguredRemote::LocalNoop(remote) => remote.fetch_attachment(request).await,
+                ConfiguredRemote::ImapSmtp(remote) => remote.fetch_attachment(request).await,
+                ConfiguredRemote::Gmail(remote) => remote.fetch_attachment(request).await,
+                ConfiguredRemote::Outlook(remote) => remote.fetch_attachment(request).await,
+                ConfiguredRemote::Jmap(remote) => remote.fetch_attachment(request).await,
+            }
+        }
+    }
 }
 
 impl MailRemote for ImapSmtpRemote {
@@ -527,6 +615,16 @@ impl MailRemote for ImapSmtpRemote {
         async move {
             let _ = message;
             Err(Error::NotImplemented("smtp send_message"))
+        }
+    }
+
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
+        async move {
+            let _ = request;
+            Err(Error::NotImplemented("imap fetch_attachment"))
         }
     }
 }
@@ -563,6 +661,16 @@ impl MailRemote for GmailRemote {
             Err(Error::NotImplemented("gmail send_message"))
         }
     }
+
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
+        async move {
+            let _ = request;
+            Err(Error::NotImplemented("gmail fetch_attachment"))
+        }
+    }
 }
 
 impl MailRemote for OutlookRemote {
@@ -597,6 +705,16 @@ impl MailRemote for OutlookRemote {
             Err(Error::NotImplemented("outlook send_message"))
         }
     }
+
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
+        async move {
+            let _ = request;
+            Err(Error::NotImplemented("outlook fetch_attachment"))
+        }
+    }
 }
 
 impl MailRemote for JmapRemote {
@@ -629,6 +747,16 @@ impl MailRemote for JmapRemote {
         async move {
             let _ = message;
             Err(Error::NotImplemented("jmap send_message"))
+        }
+    }
+
+    fn fetch_attachment(
+        &self,
+        request: AttachmentFetchRequest,
+    ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
+        async move {
+            let _ = request;
+            Err(Error::NotImplemented("jmap fetch_attachment"))
         }
     }
 }

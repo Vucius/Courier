@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+courier-adapter.workspace = true
 courier-domain.workspace = true
 courier-credential.workspace = true
 courier-proto.workspace = true
@@ -14,6 +15,7 @@ courier-search.workspace = true
 courier-security.workspace = true
 courier-storage.workspace = true
 courier-sync.workspace = true
+oauth2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

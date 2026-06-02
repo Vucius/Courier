@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 courier-proto.workspace = true
+keyring.workspace = true
 thiserror.workspace = true

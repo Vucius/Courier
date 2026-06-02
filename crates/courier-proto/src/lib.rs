@@ -170,6 +170,12 @@ pub struct CredentialStoreStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialSecret {
+    pub reference: CredentialRef,
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxSummary {
     pub id: MailboxId,
     pub account_id: AccountId,
@@ -331,6 +337,7 @@ pub enum EngineCommand {
     BeginOAuth2(AccountId),
     CompleteOAuth2(OAuth2Callback),
     CredentialStatus,
+    SaveCredentialSecret(CredentialSecret),
     SaveIdentity(IdentityConfig),
     DeleteIdentity(IdentityId),
     SendMessage(DraftId),
@@ -363,6 +370,7 @@ pub enum EngineEvent {
     OAuth2AuthorizationStarted(Result<OAuth2AuthorizationRequest, String>),
     OAuth2Completed(Result<CredentialRef, String>),
     CredentialStoreChecked(CredentialStoreStatus),
+    CredentialSaved(Result<CredentialRef, String>),
     SyncProgress {
         account_id: AccountId,
         progress: f32,

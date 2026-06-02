@@ -45,6 +45,8 @@ courier-security = { path = "crates/courier-security" }
 courier-storage = { path = "crates/courier-storage" }
 courier-sync = { path = "crates/courier-sync" }
 iced = { version = "0.13", features = ["tokio"] }
+keyring = "3.6.3"
+oauth2 = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
     AccountConfig, AccountId, AccountState, AttachmentId, AttachmentOpenRequest, AttachmentPreview,
-    AttachmentTransfer, AuthType, ConflictResolution, ConflictSummary, DesktopNotification,
-    DraftId, DraftMessage, EngineCommand, EngineEvent, IdentityConfig, IdentityId, IdentitySummary,
-    MailboxId, MailboxSummary, MessageBody, MessageId, NotificationKind, ProviderKind,
-    SendQueueItem, ThreadId, ThreadSummary,
+    AttachmentTransfer, AuthType, ConflictResolution, ConflictSummary, CredentialKind,
+    CredentialRef, CredentialSecret, DesktopNotification, DraftId, DraftMessage, EngineCommand,
+    EngineEvent, IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxSummary,
+    MessageBody, MessageId, NotificationKind, ProviderKind, SendQueueItem, ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
@@ -46,6 +46,7 @@ pub enum Message {
     AccountImapPortChanged(String),
     AccountSmtpHostChanged(String),
     AccountSmtpPortChanged(String),
+    AccountPasswordChanged(String),
     SaveAccount,
     TestAccountConnection,
     BeginOAuth2(AccountId),
@@ -87,6 +88,7 @@ pub struct App {
     account_imap_port: String,
     account_smtp_host: String,
     account_smtp_port: String,
+    account_password: String,
     identity_name: String,
     identity_email: String,
     account_connection_status: String,
@@ -126,6 +128,7 @@ pub fn init() -> (App, Task<Message>) {
         account_imap_port: "993".to_string(),
         account_smtp_host: String::new(),
         account_smtp_port: "587".to_string(),
+        account_password: String::new(),
         identity_name: String::new(),
         identity_email: String::new(),
         account_connection_status: String::new(),
@@ -461,9 +464,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.account_smtp_port = value;
             Task::none()
         }
+        Message::AccountPasswordChanged(value) => {
+            app.account_password = value;
+            Task::none()
+        }
         Message::SaveAccount => match account_config_from_form(app) {
             Ok(account) => {
                 let engine = app.engine.clone();
+                let password_secret = account_password_secret(app, &account);
                 app.status = if app.editing_account_id.is_some() {
                     "Updating account".to_string()
                 } else {
@@ -472,6 +480,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 Task::perform(
                     async move {
                         let _ = engine.send(EngineCommand::SaveAccount(account)).await;
+                        if let Some(secret) = password_secret {
+                            let _ = engine
+                                .send(EngineCommand::SaveCredentialSecret(secret))
+                                .await;
+                        }
                     },
                     |_| Message::SyncQueued,
                 )
@@ -525,6 +538,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.account_imap_port = account.imap_port.to_string();
                 app.account_smtp_host = account.smtp_host;
                 app.account_smtp_port = account.smtp_port.to_string();
+                app.account_password.clear();
                 app.identity_name.clear();
                 app.identity_email.clear();
                 app.account_connection_status.clear();
@@ -638,6 +652,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 imap_port: &app.account_imap_port,
                 smtp_host: &app.account_smtp_host,
                 smtp_port: &app.account_smtp_port,
+                password: &app.account_password,
                 identity_name: &app.identity_name,
                 identity_email: &app.identity_email,
                 connection_status: &app.account_connection_status,
@@ -907,6 +922,15 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 status.message
             };
         }
+        EngineEvent::CredentialSaved(result) => {
+            app.status = match result {
+                Ok(reference) => {
+                    app.account_password.clear();
+                    format!("Credential stored: {}", reference.key)
+                }
+                Err(error) => format!("Credential storage failed: {error}"),
+            };
+        }
         EngineEvent::IdentitySaved(identity) => {
             app.identity_name.clear();
             app.identity_email.clear();
@@ -1061,6 +1085,23 @@ fn account_config_from_form(app: &App) -> Result<AccountConfig, String> {
     })
 }
 
+fn account_password_secret(app: &App, account: &AccountConfig) -> Option<CredentialSecret> {
+    let password = app.account_password.trim();
+    if password.is_empty() || !matches!(account.auth_type, AuthType::Password) {
+        return None;
+    }
+
+    Some(CredentialSecret {
+        reference: CredentialRef {
+            account_id: account.id.clone(),
+            kind: CredentialKind::Password,
+            service: "dev.hephaestus.courier.password".to_string(),
+            key: format!("{}:password", account.id.0),
+        },
+        secret: password.to_string(),
+    })
+}
+
 fn edited_account(app: &App) -> Option<&AccountState> {
     let account_id = app.editing_account_id.as_ref()?;
     app.accounts
@@ -1102,6 +1143,7 @@ fn reset_account_form(app: &mut App) {
     app.account_imap_port = "993".to_string();
     app.account_smtp_host.clear();
     app.account_smtp_port = "587".to_string();
+    app.account_password.clear();
     app.identity_name.clear();
     app.identity_email.clear();
     app.account_connection_status.clear();

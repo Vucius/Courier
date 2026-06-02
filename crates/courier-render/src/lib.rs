@@ -14,6 +14,8 @@ pub enum ImageSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableCell {
     pub header: bool,
+    pub colspan: u16,
+    pub rowspan: u16,
     pub nodes: Vec<RenderNode>,
 }
 
@@ -37,7 +39,11 @@ pub enum RenderNode {
         children: Vec<RenderNode>,
     },
     Image(ImageSource),
-    BlockQuote(Vec<RenderNode>),
+    BlockQuote {
+        depth: u8,
+        collapsed: bool,
+        children: Vec<RenderNode>,
+    },
     List {
         ordered: bool,
         items: Vec<Vec<RenderNode>>,
@@ -84,22 +90,25 @@ pub fn render_tree_from_text(input: &str) -> RenderTree {
 
 fn html_nodes(input: &str) -> Vec<RenderNode> {
     let fragment = Html::parse_fragment(input);
-    block_children(fragment.root_element())
+    block_children(fragment.root_element(), 0)
 }
 
-fn block_children(element: ElementRef<'_>) -> Vec<RenderNode> {
-    wrap_inline_runs(raw_children(element))
+fn block_children(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode> {
+    wrap_inline_runs(raw_children(element, quote_depth))
 }
 
-fn raw_children(element: ElementRef<'_>) -> Vec<RenderNode> {
-    element.children().flat_map(node_to_nodes).collect()
+fn raw_children(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode> {
+    element
+        .children()
+        .flat_map(|node| node_to_nodes(node, quote_depth))
+        .collect()
 }
 
-fn inline_children(element: ElementRef<'_>) -> Vec<RenderNode> {
-    raw_children(element)
+fn inline_children(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode> {
+    raw_children(element, quote_depth)
 }
 
-fn node_to_nodes(node: NodeRef<'_, Node>) -> Vec<RenderNode> {
+fn node_to_nodes(node: NodeRef<'_, Node>, quote_depth: u8) -> Vec<RenderNode> {
     match node.value() {
         Node::Text(text) => normalized_text(text)
             .map(RenderNode::Text)
@@ -109,56 +118,63 @@ fn node_to_nodes(node: NodeRef<'_, Node>) -> Vec<RenderNode> {
             let Some(element) = ElementRef::wrap(node) else {
                 return Vec::new();
             };
-            element_to_nodes(element)
+            element_to_nodes(element, quote_depth)
         }
         _ => Vec::new(),
     }
 }
 
-fn element_to_nodes(element: ElementRef<'_>) -> Vec<RenderNode> {
+fn element_to_nodes(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode> {
     let name = element.value().name();
 
     match name {
         "html" | "body" | "main" | "article" | "section" | "div" | "center" => {
-            block_children(element)
+            block_children(element, quote_depth)
         }
-        "p" => vec![RenderNode::Paragraph(inline_children(element))],
+        "p" => vec![RenderNode::Paragraph(inline_children(element, quote_depth))],
         "br" => vec![RenderNode::LineBreak],
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => vec![RenderNode::Heading {
             level: heading_level(name),
-            children: inline_children(element),
+            children: inline_children(element, quote_depth),
         }],
-        "a" => link_nodes(element),
+        "a" => link_nodes(element, quote_depth),
         "img" => image_source_from_element(element)
             .map(RenderNode::Image)
             .into_iter()
             .collect(),
-        "blockquote" => vec![RenderNode::BlockQuote(block_children(element))],
+        "blockquote" => {
+            let depth = quote_depth.saturating_add(1);
+            vec![RenderNode::BlockQuote {
+                depth,
+                collapsed: depth >= 3,
+                children: block_children(element, depth),
+            }]
+        }
         "ul" | "ol" => vec![RenderNode::List {
             ordered: name == "ol",
-            items: list_items(element),
+            items: list_items(element, quote_depth),
         }],
-        "li" => block_children(element),
-        "strong" | "b" => vec![RenderNode::Strong(inline_children(element))],
-        "em" | "i" => vec![RenderNode::Emphasis(inline_children(element))],
+        "li" => block_children(element, quote_depth),
+        "strong" | "b" => vec![RenderNode::Strong(inline_children(element, quote_depth))],
+        "em" | "i" => vec![RenderNode::Emphasis(inline_children(element, quote_depth))],
         "hr" => vec![RenderNode::HorizontalRule],
         "table" => vec![RenderNode::Table {
-            rows: table_rows(element),
+            rows: table_rows(element, quote_depth),
         }],
-        "thead" | "tbody" | "tfoot" => block_children(element),
+        "thead" | "tbody" | "tfoot" => block_children(element, quote_depth),
         "tr" => {
-            let row = table_row(element);
+            let row = table_row(element, quote_depth);
             if row.cells.is_empty() {
                 Vec::new()
             } else {
                 vec![RenderNode::Table { rows: vec![row] }]
             }
         }
-        "td" | "th" => block_children(element),
+        "td" | "th" => block_children(element, quote_depth),
         "pre" => preformatted_node(element).into_iter().collect(),
         "code" => code_node(element).into_iter().collect(),
-        "span" | "small" | "label" | "font" => inline_children(element),
-        _ => block_children(element),
+        "span" | "small" | "label" | "font" => inline_children(element, quote_depth),
+        _ => block_children(element, quote_depth),
     }
 }
 
@@ -180,8 +196,8 @@ fn code_node(element: ElementRef<'_>) -> Option<RenderNode> {
     }
 }
 
-fn link_nodes(element: ElementRef<'_>) -> Vec<RenderNode> {
-    let children = inline_children(element);
+fn link_nodes(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode> {
+    let children = inline_children(element, quote_depth);
     let href = element
         .value()
         .attr("href")
@@ -197,49 +213,53 @@ fn link_nodes(element: ElementRef<'_>) -> Vec<RenderNode> {
     }
 }
 
-fn list_items(element: ElementRef<'_>) -> Vec<Vec<RenderNode>> {
+fn list_items(element: ElementRef<'_>, quote_depth: u8) -> Vec<Vec<RenderNode>> {
     element
         .children()
         .filter_map(ElementRef::wrap)
         .filter(|child| child.value().name() == "li")
-        .map(block_children)
+        .map(|child| block_children(child, quote_depth))
         .filter(|nodes| !nodes.is_empty())
         .collect()
 }
 
-fn table_rows(element: ElementRef<'_>) -> Vec<TableRow> {
+fn table_rows(element: ElementRef<'_>, quote_depth: u8) -> Vec<TableRow> {
     let mut rows = Vec::new();
-    collect_table_rows(element, &mut rows);
+    collect_table_rows(element, quote_depth, &mut rows);
     rows
 }
 
-fn collect_table_rows(element: ElementRef<'_>, rows: &mut Vec<TableRow>) {
+fn collect_table_rows(element: ElementRef<'_>, quote_depth: u8, rows: &mut Vec<TableRow>) {
     for child in element.children().filter_map(ElementRef::wrap) {
         match child.value().name() {
             "tr" => {
-                let row = table_row(child);
+                let row = table_row(child, quote_depth);
                 if !row.cells.is_empty() {
                     rows.push(row);
                 }
             }
-            "thead" | "tbody" | "tfoot" => collect_table_rows(child, rows),
+            "thead" | "tbody" | "tfoot" => collect_table_rows(child, quote_depth, rows),
             _ => {}
         }
     }
 }
 
-fn table_row(row: ElementRef<'_>) -> TableRow {
+fn table_row(row: ElementRef<'_>, quote_depth: u8) -> TableRow {
     let cells = row
         .children()
         .filter_map(ElementRef::wrap)
         .filter_map(|cell| match cell.value().name() {
             "td" => Some(TableCell {
                 header: false,
-                nodes: block_children(cell),
+                colspan: table_span(cell, "colspan"),
+                rowspan: table_span(cell, "rowspan"),
+                nodes: block_children(cell, quote_depth),
             }),
             "th" => Some(TableCell {
                 header: true,
-                nodes: block_children(cell),
+                colspan: table_span(cell, "colspan"),
+                rowspan: table_span(cell, "rowspan"),
+                nodes: block_children(cell, quote_depth),
             }),
             _ => None,
         })
@@ -247,6 +267,15 @@ fn table_row(row: ElementRef<'_>) -> TableRow {
         .collect();
 
     TableRow { cells }
+}
+
+fn table_span(cell: ElementRef<'_>, attr: &str) -> u16 {
+    cell.value()
+        .attr(attr)
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+        .min(24)
 }
 
 fn wrap_inline_runs(nodes: Vec<RenderNode>) -> Vec<RenderNode> {

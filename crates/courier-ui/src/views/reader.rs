@@ -393,10 +393,22 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
             .into()
         }
         RenderNode::Image(source) => image_label(source),
-        RenderNode::BlockQuote(children) => {
+        RenderNode::BlockQuote {
+            depth,
+            collapsed,
+            children,
+        } => {
             let mut quote = column![].spacing(6).padding(8).width(Length::Fill);
-            for child in children {
-                quote = quote.push(render_node(child));
+            if *collapsed {
+                quote = quote.push(
+                    text(format!("Quoted reply depth {} collapsed", depth))
+                        .size(12)
+                        .color(crate::theme::TEXT_MUTED),
+                );
+            } else {
+                for child in children {
+                    quote = quote.push(render_node(child));
+                }
             }
             container(quote)
                 .padding([8, 10])
@@ -572,7 +584,7 @@ fn table_cell<'a>(cell: &'a TableCell) -> Element<'a, Message> {
 
     container(content)
         .padding(8)
-        .width(Length::FillPortion(1))
+        .width(Length::FillPortion(cell.colspan.max(1)))
         .style(move |_| container::Style {
             background: Some(Background::Color(background)),
             border: Border {
@@ -618,6 +630,7 @@ fn children_text(children: &[RenderNode]) -> String {
             | RenderNode::Emphasis(children)
             | RenderNode::Paragraph(children)
             | RenderNode::Heading { children, .. } => Some(children_text(children)),
+            RenderNode::BlockQuote { children, .. } => Some(children_text(children)),
             RenderNode::Image(_) => Some("[image]".to_string()),
             RenderNode::LineBreak => Some("\n".to_string()),
             _ => None,
