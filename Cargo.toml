@@ -28,7 +28,7 @@ publisher = "Hephaestus"
 summary = "Local-first desktop email client"
 data_dir_name = ".courier"
 config_schema = 1
-database_schema = 2
+database_schema = 3
 
 [workspace.dependencies]
 anyhow = "1"

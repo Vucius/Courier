@@ -492,7 +492,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use courier_adapter::{
-        MailRemote, NoopRemote, OutgoingMessage, RemoteDelta, RemoteMessage, RemoteOp, SendResult,
+        AttachmentFetchRequest, AttachmentFetchResult, MailRemote, NoopRemote, OutgoingMessage,
+        RemoteDelta, RemoteMessage, RemoteOp, SendResult,
     };
     use courier_domain::SyncCursor;
     use courier_proto::{
@@ -988,6 +989,14 @@ mod tests {
             _message: OutgoingMessage,
         ) -> impl std::future::Future<Output = courier_adapter::Result<SendResult>> + Send {
             async { Err(courier_adapter::Error::NotImplemented("smtp send_message")) }
+        }
+
+        fn fetch_attachment(
+            &self,
+            _request: AttachmentFetchRequest,
+        ) -> impl std::future::Future<Output = courier_adapter::Result<AttachmentFetchResult>> + Send
+        {
+            async { Err(courier_adapter::Error::NotImplemented("attachment fetch")) }
         }
     }
 

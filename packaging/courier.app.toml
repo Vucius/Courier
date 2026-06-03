@@ -10,7 +10,7 @@ license = "MIT"
 data_dir_name = ".courier"
 database_file = "courier.db"
 minimum_config_schema = 1
-minimum_database_schema = 2
+minimum_database_schema = 3
 
 [icons]
 source_svg = "packaging/icons/courier.svg"

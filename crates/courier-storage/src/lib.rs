@@ -36,6 +36,13 @@ pub struct Storage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub db_path: PathBuf,
+    pub sql_migrations: Vec<String>,
+    pub compatibility_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedOp {
     pub id: i64,
     pub account_id: AccountId,
@@ -53,6 +60,8 @@ pub struct StoredAttachment {
     pub mime_type: String,
     pub size: u64,
     pub blob_path: Option<PathBuf>,
+    pub content_id: Option<String>,
+    pub inline: bool,
 }
 
 impl From<StoredAttachment> for AttachmentSummary {
@@ -65,6 +74,8 @@ impl From<StoredAttachment> for AttachmentSummary {
             blob_path: attachment
                 .blob_path
                 .map(|path| path.to_string_lossy().into_owned()),
+            content_id: attachment.content_id,
+            inline: attachment.inline,
         }
     }
 }
@@ -79,15 +90,34 @@ impl Storage {
     }
 
     pub fn initialize(&self) -> Result<()> {
+        self.initialize_with_report().map(|_| ())
+    }
+
+    pub fn initialize_with_report(&self) -> Result<MigrationReport> {
         let db_path = self.db_path();
         let connection = rusqlite::Connection::open(&db_path)?;
         connection.execute_batch(include_str!("../../../migrations/001_init.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/002_search.sql"))?;
-        ensure_accounts_enabled_column(&connection)?;
-        ensure_tasks_retry_columns(&connection)?;
+        let mut compatibility_steps = Vec::new();
+        if ensure_accounts_enabled_column(&connection)? {
+            compatibility_steps.push("accounts.enabled".to_string());
+        }
+        compatibility_steps.extend(ensure_attachment_metadata_columns(&connection)?);
+        compatibility_steps.extend(ensure_tasks_retry_columns(&connection)?);
 
-        tracing::info!(path = %db_path.display(), "courier storage initialized");
-        Ok(())
+        let report = MigrationReport {
+            db_path,
+            sql_migrations: vec!["001_init.sql".to_string(), "002_search.sql".to_string()],
+            compatibility_steps,
+        };
+
+        tracing::info!(
+            path = %report.db_path.display(),
+            migrations = ?report.sql_migrations,
+            compatibility_steps = ?report.compatibility_steps,
+            "courier storage initialized"
+        );
+        Ok(report)
     }
 
     pub fn upsert_account(&self, account: &AccountSummary) -> Result<()> {
@@ -895,7 +925,7 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             r#"
-            SELECT id, filename, mime_type, size, blob_path
+            SELECT id, filename, mime_type, size, blob_path, content_id, inline
             FROM attachments
             WHERE message_id = ?1
             ORDER BY filename COLLATE NOCASE, id
@@ -908,6 +938,8 @@ impl Storage {
                 mime_type: row.get(2)?,
                 size: row.get::<_, i64>(3)?.max(0) as u64,
                 blob_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                content_id: row.get(5)?,
+                inline: row.get::<_, i64>(6)? != 0,
             })
         })?;
 
@@ -922,7 +954,7 @@ impl Storage {
         connection
             .query_row(
                 r#"
-                SELECT id, filename, mime_type, size, blob_path
+                SELECT id, filename, mime_type, size, blob_path, content_id, inline
                 FROM attachments
                 WHERE id = ?1
                 "#,
@@ -934,8 +966,27 @@ impl Storage {
                         mime_type: row.get(2)?,
                         size: row.get::<_, i64>(3)?.max(0) as u64,
                         blob_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                        content_id: row.get(5)?,
+                        inline: row.get::<_, i64>(6)? != 0,
                     })
                 },
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    pub fn attachment_account_id(&self, attachment_id: &AttachmentId) -> Result<Option<AccountId>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                r#"
+                SELECT m.account_id
+                FROM attachments a
+                JOIN messages m ON m.id = a.message_id
+                WHERE a.id = ?1
+                "#,
+                params![attachment_id.0],
+                |row| Ok(AccountId(row.get(0)?)),
             )
             .optional()
             .map_err(Error::from)
@@ -1563,13 +1614,17 @@ impl Storage {
 
             connection.execute(
                 r#"
-                INSERT INTO attachments (id, message_id, filename, mime_type, size, blob_path)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO attachments (
+                    id, message_id, filename, mime_type, size, blob_path, content_id, inline
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ON CONFLICT(id) DO UPDATE SET
                     filename = excluded.filename,
                     mime_type = excluded.mime_type,
                     size = excluded.size,
-                    blob_path = excluded.blob_path
+                    blob_path = excluded.blob_path,
+                    content_id = excluded.content_id,
+                    inline = excluded.inline
                 "#,
                 params![
                     attachment.id.0,
@@ -1578,6 +1633,8 @@ impl Storage {
                     attachment.mime_type,
                     u64_to_i64(attachment.size),
                     relative.to_string_lossy(),
+                    attachment.content_id,
+                    if attachment.inline { 1 } else { 0 },
                 ],
             )?;
         }
@@ -2031,27 +2088,47 @@ fn has_pending_op_for_message(
     Ok(false)
 }
 
-fn ensure_accounts_enabled_column(connection: &Connection) -> Result<()> {
+fn ensure_accounts_enabled_column(connection: &Connection) -> Result<bool> {
     if !table_has_column(connection, "accounts", "enabled")? {
         connection.execute(
             "ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
             [],
         )?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
-fn ensure_tasks_retry_columns(connection: &Connection) -> Result<()> {
+fn ensure_attachment_metadata_columns(connection: &Connection) -> Result<Vec<String>> {
+    let mut added = Vec::new();
+    if !table_has_column(connection, "attachments", "content_id")? {
+        connection.execute("ALTER TABLE attachments ADD COLUMN content_id TEXT", [])?;
+        added.push("attachments.content_id".to_string());
+    }
+    if !table_has_column(connection, "attachments", "inline")? {
+        connection.execute(
+            "ALTER TABLE attachments ADD COLUMN inline INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        added.push("attachments.inline".to_string());
+    }
+    Ok(added)
+}
+
+fn ensure_tasks_retry_columns(connection: &Connection) -> Result<Vec<String>> {
+    let mut added = Vec::new();
     if !table_has_column(connection, "tasks", "retry_count")? {
         connection.execute(
             "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+        added.push("tasks.retry_count".to_string());
     }
     if !table_has_column(connection, "tasks", "last_error")? {
         connection.execute("ALTER TABLE tasks ADD COLUMN last_error TEXT", [])?;
+        added.push("tasks.last_error".to_string());
     }
-    Ok(())
+    Ok(added)
 }
 
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {

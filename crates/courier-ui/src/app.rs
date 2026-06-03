@@ -38,6 +38,7 @@ pub enum Message {
     DownloadAttachment(AttachmentId),
     CancelAttachmentDownload(AttachmentId),
     RetryAttachmentDownload(AttachmentId),
+    SetNetworkOnline(bool),
     DismissAttachmentNotice,
     ClearNotifications,
     ResolveConflict(MessageId, ConflictResolution),
@@ -77,6 +78,7 @@ pub struct App {
     conflicts: Vec<ConflictSummary>,
     notifications: Vec<DesktopNotification>,
     unread_notifications: u32,
+    network_online: bool,
     search_query: String,
     draft_to: String,
     draft_subject: String,
@@ -117,6 +119,7 @@ pub fn init() -> (App, Task<Message>) {
         conflicts: Vec::new(),
         notifications: Vec::new(),
         unread_notifications: 0,
+        network_online: true,
         search_query: String::new(),
         draft_to: String::new(),
         draft_subject: String::new(),
@@ -413,6 +416,21 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 |_| Message::SyncQueued,
             )
         }
+        Message::SetNetworkOnline(online) => {
+            let engine = app.engine.clone();
+            app.network_online = online;
+            app.status = if online {
+                "Network sends and sync enabled".to_string()
+            } else {
+                "Network sends and sync paused".to_string()
+            };
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::SetNetworkOnline(online)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
         Message::DismissAttachmentNotice => {
             app.attachment_preview = None;
             app.attachment_open = None;
@@ -691,6 +709,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
         crate::components::action_bar::button_primary("Compose", Message::Compose),
         crate::components::action_bar::button_toolbar("Account", Message::AddAccount),
         crate::components::action_bar::button_toolbar("Sync", Message::SyncNow),
+        crate::components::action_bar::button_toolbar(
+            if app.network_online {
+                "Go offline"
+            } else {
+                "Go online"
+            },
+            Message::SetNetworkOnline(!app.network_online),
+        ),
     ]
     .spacing(8);
 
@@ -989,6 +1015,10 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
         EngineEvent::SendQueueUpdated(queue) => {
             app.send_queue = queue;
             app.status = "Send queue updated".to_string();
+        }
+        EngineEvent::NetworkStatusChanged(status) => {
+            app.network_online = status.online;
+            app.status = status.reason;
         }
         EngineEvent::ConflictsUpdated(conflicts) => {
             app.conflicts = conflicts;

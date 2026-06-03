@@ -214,6 +214,8 @@ pub struct AttachmentSummary {
     pub mime_type: String,
     pub size: u64,
     pub blob_path: Option<String>,
+    pub content_id: Option<String>,
+    pub inline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +310,13 @@ pub struct DesktopNotification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkStatus {
+    pub online: bool,
+    pub reason: String,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DraftMessage {
     pub id: DraftId,
     pub account_id: AccountId,
@@ -352,6 +361,7 @@ pub enum EngineCommand {
     DownloadAttachment(AttachmentId),
     CancelAttachmentDownload(AttachmentId),
     RetryAttachmentDownload(AttachmentId),
+    SetNetworkOnline(bool),
     ListConflicts,
     ResolveConflict(MessageId, ConflictResolution),
     Snooze(MessageId, i64),
@@ -386,6 +396,7 @@ pub enum EngineEvent {
     AttachmentOpenExecuted(Result<AttachmentOpenRequest, String>),
     AttachmentTransfersUpdated(Vec<AttachmentTransfer>),
     SendQueueUpdated(Vec<SendQueueItem>),
+    NetworkStatusChanged(NetworkStatus),
     ConflictsUpdated(Vec<ConflictSummary>),
     NotificationRaised(DesktopNotification),
     SendResult {

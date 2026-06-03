@@ -2,17 +2,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use courier_adapter::{AttachmentFetchRequest, MailRemote, NoopRemote};
+use courier_adapter::{AttachmentFetchRequest, ConfiguredRemote, MailRemote};
 use courier_credential::{
     CredentialStore, OsCredentialStore, account_credential_refs, credential_ref,
 };
 use courier_proto::{
-    AccountConnectionTestResult, AccountId, AccountSummary, AttachmentId, AttachmentOpenRequest,
-    AttachmentSummary, AttachmentTransfer, AttachmentTransferStatus, AuthType, CredentialKind,
-    CredentialSecret, DesktopNotification, EndpointCheckResult, EngineCommand, EngineEvent,
-    MailboxId, MailboxRole, MailboxSummary, MessageBody, MessageId, NotificationKind,
-    OAuth2AuthorizationRequest, OAuth2Callback, OAuth2ClientConfig, ProviderKind, TaskId, ThreadId,
-    ThreadSummary,
+    AccountConfig, AccountConnectionTestResult, AccountId, AccountState, AccountSummary,
+    AttachmentId, AttachmentOpenRequest, AttachmentSummary, AttachmentTransfer,
+    AttachmentTransferStatus, AuthType, CredentialKind, CredentialSecret, DesktopNotification,
+    EndpointCheckResult, EngineCommand, EngineEvent, MailboxId, MailboxRole, MailboxSummary,
+    MessageBody, MessageId, NetworkStatus, NotificationKind, OAuth2AuthorizationRequest,
+    OAuth2Callback, OAuth2ClientConfig, ProviderKind, TaskId, ThreadId, ThreadSummary,
 };
 use courier_provider::oauth2_client_config;
 use courier_search::SearchIndex;
@@ -79,6 +79,7 @@ pub fn spawn_engine(config: EngineConfig) -> (EngineHandle, JoinHandle<Result<()
         notifications: NotificationPolicy::default(),
         attachment_transfers: HashMap::new(),
         pending_oauth2: HashMap::new(),
+        network_online: true,
     };
     let join = tokio::spawn(runtime.run());
 
@@ -99,6 +100,7 @@ struct EngineRuntime {
     notifications: NotificationPolicy,
     attachment_transfers: HashMap<String, AttachmentTransfer>,
     pending_oauth2: HashMap<String, PendingOAuth2>,
+    network_online: bool,
 }
 
 struct PendingOAuth2 {
@@ -147,10 +149,15 @@ impl NotificationPolicy {
 impl EngineRuntime {
     async fn run(mut self) -> Result<()> {
         let storage = Storage::open(self.config.data_dir.clone())?;
-        storage.initialize()?;
+        let migration_report = storage.initialize_with_report()?;
+        tracing::info!(
+            db_path = %migration_report.db_path.display(),
+            migrations = ?migration_report.sql_migrations,
+            compatibility_steps = ?migration_report.compatibility_steps,
+            "storage migration runner completed"
+        );
         seed_demo_data(&storage)?;
 
-        let sync = SyncScheduler::new(storage.clone());
         let search = SearchIndex::new(storage.clone());
         let mut send_queue_tick = tokio::time::interval(Duration::from_secs(5));
 
@@ -163,10 +170,10 @@ impl EngineRuntime {
                     let Some(command) = command else {
                         break;
                     };
-                    self.handle_command(command, &storage, &sync, &search).await;
+                    self.handle_command(command, &storage, &search).await;
                 }
                 _ = send_queue_tick.tick() => {
-                    self.run_due_send_queue(&storage, &sync).await;
+                    self.run_due_send_queue(&storage).await;
                 }
             }
         }
@@ -178,11 +185,18 @@ impl EngineRuntime {
         &mut self,
         command: EngineCommand,
         storage: &Storage,
-        sync: &SyncScheduler,
         search: &SearchIndex,
     ) {
         match command {
             EngineCommand::SyncNow(account_id) => {
+                if !self.network_online {
+                    self.publish_network_paused("Sync skipped because Courier is offline");
+                    let _ = self.event_tx.send(EngineEvent::Error(
+                        "Network is offline; sync is paused".to_string(),
+                    ));
+                    return;
+                }
+
                 let _ = self.event_tx.send(EngineEvent::SyncProgress {
                     account_id: account_id.clone(),
                     progress: 0.25,
@@ -195,6 +209,22 @@ impl EngineRuntime {
                         "oauth2 token refresh failed before sync"
                     );
                 }
+
+                let sync = match scheduler_for_account(storage, &account_id) {
+                    Ok(sync) => sync,
+                    Err(error) => {
+                        self.publish_notification(DesktopNotification {
+                            id: format!("sync-error:{}", unix_timestamp()),
+                            kind: NotificationKind::Error,
+                            title: "Sync failed".to_string(),
+                            body: error,
+                            account_id: Some(account_id),
+                            message_ids: Vec::new(),
+                            created_at: unix_timestamp(),
+                        });
+                        return;
+                    }
+                };
 
                 match sync.sync_now(account_id.clone()).await {
                     Ok(report) => {
@@ -445,6 +475,28 @@ impl EngineRuntime {
             }
             EngineCommand::SendMessage(draft_id) => {
                 let task_id = TaskId(format!("send:{}", draft_id.0));
+                if !self.network_online {
+                    self.publish_send_queue(storage);
+                    self.publish_network_paused("Send queued until network is online");
+                    let _ = self.event_tx.send(EngineEvent::SendResult {
+                        task_id,
+                        result: Err("Network is offline; send remains queued".to_string()),
+                    });
+                    return;
+                }
+
+                let sync = match scheduler_for_draft(storage, &draft_id) {
+                    Ok(sync) => sync,
+                    Err(error) => {
+                        self.publish_send_queue(storage);
+                        let _ = self.event_tx.send(EngineEvent::SendResult {
+                            task_id,
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                };
+
                 match sync.send_draft(draft_id).await {
                     Ok(report) => {
                         tracing::info!(
@@ -473,7 +525,7 @@ impl EngineRuntime {
                 Ok(()) => {
                     tracing::info!(draft_id = ?draft.id, "queued draft save");
                     self.publish_send_queue(storage);
-                    self.run_due_send_queue(storage, sync).await;
+                    self.run_due_send_queue(storage).await;
                 }
                 Err(error) => {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
@@ -508,6 +560,27 @@ impl EngineRuntime {
                 }
                 self.publish_send_queue(storage);
                 let task_id = TaskId(format!("send:{}", draft_id.0));
+                if !self.network_online {
+                    self.publish_network_paused("Retry queued until network is online");
+                    let _ = self.event_tx.send(EngineEvent::SendResult {
+                        task_id,
+                        result: Err("Network is offline; retry remains queued".to_string()),
+                    });
+                    return;
+                }
+
+                let sync = match scheduler_for_draft(storage, &draft_id) {
+                    Ok(sync) => sync,
+                    Err(error) => {
+                        self.publish_send_queue(storage);
+                        let _ = self.event_tx.send(EngineEvent::SendResult {
+                            task_id,
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                };
+
                 match sync.send_draft(draft_id).await {
                     Ok(report) => {
                         self.publish_snapshot(storage);
@@ -554,7 +627,39 @@ impl EngineRuntime {
                 }
             },
             EngineCommand::RunDueSendQueue => {
-                self.run_due_send_queue(storage, sync).await;
+                self.run_due_send_queue(storage).await;
+            }
+            EngineCommand::SetNetworkOnline(online) => {
+                self.network_online = online;
+                let status = NetworkStatus {
+                    online,
+                    reason: if online {
+                        "Network sends and sync are enabled".to_string()
+                    } else {
+                        "Network sends and sync are paused".to_string()
+                    },
+                    checked_at: unix_timestamp(),
+                };
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::NetworkStatusChanged(status.clone()));
+                self.publish_notification(DesktopNotification {
+                    id: format!("network:{}", if online { "online" } else { "offline" }),
+                    kind: if online {
+                        NotificationKind::Sync
+                    } else {
+                        NotificationKind::Warning
+                    },
+                    title: if online {
+                        "Network online".to_string()
+                    } else {
+                        "Network offline".to_string()
+                    },
+                    body: status.reason,
+                    account_id: None,
+                    message_ids: Vec::new(),
+                    created_at: unix_timestamp(),
+                });
             }
             EngineCommand::PreviewAttachment(attachment_id) => {
                 match storage.attachment_preview(&attachment_id, 64 * 1024) {
@@ -728,7 +833,17 @@ impl EngineRuntime {
             filename: transfer.attachment.filename.clone(),
             expected_size: transfer.attachment.size,
         };
-        let remote = NoopRemote::default();
+        let remote = match remote_for_attachment(storage, &transfer.attachment.id) {
+            Ok(remote) => remote,
+            Err(error) => {
+                let mut failed = transfer;
+                failed.status = AttachmentTransferStatus::Failed;
+                failed.progress = 0.0;
+                failed.message = error;
+                self.upsert_attachment_transfer(failed);
+                return;
+            }
+        };
 
         match remote.fetch_attachment(request).await {
             Ok(result) => {
@@ -768,42 +883,63 @@ impl EngineRuntime {
             .send(EngineEvent::AttachmentTransfersUpdated(transfers));
     }
 
-    async fn run_due_send_queue(&mut self, storage: &Storage, sync: &SyncScheduler) {
-        match sync.send_due_drafts(unix_timestamp(), 8).await {
-            Ok(report) => {
-                if report.attempted > 0 {
-                    tracing::info!(
-                        attempted = report.attempted,
-                        sent = report.sent.len(),
-                        failed = report.failed.len(),
-                        "drained due send queue"
-                    );
-                    self.publish_snapshot(storage);
-                    self.publish_send_queue(storage);
-                    for sent in report.sent {
-                        self.publish_notification(DesktopNotification {
-                            id: format!("send-ok:{}", sent.task_id.0),
-                            kind: NotificationKind::Send,
-                            title: "Message sent".to_string(),
-                            body: format!("Draft {} was sent", sent.draft_id.0),
-                            account_id: None,
-                            message_ids: vec![sent.message_id],
-                            created_at: unix_timestamp(),
-                        });
-                    }
-                    for (draft_id, error) in report.failed {
-                        self.publish_notification(DesktopNotification {
-                            id: format!("send-error:{}", draft_id.0),
-                            kind: NotificationKind::Error,
-                            title: "Send retry failed".to_string(),
-                            body: error,
-                            account_id: None,
-                            message_ids: Vec::new(),
-                            created_at: unix_timestamp(),
-                        });
+    async fn run_due_send_queue(&mut self, storage: &Storage) {
+        if !self.network_online {
+            self.publish_network_paused("Due send queue paused while Courier is offline");
+            self.publish_send_queue(storage);
+            return;
+        }
+
+        match storage.due_draft_ids(unix_timestamp(), 8) {
+            Ok(draft_ids) if !draft_ids.is_empty() => {
+                let mut sent = Vec::new();
+                let mut failed = Vec::new();
+
+                for draft_id in draft_ids {
+                    match scheduler_for_draft(storage, &draft_id) {
+                        Ok(sync) => match sync.send_draft(draft_id.clone()).await {
+                            Ok(report) => sent.push(report),
+                            Err(error) => failed.push((draft_id, error.to_string())),
+                        },
+                        Err(error) => {
+                            let _ = storage.mark_draft_failed(&draft_id, &error);
+                            failed.push((draft_id, error));
+                        }
                     }
                 }
+
+                tracing::info!(
+                    attempted = sent.len() + failed.len(),
+                    sent = sent.len(),
+                    failed = failed.len(),
+                    "drained due send queue"
+                );
+                self.publish_snapshot(storage);
+                self.publish_send_queue(storage);
+                for sent in sent {
+                    self.publish_notification(DesktopNotification {
+                        id: format!("send-ok:{}", sent.task_id.0),
+                        kind: NotificationKind::Send,
+                        title: "Message sent".to_string(),
+                        body: format!("Draft {} was sent", sent.draft_id.0),
+                        account_id: None,
+                        message_ids: vec![sent.message_id],
+                        created_at: unix_timestamp(),
+                    });
+                }
+                for (draft_id, error) in failed {
+                    self.publish_notification(DesktopNotification {
+                        id: format!("send-error:{}", draft_id.0),
+                        kind: NotificationKind::Error,
+                        title: "Send retry failed".to_string(),
+                        body: error,
+                        account_id: None,
+                        message_ids: Vec::new(),
+                        created_at: unix_timestamp(),
+                    });
+                }
             }
+            Ok(_) => {}
             Err(error) => {
                 let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
             }
@@ -1010,6 +1146,26 @@ impl EngineRuntime {
         }
     }
 
+    fn publish_network_paused(&mut self, message: &str) {
+        let status = NetworkStatus {
+            online: false,
+            reason: message.to_string(),
+            checked_at: unix_timestamp(),
+        };
+        let _ = self
+            .event_tx
+            .send(EngineEvent::NetworkStatusChanged(status.clone()));
+        self.publish_notification(DesktopNotification {
+            id: format!("network-paused:{}", unix_timestamp()),
+            kind: NotificationKind::Warning,
+            title: "Network paused".to_string(),
+            body: status.reason,
+            account_id: None,
+            message_ids: Vec::new(),
+            created_at: status.checked_at,
+        });
+    }
+
     fn publish_snapshot(&self, storage: &Storage) {
         match storage.list_accounts() {
             Ok(accounts) => {
@@ -1048,6 +1204,78 @@ impl EngineRuntime {
                 let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
             }
         }
+    }
+}
+
+fn scheduler_for_account(
+    storage: &Storage,
+    account_id: &AccountId,
+) -> std::result::Result<SyncScheduler<ConfiguredRemote>, String> {
+    Ok(SyncScheduler::with_remote(
+        storage.clone(),
+        remote_for_account(storage, account_id)?,
+    ))
+}
+
+fn scheduler_for_draft(
+    storage: &Storage,
+    draft_id: &courier_proto::DraftId,
+) -> std::result::Result<SyncScheduler<ConfiguredRemote>, String> {
+    let draft = storage
+        .load_draft(draft_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Draft not found: {}", draft_id.0))?;
+
+    scheduler_for_account(storage, &draft.account_id)
+}
+
+fn remote_for_attachment(
+    storage: &Storage,
+    attachment_id: &AttachmentId,
+) -> std::result::Result<ConfiguredRemote, String> {
+    let account_id = storage
+        .attachment_account_id(attachment_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "Attachment {} is not linked to a stored message account",
+                attachment_id.0
+            )
+        })?;
+
+    remote_for_account(storage, &account_id)
+}
+
+fn remote_for_account(
+    storage: &Storage,
+    account_id: &AccountId,
+) -> std::result::Result<ConfiguredRemote, String> {
+    let account = storage
+        .list_accounts()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|account| account.id == *account_id)
+        .ok_or_else(|| format!("Account not found: {}", account_id.0))?;
+
+    if !account.enabled {
+        return Err(format!("Account {} is disabled", account.email));
+    }
+
+    Ok(ConfiguredRemote::from_account_config(account_config(
+        account,
+    )))
+}
+
+fn account_config(account: AccountState) -> AccountConfig {
+    AccountConfig {
+        id: account.id,
+        email: account.email,
+        provider: account.provider,
+        imap_host: account.imap_host,
+        imap_port: account.imap_port,
+        smtp_host: account.smtp_host,
+        smtp_port: account.smtp_port,
+        auth_type: account.auth_type,
     }
 }
 

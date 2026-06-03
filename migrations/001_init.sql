@@ -75,7 +75,9 @@ CREATE TABLE IF NOT EXISTS attachments (
     filename    TEXT NOT NULL,
     mime_type   TEXT NOT NULL,
     size        INTEGER NOT NULL,
-    blob_path   TEXT
+    blob_path   TEXT,
+    content_id  TEXT,
+    inline      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS contacts (

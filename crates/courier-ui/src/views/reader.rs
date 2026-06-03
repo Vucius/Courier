@@ -24,7 +24,7 @@ pub fn view<'a>(
             } else {
                 body.to.join(", ")
             };
-            let rendered_body = render_tree_view(render_tree, &body.body);
+            let rendered_body = render_tree_view(render_tree, &body.body, &body.attachments);
             let mut content = column![
                 crate::components::surface::header(
                     &body.subject,
@@ -329,6 +329,7 @@ fn format_size(size: u64) -> String {
 fn render_tree_view<'a>(
     render_tree: Option<&'a RenderTree>,
     fallback: &'a str,
+    attachments: &'a [AttachmentSummary],
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(8).padding(12).width(Length::Fill);
 
@@ -342,7 +343,7 @@ fn render_tree_view<'a>(
             }
 
             for node in &tree.nodes {
-                content = content.push(render_node(node));
+                content = content.push(render_node(node, attachments));
             }
         }
         None => {
@@ -358,7 +359,10 @@ fn render_tree_view<'a>(
     scrollable(content).height(Length::Fill).into()
 }
 
-fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
+fn render_node<'a>(
+    node: &'a RenderNode,
+    attachments: &'a [AttachmentSummary],
+) -> Element<'a, Message> {
     match node {
         RenderNode::Text(value) => text(value)
             .size(14)
@@ -370,7 +374,7 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
         RenderNode::Paragraph(children) => {
             let mut line = row![].spacing(4).width(Length::Fill);
             for child in children {
-                line = line.push(render_inline_node(child));
+                line = line.push(render_inline_node(child, attachments));
             }
             line.into()
         }
@@ -392,7 +396,7 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
             .spacing(2)
             .into()
         }
-        RenderNode::Image(source) => image_label(source),
+        RenderNode::Image(source) => image_label(source, attachments),
         RenderNode::BlockQuote {
             depth,
             collapsed,
@@ -407,7 +411,7 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
                 );
             } else {
                 for child in children {
-                    quote = quote.push(render_node(child));
+                    quote = quote.push(render_node(child, attachments));
                 }
             }
             container(quote)
@@ -434,7 +438,7 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
                 };
                 let mut item_body = column![].spacing(4).width(Length::Fill);
                 for node in item {
-                    item_body = item_body.push(render_node(node));
+                    item_body = item_body.push(render_node(node, attachments));
                 }
                 list = list.push(
                     row![
@@ -456,11 +460,14 @@ fn render_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
         }
         RenderNode::HorizontalRule => crate::components::surface::divider(),
         RenderNode::LineBreak => text("").height(Length::Fixed(6.0)).into(),
-        RenderNode::Table { rows } => table_view(rows),
+        RenderNode::Table { rows } => table_view(rows, attachments),
     }
 }
 
-fn render_inline_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
+fn render_inline_node<'a>(
+    node: &'a RenderNode,
+    attachments: &'a [AttachmentSummary],
+) -> Element<'a, Message> {
     match node {
         RenderNode::Text(value) => text(value).size(14).color(crate::theme::TEXT).into(),
         RenderNode::Code(value) => code_inline(value),
@@ -472,7 +479,7 @@ fn render_inline_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
                 .color(crate::theme::ACCENT)
                 .into()
         }
-        RenderNode::Image(source) => image_label(source),
+        RenderNode::Image(source) => image_label(source, attachments),
         RenderNode::Strong(children) => {
             inline_text(children, Weight::Bold, Style::Normal, crate::theme::TEXT)
         }
@@ -480,7 +487,7 @@ fn render_inline_node<'a>(node: &'a RenderNode) -> Element<'a, Message> {
             inline_text(children, Weight::Normal, Style::Italic, crate::theme::TEXT)
         }
         RenderNode::LineBreak => text(" ").width(Length::Fixed(1.0)).into(),
-        other => render_node(other),
+        other => render_node(other, attachments),
     }
 }
 
@@ -556,13 +563,16 @@ fn preformatted_block<'a>(value: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-fn table_view<'a>(rows: &'a [courier_render::TableRow]) -> Element<'a, Message> {
+fn table_view<'a>(
+    rows: &'a [courier_render::TableRow],
+    attachments: &'a [AttachmentSummary],
+) -> Element<'a, Message> {
     let mut table = column![].spacing(0).width(Length::Fill);
 
     for row_data in rows {
         let mut table_row = row![].spacing(0).width(Length::Fill);
         for cell in &row_data.cells {
-            table_row = table_row.push(table_cell(cell));
+            table_row = table_row.push(table_cell(cell, attachments));
         }
         table = table.push(table_row);
     }
@@ -570,10 +580,13 @@ fn table_view<'a>(rows: &'a [courier_render::TableRow]) -> Element<'a, Message> 
     table.into()
 }
 
-fn table_cell<'a>(cell: &'a TableCell) -> Element<'a, Message> {
+fn table_cell<'a>(
+    cell: &'a TableCell,
+    attachments: &'a [AttachmentSummary],
+) -> Element<'a, Message> {
     let mut content = column![].spacing(4).width(Length::Fill);
     for node in &cell.nodes {
-        content = content.push(render_node(node));
+        content = content.push(render_node(node, attachments));
     }
 
     let background = if cell.header {
@@ -606,7 +619,14 @@ fn heading_size(level: u8) -> u16 {
     }
 }
 
-fn image_label<'a>(source: &'a ImageSource) -> Element<'a, Message> {
+fn image_label<'a>(
+    source: &'a ImageSource,
+    attachments: &'a [AttachmentSummary],
+) -> Element<'a, Message> {
+    if let Some(attachment) = inline_image_attachment(source, attachments) {
+        return inline_image_attachment_view(attachment);
+    }
+
     match source {
         ImageSource::RemoteUrl(_) => {
             crate::components::attachment::image_placeholder("Remote image blocked")
@@ -617,6 +637,90 @@ fn image_label<'a>(source: &'a ImageSource) -> Element<'a, Message> {
         }
         ImageSource::LocalPath(value) => crate::components::attachment::chip(value, "image"),
     }
+}
+
+fn inline_image_attachment<'a>(
+    source: &ImageSource,
+    attachments: &'a [AttachmentSummary],
+) -> Option<&'a AttachmentSummary> {
+    match source {
+        ImageSource::Cid(value) => {
+            let needle = normalize_cid(value);
+            attachments.iter().find(|attachment| {
+                attachment.inline
+                    && attachment
+                        .content_id
+                        .as_deref()
+                        .map(normalize_cid)
+                        .is_some_and(|content_id| content_id == needle)
+            })
+        }
+        ImageSource::Attachment(value) | ImageSource::LocalPath(value) => {
+            let needle = value.trim();
+            attachments.iter().find(|attachment| {
+                attachment.id.0 == needle || attachment.filename.eq_ignore_ascii_case(needle)
+            })
+        }
+        ImageSource::RemoteUrl(_) => None,
+    }
+}
+
+fn inline_image_attachment_view<'a>(attachment: &'a AttachmentSummary) -> Element<'a, Message> {
+    let state = if attachment.blob_path.is_some() {
+        "inline image available locally"
+    } else {
+        "inline image not downloaded"
+    };
+    let mut actions = row![
+        crate::components::action_bar::button_text(
+            "Preview",
+            Message::PreviewAttachment(attachment.id.clone()),
+        ),
+        crate::components::action_bar::button_text(
+            "Open",
+            Message::OpenAttachment(attachment.id.clone())
+        ),
+    ]
+    .spacing(6);
+
+    if attachment.blob_path.is_none() {
+        actions = actions.push(crate::components::action_bar::button_text(
+            "Download",
+            Message::DownloadAttachment(attachment.id.clone()),
+        ));
+    }
+
+    container(
+        row![
+            crate::components::attachment::image_placeholder(&attachment.filename),
+            text(state).size(12).color(crate::theme::TEXT_MUTED),
+            iced::widget::horizontal_space(),
+            actions,
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
+    )
+    .padding(8)
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(Background::Color(crate::theme::SURFACE_ALT)),
+        border: Border {
+            width: 1.0,
+            radius: 4.0.into(),
+            color: crate::theme::BORDER,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn normalize_cid(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("cid:")
+        .trim_matches(['<', '>'])
+        .to_ascii_lowercase()
 }
 
 fn children_text(children: &[RenderNode]) -> String {

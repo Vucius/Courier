@@ -4,7 +4,7 @@
   "bundle_identifier": "dev.hephaestus.courier",
   "publisher": "Hephaestus",
   "license": "MIT",
-  "database_schema": 2,
+  "database_schema": 3,
   "config_schema": 1,
   "artifacts": {
     "windows": {
