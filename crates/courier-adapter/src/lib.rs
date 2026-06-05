@@ -1,6 +1,6 @@
 #![allow(clippy::manual_async_fn)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,9 @@ use futures_util::TryStreamExt;
 use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -38,6 +41,8 @@ pub enum Error {
     Smtp(String),
     #[error("imap transport error: {0}")]
     Imap(String),
+    #[error("jmap transport error: {0}")]
+    Jmap(String),
     #[error("message envelope is invalid: {0}")]
     InvalidEnvelope(String),
     #[error("remote message is invalid: {0}")]
@@ -95,6 +100,17 @@ pub struct RemoteMessage {
     pub timestamp: i64,
     pub read: bool,
     pub raw: Option<Vec<u8>>,
+    pub attachments: Vec<RemoteAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAttachment {
+    pub id: AttachmentId,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub content_id: Option<String>,
+    pub inline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +203,7 @@ pub struct OutlookRemote {
 pub struct JmapRemote {
     account: AccountConfig,
     plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +301,23 @@ fn endpoint_from_account_smtp(account: &AccountConfig) -> Result<Option<Provider
     }))
 }
 
+fn endpoint_from_account_jmap(account: &AccountConfig) -> Result<Option<ProviderEndpoint>> {
+    let host = account.imap_host.trim();
+    if host.is_empty() {
+        return Err(Error::MissingEndpoint("jmap"));
+    }
+
+    Ok(Some(ProviderEndpoint {
+        host: host.to_string(),
+        port: account.imap_port,
+        security: if account.imap_port == 80 {
+            TransportSecurity::Plain
+        } else {
+            TransportSecurity::Tls
+        },
+    }))
+}
+
 fn fallback_plan(account: &AccountConfig, transport: ProtocolTransport) -> ProtocolConnectionPlan {
     let capabilities = capabilities_for(&account.provider);
     ProtocolConnectionPlan {
@@ -291,7 +325,14 @@ fn fallback_plan(account: &AccountConfig, transport: ProtocolTransport) -> Proto
         transport,
         imap_endpoint: capabilities.imap_endpoint.clone(),
         smtp_endpoint: capabilities.smtp_endpoint.clone(),
-        jmap_endpoint: capabilities.jmap_endpoint.clone(),
+        jmap_endpoint: if matches!(account.provider, ProviderKind::Jmap) {
+            endpoint_from_account_jmap(account)
+                .ok()
+                .flatten()
+                .or_else(|| capabilities.jmap_endpoint.clone())
+        } else {
+            capabilities.jmap_endpoint.clone()
+        },
         auth_mechanisms: capabilities.auth_mechanisms.clone(),
         credential_refs: credential_refs_for_account(account),
         capabilities,
@@ -319,7 +360,10 @@ impl ProtocolConnectionPlan {
             ProviderKind::GenericImap => endpoint_from_account_smtp(account)?,
             _ => capabilities.smtp_endpoint.clone(),
         };
-        let jmap_endpoint = capabilities.jmap_endpoint.clone();
+        let jmap_endpoint = match account.provider {
+            ProviderKind::Jmap => endpoint_from_account_jmap(account)?,
+            _ => capabilities.jmap_endpoint.clone(),
+        };
         let transport = match account.provider {
             ProviderKind::GenericImap => ProtocolTransport::ImapSmtp,
             ProviderKind::Gmail => ProtocolTransport::GmailImapSmtp,
@@ -412,7 +456,7 @@ impl ConfiguredRemote {
             )),
             ProviderKind::Gmail => Self::Gmail(GmailRemote::new(account, secret_resolver)),
             ProviderKind::Outlook => Self::Outlook(OutlookRemote::new(account, secret_resolver)),
-            ProviderKind::Jmap => Self::Jmap(JmapRemote::new(account)),
+            ProviderKind::Jmap => Self::Jmap(JmapRemote::new(account, secret_resolver)),
         }
     }
 }
@@ -485,10 +529,14 @@ impl OutlookRemote {
 }
 
 impl JmapRemote {
-    pub fn new(account: AccountConfig) -> Self {
+    pub fn new(account: AccountConfig, secret_resolver: Option<CredentialSecretResolver>) -> Self {
         let plan = ProtocolConnectionPlan::from_account(&account)
             .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::Jmap));
-        Self { account, plan }
+        Self {
+            account,
+            plan,
+            secret_resolver,
+        }
     }
 
     pub fn account(&self) -> &AccountConfig {
@@ -1086,6 +1134,7 @@ async fn fetch_imap_delta(
             timestamp: unix_timestamp(),
             read,
             raw: Some(raw_message),
+            attachments: Vec::new(),
         });
     }
 
@@ -1461,6 +1510,741 @@ fn sanitize_remote_id(value: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JmapAuthSecret {
+    Basic { username: String, password: String },
+    Bearer(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapSession {
+    api_url: String,
+    download_url: String,
+    accounts: BTreeMap<String, JmapSessionAccount>,
+    primary_accounts: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapSessionAccount {
+    account_capabilities: Option<BTreeMap<String, Value>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapMailbox {
+    id: String,
+    name: String,
+    role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapEmail {
+    id: String,
+    thread_id: Option<String>,
+    keywords: Option<BTreeMap<String, Value>>,
+    subject: Option<String>,
+    from: Option<Vec<JmapEmailAddress>>,
+    to: Option<Vec<JmapEmailAddress>>,
+    preview: Option<String>,
+    text_body: Option<Vec<JmapBodyPart>>,
+    html_body: Option<Vec<JmapBodyPart>>,
+    body_values: Option<BTreeMap<String, JmapBodyValue>>,
+    attachments: Option<Vec<JmapBodyPart>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapEmailAddress {
+    name: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapBodyPart {
+    part_id: Option<String>,
+    blob_id: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "type")]
+    mime_type: Option<String>,
+    size: Option<u64>,
+    cid: Option<String>,
+    disposition: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JmapBodyValue {
+    value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpTarget {
+    https: bool,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+async fn list_jmap_mailboxes(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+) -> Result<Vec<RemoteMailbox>> {
+    let auth = resolve_jmap_auth_secret(&account, &plan, secret_resolver.as_ref())?;
+    let session = fetch_jmap_session(&plan, &auth).await?;
+    let account_id = jmap_mail_account_id(&session)?;
+    let response = jmap_method_call(
+        &session.api_url,
+        &auth,
+        json!({
+            "using": jmap_using(),
+            "methodCalls": [[
+                "Mailbox/get",
+                {
+                    "accountId": account_id,
+                    "ids": null,
+                    "properties": ["id", "name", "role"]
+                },
+                "m0"
+            ]]
+        }),
+    )
+    .await?;
+    let list = jmap_response_list::<JmapMailbox>(&response, "Mailbox/get")?;
+
+    Ok(list
+        .into_iter()
+        .map(|mailbox| RemoteMailbox {
+            id: remote_mailbox_id(&account.id.0, &mailbox.id),
+            name: mailbox.name,
+            role: jmap_mailbox_role(mailbox.role.as_deref()),
+        })
+        .collect())
+}
+
+async fn fetch_jmap_delta(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+    mailbox: MailboxId,
+    cursor: SyncCursor,
+) -> Result<RemoteDelta> {
+    let auth = resolve_jmap_auth_secret(&account, &plan, secret_resolver.as_ref())?;
+    let session = fetch_jmap_session(&plan, &auth).await?;
+    let account_id = jmap_mail_account_id(&session)?;
+    let jmap_mailbox_id = remote_mailbox_name(&account.id.0, &mailbox.0);
+    let query = jmap_method_call(
+        &session.api_url,
+        &auth,
+        json!({
+            "using": jmap_using(),
+            "methodCalls": [[
+                "Email/query",
+                {
+                    "accountId": account_id,
+                    "filter": { "inMailbox": jmap_mailbox_id },
+                    "sort": [{ "property": "receivedAt", "isAscending": false }],
+                    "limit": 50
+                },
+                "q0"
+            ]]
+        }),
+    )
+    .await?;
+    let ids = jmap_response_ids(&query, "Email/query")?;
+    if ids.is_empty() {
+        return Ok(RemoteDelta::empty(cursor));
+    }
+
+    let emails = jmap_method_call(
+        &session.api_url,
+        &auth,
+        json!({
+            "using": jmap_using(),
+            "methodCalls": [[
+                "Email/get",
+                {
+                    "accountId": account_id,
+                    "ids": ids,
+                    "properties": [
+                        "id", "blobId", "threadId", "keywords", "subject", "from", "to",
+                        "receivedAt", "preview", "textBody", "htmlBody", "bodyValues",
+                        "attachments"
+                    ],
+                    "bodyProperties": [
+                        "partId", "blobId", "name", "type", "size", "cid", "disposition"
+                    ],
+                    "fetchTextBodyValues": true,
+                    "fetchHTMLBodyValues": true
+                },
+                "g0"
+            ]]
+        }),
+    )
+    .await?;
+    let messages = jmap_response_list::<JmapEmail>(&emails, "Email/get")?
+        .into_iter()
+        .map(|email| remote_message_from_jmap(&account, email))
+        .collect();
+
+    Ok(RemoteDelta {
+        cursor,
+        messages,
+        deleted_messages: Vec::new(),
+        moved_messages: Vec::new(),
+    })
+}
+
+async fn fetch_jmap_attachment(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+    request: AttachmentFetchRequest,
+) -> Result<AttachmentFetchResult> {
+    let auth = resolve_jmap_auth_secret(&account, &plan, secret_resolver.as_ref())?;
+    let session = fetch_jmap_session(&plan, &auth).await?;
+    let account_id = jmap_mail_account_id(&session)?;
+    let blob_id = jmap_blob_id_from_attachment_id(&account.id.0, &request.attachment_id)?;
+    let url = jmap_download_url(
+        &session.download_url,
+        account_id,
+        &blob_id,
+        &request.filename,
+        "application/octet-stream",
+    );
+    let bytes = http_get_bytes(&url, &auth).await?;
+    Ok(AttachmentFetchResult {
+        attachment_id: request.attachment_id,
+        bytes,
+    })
+}
+
+fn resolve_jmap_auth_secret(
+    account: &AccountConfig,
+    plan: &ProtocolConnectionPlan,
+    secret_resolver: Option<&CredentialSecretResolver>,
+) -> Result<JmapAuthSecret> {
+    let Some(secret_resolver) = secret_resolver else {
+        return Err(Error::MissingCredential("credential resolver"));
+    };
+
+    match &account.auth_type {
+        AuthType::Password => {
+            let reference = plan
+                .credential_refs
+                .iter()
+                .find(|reference| matches!(reference.kind, CredentialKind::Password))
+                .ok_or(Error::MissingCredential("password reference"))?;
+            let password = secret_resolver
+                .get_secret(reference)?
+                .ok_or(Error::MissingCredential("password"))?;
+            Ok(JmapAuthSecret::Basic {
+                username: account.email.clone(),
+                password,
+            })
+        }
+        AuthType::OAuth2 => {
+            let reference = plan
+                .credential_refs
+                .iter()
+                .find(|reference| matches!(reference.kind, CredentialKind::OAuthAccessToken))
+                .ok_or(Error::MissingCredential("oauth access token reference"))?;
+            let token = secret_resolver
+                .get_secret(reference)?
+                .ok_or(Error::MissingCredential("oauth access token"))?;
+            Ok(JmapAuthSecret::Bearer(token))
+        }
+    }
+}
+
+async fn fetch_jmap_session(
+    plan: &ProtocolConnectionPlan,
+    auth: &JmapAuthSecret,
+) -> Result<JmapSession> {
+    let endpoint = plan
+        .jmap_endpoint
+        .as_ref()
+        .ok_or(Error::MissingEndpoint("jmap"))?;
+    let url = jmap_session_url(endpoint);
+    let body = http_get_bytes(&url, auth).await?;
+    serde_json::from_slice(&body).map_err(|error| Error::Jmap(error.to_string()))
+}
+
+async fn jmap_method_call(url: &str, auth: &JmapAuthSecret, body: Value) -> Result<Value> {
+    let response = http_request_bytes(
+        "POST",
+        url,
+        auth,
+        Some(serde_json::to_vec(&body).map_err(|error| Error::Jmap(error.to_string()))?),
+        Some("application/json"),
+    )
+    .await?;
+    serde_json::from_slice(&response).map_err(|error| Error::Jmap(error.to_string()))
+}
+
+fn jmap_response_list<T>(response: &Value, method: &str) -> Result<Vec<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let value = jmap_method_response(response, method)?;
+    let list = value
+        .get("list")
+        .cloned()
+        .ok_or_else(|| Error::Jmap(format!("{method} response is missing list")))?;
+    serde_json::from_value(list).map_err(|error| Error::Jmap(error.to_string()))
+}
+
+fn jmap_response_ids(response: &Value, method: &str) -> Result<Vec<String>> {
+    let value = jmap_method_response(response, method)?;
+    let ids = value
+        .get("ids")
+        .cloned()
+        .ok_or_else(|| Error::Jmap(format!("{method} response is missing ids")))?;
+    serde_json::from_value(ids).map_err(|error| Error::Jmap(error.to_string()))
+}
+
+fn jmap_method_response<'a>(response: &'a Value, method: &str) -> Result<&'a Value> {
+    let responses = response
+        .get("methodResponses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Jmap("JMAP response is missing methodResponses".to_string()))?;
+
+    for item in responses {
+        let Some(tuple) = item.as_array() else {
+            continue;
+        };
+        if tuple.len() < 2 {
+            continue;
+        }
+        if tuple[0].as_str() == Some(method) {
+            return Ok(&tuple[1]);
+        }
+        if tuple[0].as_str() == Some("error") {
+            return Err(Error::Jmap(tuple[1].to_string()));
+        }
+    }
+
+    Err(Error::Jmap(format!("{method} response was not returned")))
+}
+
+fn jmap_using() -> Vec<&'static str> {
+    vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"]
+}
+
+fn jmap_mail_account_id(session: &JmapSession) -> Result<&str> {
+    if let Some(accounts) = &session.primary_accounts
+        && let Some(account_id) = accounts.get("urn:ietf:params:jmap:mail")
+    {
+        return Ok(account_id);
+    }
+
+    session
+        .accounts
+        .iter()
+        .find(|(_, account)| {
+            account
+                .account_capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.contains_key("urn:ietf:params:jmap:mail"))
+        })
+        .map(|(account_id, _)| account_id.as_str())
+        .or_else(|| session.accounts.keys().next().map(String::as_str))
+        .ok_or_else(|| Error::Jmap("JMAP session has no mail account".to_string()))
+}
+
+fn remote_message_from_jmap(account: &AccountConfig, email: JmapEmail) -> RemoteMessage {
+    let (body, content_type) = jmap_body(&email);
+    let snippet = email
+        .preview
+        .clone()
+        .filter(|preview| !preview.trim().is_empty())
+        .unwrap_or_else(|| snippet_from_body(&body));
+    let subject = email.subject.unwrap_or_default();
+    let from = email
+        .from
+        .as_deref()
+        .and_then(|addresses| addresses.first())
+        .map(jmap_address_label)
+        .unwrap_or_default();
+    let to = email
+        .to
+        .unwrap_or_default()
+        .iter()
+        .map(jmap_address_label)
+        .collect::<Vec<_>>();
+    let read = email
+        .keywords
+        .as_ref()
+        .is_some_and(|keywords| keywords.contains_key("$seen"));
+    let attachments = email
+        .attachments
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|attachment| remote_attachment_from_jmap(account, attachment))
+        .collect();
+    let message_id = jmap_message_id(&account.id.0, &email.id);
+
+    RemoteMessage {
+        id: message_id,
+        thread_id: ThreadId(format!(
+            "thread:jmap:{}:{}",
+            account.id.0,
+            hex_encode(email.thread_id.as_deref().unwrap_or(&email.id))
+        )),
+        subject,
+        from,
+        to,
+        snippet,
+        body,
+        content_type,
+        timestamp: unix_timestamp(),
+        read,
+        raw: None,
+        attachments,
+    }
+}
+
+fn remote_attachment_from_jmap(
+    account: &AccountConfig,
+    attachment: JmapBodyPart,
+) -> Option<RemoteAttachment> {
+    let blob_id = attachment.blob_id?;
+    Some(RemoteAttachment {
+        id: jmap_attachment_id(&account.id.0, &blob_id),
+        filename: attachment.name.unwrap_or_else(|| "attachment".to_string()),
+        mime_type: attachment
+            .mime_type
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        size: attachment.size.unwrap_or_default(),
+        content_id: attachment.cid,
+        inline: attachment
+            .disposition
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("inline")),
+    })
+}
+
+fn jmap_body(email: &JmapEmail) -> (String, String) {
+    if let Some(body) = jmap_body_value(email.html_body.as_deref(), email.body_values.as_ref()) {
+        return (body, "text/html".to_string());
+    }
+    if let Some(body) = jmap_body_value(email.text_body.as_deref(), email.body_values.as_ref()) {
+        return (body, "text/plain".to_string());
+    }
+    (String::new(), "text/plain".to_string())
+}
+
+fn jmap_body_value(
+    parts: Option<&[JmapBodyPart]>,
+    values: Option<&BTreeMap<String, JmapBodyValue>>,
+) -> Option<String> {
+    let values = values?;
+    parts?
+        .iter()
+        .filter_map(|part| part.part_id.as_ref())
+        .find_map(|part_id| values.get(part_id).and_then(|body| body.value.clone()))
+}
+
+fn jmap_address_label(address: &JmapEmailAddress) -> String {
+    match (
+        address.name.as_deref().filter(|name| !name.is_empty()),
+        address.email.as_deref().filter(|email| !email.is_empty()),
+    ) {
+        (Some(name), Some(email)) => format!("{name} <{email}>"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(email)) => email.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+fn jmap_mailbox_role(role: Option<&str>) -> MailboxRole {
+    match role.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "inbox" => MailboxRole::Inbox,
+        "sent" => MailboxRole::Sent,
+        "drafts" => MailboxRole::Drafts,
+        "trash" => MailboxRole::Trash,
+        "junk" | "spam" => MailboxRole::Spam,
+        "archive" => MailboxRole::Archive,
+        _ => MailboxRole::Custom,
+    }
+}
+
+fn jmap_session_url(endpoint: &ProviderEndpoint) -> String {
+    if endpoint.host.starts_with("http://") || endpoint.host.starts_with("https://") {
+        let base = endpoint.host.trim_end_matches('/');
+        return format!("{base}/.well-known/jmap");
+    }
+
+    let scheme = match endpoint.security {
+        TransportSecurity::Plain => "http",
+        TransportSecurity::Tls | TransportSecurity::StartTls => "https",
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let port = if endpoint.port == default_port {
+        String::new()
+    } else {
+        format!(":{}", endpoint.port)
+    };
+    format!("{scheme}://{}{port}/.well-known/jmap", endpoint.host)
+}
+
+fn jmap_download_url(
+    template: &str,
+    account_id: &str,
+    blob_id: &str,
+    name: &str,
+    mime_type: &str,
+) -> String {
+    template
+        .replace("{accountId}", &encode_path_component(account_id))
+        .replace("{blobId}", &encode_path_component(blob_id))
+        .replace("{name}", &encode_path_component(name))
+        .replace("{type}", &encode_query_component(mime_type))
+}
+
+fn jmap_message_id(account_id: &str, remote_id: &str) -> MessageId {
+    MessageId(format!("{account_id}:jmap:email:{}", hex_encode(remote_id)))
+}
+
+fn jmap_attachment_id(account_id: &str, blob_id: &str) -> AttachmentId {
+    AttachmentId(format!("{account_id}:jmap:blob:{}", hex_encode(blob_id)))
+}
+
+fn jmap_blob_id_from_attachment_id(
+    account_id: &str,
+    attachment_id: &AttachmentId,
+) -> Result<String> {
+    let prefix = format!("{account_id}:jmap:blob:");
+    let Some(encoded) = attachment_id.0.strip_prefix(&prefix) else {
+        return Err(Error::InvalidRemoteMessage(format!(
+            "attachment id has no JMAP blob id: {}",
+            attachment_id.0
+        )));
+    };
+    hex_decode(encoded).ok_or_else(|| {
+        Error::InvalidRemoteMessage(format!(
+            "attachment id has invalid JMAP blob id: {}",
+            attachment_id.0
+        ))
+    })
+}
+
+async fn http_get_bytes(url: &str, auth: &JmapAuthSecret) -> Result<Vec<u8>> {
+    http_request_bytes("GET", url, auth, None, None).await
+}
+
+async fn http_request_bytes(
+    method: &str,
+    url: &str,
+    auth: &JmapAuthSecret,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<Vec<u8>> {
+    let target = parse_http_url(url)?;
+    let request = http_request(method, &target, auth, body.as_deref(), content_type);
+
+    match target.https {
+        true => {
+            let tcp = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+                .await
+                .map_err(|error| Error::Jmap(error.to_string()))?;
+            let mut tls = async_native_tls::TlsConnector::new()
+                .connect(target.host.as_str(), tcp)
+                .await
+                .map_err(|error| Error::Jmap(error.to_string()))?;
+            http_round_trip(&mut tls, &request).await
+        }
+        false => {
+            let mut tcp = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+                .await
+                .map_err(|error| Error::Jmap(error.to_string()))?;
+            http_round_trip(&mut tcp, &request).await
+        }
+    }
+}
+
+async fn http_round_trip<S>(stream: &mut S, request: &[u8]) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(request)
+        .await
+        .map_err(|error| Error::Jmap(error.to_string()))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| Error::Jmap(error.to_string()))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|error| Error::Jmap(error.to_string()))?;
+    parse_http_response(response)
+}
+
+fn parse_http_url(url: &str) -> Result<HttpTarget> {
+    let (https, rest, default_port) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest, 443)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest, 80)
+    } else {
+        return Err(Error::Jmap(format!("unsupported URL: {url}")));
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .unwrap_or((authority, default_port));
+
+    if host.is_empty() {
+        return Err(Error::Jmap(format!("URL is missing host: {url}")));
+    }
+
+    Ok(HttpTarget {
+        https,
+        host: host.to_string(),
+        port,
+        path: format!("/{path}"),
+    })
+}
+
+fn http_request(
+    method: &str,
+    target: &HttpTarget,
+    auth: &JmapAuthSecret,
+    body: Option<&[u8]>,
+    content_type: Option<&str>,
+) -> Vec<u8> {
+    let body_len = body.map_or(0, <[u8]>::len);
+    let mut request = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json, application/octet-stream\r\nAuthorization: {}\r\nConnection: close\r\nContent-Length: {body_len}\r\n",
+        target.path,
+        target.host,
+        authorization_header(auth),
+    );
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    let mut bytes = request.into_bytes();
+    if let Some(body) = body {
+        bytes.extend_from_slice(body);
+    }
+    bytes
+}
+
+fn parse_http_response(response: Vec<u8>) -> Result<Vec<u8>> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err(Error::Jmap("HTTP response is missing headers".to_string()));
+    };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let mut lines = headers.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| Error::Jmap("HTTP response is missing status".to_string()))?;
+    let body = response[header_end + 4..].to_vec();
+    if !(200..300).contains(&status) {
+        return Err(Error::Jmap(format!(
+            "HTTP {status}: {}",
+            String::from_utf8_lossy(&body)
+        )));
+    }
+
+    if headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
+    {
+        return decode_chunked_body(&body);
+    }
+
+    Ok(body)
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    loop {
+        let Some(line_end) = body[index..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| index + offset)
+        else {
+            return Err(Error::Jmap("chunked body is truncated".to_string()));
+        };
+        let line = String::from_utf8_lossy(&body[index..line_end]);
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|error| Error::Jmap(error.to_string()))?;
+        index = line_end + 2;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        let chunk_end = index.saturating_add(size);
+        if chunk_end > body.len() {
+            return Err(Error::Jmap("chunked body chunk is truncated".to_string()));
+        }
+        decoded.extend_from_slice(&body[index..chunk_end]);
+        index = chunk_end.saturating_add(2);
+    }
+}
+
+fn authorization_header(auth: &JmapAuthSecret) -> String {
+    match auth {
+        JmapAuthSecret::Basic { username, password } => {
+            format!(
+                "Basic {}",
+                base64_encode(format!("{username}:{password}").as_bytes())
+            )
+        }
+        JmapAuthSecret::Bearer(token) => format!("Bearer {token}"),
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn encode_path_component(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut encoded, byte| {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+        encoded
+    })
+}
+
+fn encode_query_component(value: &str) -> String {
+    encode_path_component(value).replace("%20", "+")
+}
+
 impl MailRemote for ImapSmtpRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send {
         let account = self.account.clone();
@@ -1604,7 +2388,10 @@ impl MailRemote for OutlookRemote {
 
 impl MailRemote for JmapRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send {
-        async { Err(Error::NotImplemented("jmap list_mailboxes")) }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { list_jmap_mailboxes(account, plan, secret_resolver).await }
     }
 
     fn fetch_delta(
@@ -1612,10 +2399,10 @@ impl MailRemote for JmapRemote {
         mailbox: MailboxId,
         cursor: SyncCursor,
     ) -> impl Future<Output = Result<RemoteDelta>> + Send {
-        async move {
-            let _ = (mailbox, cursor);
-            Err(Error::NotImplemented("jmap fetch_delta"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_jmap_delta(account, plan, secret_resolver, mailbox, cursor).await }
     }
 
     fn apply_ops(&self, ops: Vec<RemoteOp>) -> impl Future<Output = Result<()>> + Send {
@@ -1639,10 +2426,10 @@ impl MailRemote for JmapRemote {
         &self,
         request: AttachmentFetchRequest,
     ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
-        async move {
-            let _ = request;
-            Err(Error::NotImplemented("jmap fetch_attachment"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_jmap_attachment(account, plan, secret_resolver, request).await }
     }
 }
 

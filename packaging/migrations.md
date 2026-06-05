@@ -29,7 +29,7 @@ The SQLite database file is `courier.db`.
 ## Release Smoke
 
 CI now runs `packaging/verify-release-smoke.ps1` before staging release metadata.
-The automated smoke verifies that release metadata exists, the release manifest and app config schema values match workspace metadata, installer metadata is present, release artifacts no longer use pending installer placeholders, uninstall policy preserves `.courier`, and these notes still name the executable migration runner plus the shipped SQL migrations.
+The automated smoke verifies that release metadata exists, the release manifest and app config schema values match workspace metadata, installer metadata is present, `packaging/build-installers.ps1` is staged as the installer builder entrypoint, `packaging/generate-icons.ps1` is staged as the raster icon generation entrypoint, release artifacts no longer use pending installer placeholders, uninstall policy preserves `.courier`, and these notes still name the executable migration runner plus the shipped SQL migrations.
 
 Manual runtime smoke is still required for installer candidates:
 
@@ -37,3 +37,15 @@ Manual runtime smoke is still required for installer candidates:
 2. Confirm startup logs include the `storage migration runner completed` entry.
 3. Confirm the migration report lists `001_init.sql`, `002_search.sql`, and any compatibility columns added for that database.
 4. Open a message with attachments and verify existing attachment rows still load even when `content_id` and `inline` were added by compatibility gates.
+
+## Installer Builder Entry Point
+
+`packaging/generate-icons.ps1` converts `packaging/icons/courier.svg` into the raster assets declared in `packaging/courier.app.toml`: `courier.png`, `courier.ico`, and, on macOS, `courier.icns`. It uses ImageMagick or `rsvg-convert` for PNG rendering, ImageMagick for ICO assembly, and macOS `iconutil` for ICNS assembly.
+
+`packaging/build-installers.ps1` is the platform-specific builder entry point for release candidates. It consumes `packaging/release-manifest.json`, `packaging/installers/courier.installers.toml`, the release binary under `target/release`, and the icon assets declared in `packaging/courier.app.toml`.
+
+- Windows builds call WiX (`wix build`) to produce the MSI named by the release manifest.
+- macOS builds stage `Courier.app` and call `hdiutil create` to produce the DMG.
+- Linux builds stage an AppDir and call `appimagetool`, `dpkg-deb --build`, and `rpmbuild -bb` when those tools are available.
+
+The builder intentionally fails when a required platform tool or icon asset is missing, so release CI can distinguish incomplete packaging prerequisites from successful installer production.

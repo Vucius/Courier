@@ -776,6 +776,45 @@ impl Storage {
         self.update_message_blob_state(message_id, Some(&raw_path), !parsed.attachments.is_empty())
     }
 
+    pub fn persist_attachment_metadata(
+        &self,
+        message_id: &MessageId,
+        attachments: &[AttachmentSummary],
+    ) -> Result<()> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.connection()?;
+        for attachment in attachments {
+            connection.execute(
+                r#"
+                INSERT INTO attachments (
+                    id, message_id, filename, mime_type, size, blob_path, content_id, inline
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+                ON CONFLICT(id) DO UPDATE SET
+                    filename = excluded.filename,
+                    mime_type = excluded.mime_type,
+                    size = excluded.size,
+                    content_id = excluded.content_id,
+                    inline = excluded.inline
+                "#,
+                params![
+                    attachment.id.0,
+                    message_id.0,
+                    attachment.filename,
+                    attachment.mime_type,
+                    u64_to_i64(attachment.size),
+                    attachment.content_id,
+                    if attachment.inline { 1 } else { 0 },
+                ],
+            )?;
+        }
+
+        self.update_message_blob_state(message_id, None, true)
+    }
+
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
         self.list_threads_for_mailbox(None)
     }

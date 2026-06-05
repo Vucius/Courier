@@ -58,6 +58,8 @@ jobs:
           cp packaging/release-manifest.json target/release/package/
           cp packaging/migrations.md target/release/package/
           cp packaging/verify-release-smoke.ps1 target/release/package/
+          cp packaging/build-installers.ps1 target/release/package/
+          cp packaging/generate-icons.ps1 target/release/package/
           mkdir -p target/release/package/installers
           cp packaging/installers/courier.installers.toml target/release/package/installers/
           mkdir -p target/release/package/icons

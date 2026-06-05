@@ -1,11 +1,12 @@
 #![allow(clippy::manual_async_fn)]
 
 use courier_adapter::{
-    MailRemote, NoopRemote, OutgoingMessage, RemoteDelta, RemoteMailbox, RemoteMessage, RemoteOp,
+    MailRemote, NoopRemote, OutgoingMessage, RemoteAttachment, RemoteDelta, RemoteMailbox,
+    RemoteMessage, RemoteOp,
 };
 use courier_proto::{
-    AccountId, DraftId, DraftMessage, MailboxId, MailboxSummary, MessageBody, MessageId, TaskId,
-    ThreadSummary,
+    AccountId, AttachmentSummary, DraftId, DraftMessage, MailboxId, MailboxSummary, MessageBody,
+    MessageId, TaskId, ThreadSummary,
 };
 use courier_storage::{QueuedOp, Storage};
 use serde::Deserialize;
@@ -380,6 +381,8 @@ where
             return Ok(false);
         }
 
+        let message_id = message.id.clone();
+        let attachments = remote_attachment_summaries(message.attachments);
         let thread = ThreadSummary {
             id: message.thread_id.clone(),
             account_id: account_id.clone(),
@@ -406,6 +409,8 @@ where
             self.storage
                 .persist_raw_message_for_existing(&body.id, raw)?;
         }
+        self.storage
+            .persist_attachment_metadata(&message_id, &attachments)?;
 
         Ok(true)
     }
@@ -434,6 +439,21 @@ impl DeltaPersistReport {
             || self.uidvalidity_reset
             || self.conflicts > 0
     }
+}
+
+fn remote_attachment_summaries(attachments: Vec<RemoteAttachment>) -> Vec<AttachmentSummary> {
+    attachments
+        .into_iter()
+        .map(|attachment| AttachmentSummary {
+            id: attachment.id,
+            filename: attachment.filename,
+            mime_type: attachment.mime_type,
+            size: attachment.size,
+            blob_path: None,
+            content_id: attachment.content_id,
+            inline: attachment.inline,
+        })
+        .collect()
 }
 
 fn remote_mailbox_summary(account_id: &AccountId, mailbox: &RemoteMailbox) -> MailboxSummary {
@@ -680,6 +700,7 @@ mod tests {
                 timestamp: 1234,
                 read: false,
                 raw: None,
+                attachments: Vec::new(),
             }],
             deleted_messages: Vec::new(),
             moved_messages: Vec::new(),
@@ -789,6 +810,7 @@ mod tests {
                     timestamp: 9,
                     read: false,
                     raw: None,
+                    attachments: Vec::new(),
                 },
             )
             .expect("persist remote message");
@@ -875,6 +897,7 @@ mod tests {
                 timestamp: 9,
                 read: false,
                 raw: None,
+                attachments: Vec::new(),
             }],
             deleted_messages: Vec::new(),
             moved_messages: Vec::new(),

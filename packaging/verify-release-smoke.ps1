@@ -12,6 +12,8 @@ $requiredFiles = @(
     "packaging/release-manifest.json",
     "packaging/migrations.md",
     "packaging/installers/courier.installers.toml",
+    "packaging/build-installers.ps1",
+    "packaging/generate-icons.ps1",
     "packaging/icons/courier.svg",
     "migrations/001_init.sql",
     "migrations/002_search.sql"
@@ -60,6 +62,12 @@ if ($appConfigSchema -ne $cargoConfigSchema) {
 if ($manifest.installer_metadata -ne "packaging/installers/courier.installers.toml") {
     throw "release-manifest installer_metadata does not point at the installer metadata file"
 }
+if ($manifest.installer_builder -ne "packaging/build-installers.ps1") {
+    throw "release-manifest installer_builder does not point at the installer build script"
+}
+if ($manifest.icon_generator -ne "packaging/generate-icons.ps1") {
+    throw "release-manifest icon_generator does not point at the icon generation script"
+}
 if (-not $manifest.data_preservation.preserve_on_uninstall) {
     throw "release-manifest must preserve user data on uninstall"
 }
@@ -71,11 +79,18 @@ if ($manifestText.Contains("pending-")) {
 
 foreach ($needle in @(
     "preserve_user_data_on_uninstall = true",
+    'builder_script = "packaging/build-installers.ps1"',
+    'icon_generator = "packaging/generate-icons.ps1"',
     'format = "msi"',
+    'builder = "wix build"',
     'format = "dmg"',
+    'builder = "hdiutil create"',
     "linux.appimage",
+    'builder = "appimagetool"',
     "linux.deb",
-    "linux.rpm"
+    'builder = "dpkg-deb --build"',
+    "linux.rpm",
+    'builder = "rpmbuild -bb"'
 )) {
     if (-not $installerToml.Contains($needle)) {
         throw "packaging/installers/courier.installers.toml is missing $needle"
@@ -92,6 +107,8 @@ $artifactFiles = @(
     "courier.app.toml",
     "release-manifest.json",
     "migrations.md",
+    "build-installers.ps1",
+    "generate-icons.ps1",
     "installers/courier.installers.toml",
     "icons/courier.svg"
 )

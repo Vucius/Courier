@@ -23,6 +23,8 @@
     }
   },
   "installer_metadata": "packaging/installers/courier.installers.toml",
+  "installer_builder": "packaging/build-installers.ps1",
+  "icon_generator": "packaging/generate-icons.ps1",
   "data_preservation": {
     "user_data_dir": ".courier",
     "preserve_on_uninstall": true
