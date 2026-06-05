@@ -5,8 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-imap.workspace = true
+async-native-tls.workspace = true
 courier-domain.workspace = true
+courier-mime.workspace = true
 courier-provider.workspace = true
 courier-proto.workspace = true
+futures-util.workspace = true
 lettre.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -590,7 +590,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SetNotificationsQuietFor(seconds) => {
             let engine = app.engine.clone();
             app.notification_policy.quiet = true;
-            app.status = "Quiet notifications enabled for 1 hour".to_string();
+            app.status = format!(
+                "Quiet notifications enabled for {}",
+                quiet_duration_label(seconds)
+            );
             Task::perform(
                 async move {
                     let _ = engine
@@ -963,18 +966,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         crate::components::surface::divider(),
         crate::components::list::section_label("CONTROLS"),
         crate::components::action_bar::button_toolbar("Account", Message::AddAccount),
-        crate::components::action_bar::button_toolbar(
-            if app.notification_policy.quiet {
-                "Notify"
-            } else {
-                "Quiet 1h"
-            },
-            if app.notification_policy.quiet {
-                Message::SetNotificationsQuiet(false)
-            } else {
-                Message::SetNotificationsQuietFor(60 * 60)
-            },
-        ),
+        notification_sidebar_controls(app),
         row![
             crate::components::action_bar::button_toolbar("Sync", Message::SyncNow),
             crate::components::action_bar::button_toolbar(
@@ -1082,17 +1074,13 @@ fn sidebar_summary(app: &App) -> Element<'_, Message> {
                     .size(crate::theme::FONT_CAPTION)
                     .color(crate::theme::TEXT),
                 iced::widget::horizontal_space(),
-                text(if app.notification_policy.quiet {
-                    "Quiet"
-                } else {
-                    "Notify"
-                })
-                .size(crate::theme::FONT_CAPTION)
-                .color(if app.notification_policy.quiet {
-                    crate::theme::WARNING
-                } else {
-                    crate::theme::SUCCESS
-                }),
+                text(notification_policy_label(&app.notification_policy))
+                    .size(crate::theme::FONT_CAPTION)
+                    .color(if app.notification_policy.quiet {
+                        crate::theme::WARNING
+                    } else {
+                        crate::theme::SUCCESS
+                    }),
             ]
             .align_y(iced::Alignment::Center),
             text("J/K move · R reply · M actions · D trash")
@@ -1281,6 +1269,83 @@ fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> 
         .into()
 }
 
+fn notification_sidebar_controls(app: &App) -> Element<'_, Message> {
+    if app.notification_policy.quiet {
+        return crate::components::action_bar::button_toolbar(
+            "Notify",
+            Message::SetNotificationsQuiet(false),
+        );
+    }
+
+    row![
+        crate::components::action_bar::button_toolbar(
+            "15m",
+            Message::SetNotificationsQuietFor(900)
+        ),
+        crate::components::action_bar::button_toolbar(
+            "1h",
+            Message::SetNotificationsQuietFor(60 * 60)
+        ),
+        crate::components::action_bar::button_toolbar(
+            "4h",
+            Message::SetNotificationsQuietFor(4 * 60 * 60)
+        ),
+    ]
+    .spacing(crate::theme::SPACE_XS)
+    .into()
+}
+
+fn notification_policy_label(policy: &NotificationPolicyState) -> String {
+    if policy.quiet {
+        if let Some(until) = policy.quiet_until {
+            return format!("Quiet {}", relative_minutes_label(until));
+        }
+
+        return "Quiet".to_string();
+    }
+
+    "Notify".to_string()
+}
+
+fn relative_minutes_label(unix_until: i64) -> String {
+    let remaining = unix_until
+        .saturating_sub(unix_timestamp())
+        .div_euclid(60)
+        .max(1);
+    if remaining < 60 {
+        format!("{remaining}m")
+    } else {
+        let hours = (remaining + 59) / 60;
+        format!("{hours}h")
+    }
+}
+
+fn quiet_duration_label(seconds: i64) -> String {
+    let minutes = (seconds.max(60) + 59) / 60;
+    if minutes < 60 {
+        if minutes == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{minutes} minutes")
+        }
+    } else {
+        let hours = (minutes + 59) / 60;
+        if hours == 1 {
+            "1 hour".to_string()
+        } else {
+            format!("{hours} hours")
+        }
+    }
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .min(i64::MAX as u64) as i64
+}
+
 fn notifications_view<'a>(
     notifications: &'a [DesktopNotification],
     unread: u32,
@@ -1296,8 +1361,16 @@ fn notifications_view<'a>(
                 Message::SetNotificationsQuiet(!policy.quiet),
             ),
             crate::components::action_bar::button_text(
-                "Quiet 1h",
-                Message::SetNotificationsQuietFor(60 * 60),
+                "15m",
+                Message::SetNotificationsQuietFor(900)
+            ),
+            crate::components::action_bar::button_text(
+                "1h",
+                Message::SetNotificationsQuietFor(60 * 60)
+            ),
+            crate::components::action_bar::button_text(
+                "4h",
+                Message::SetNotificationsQuietFor(4 * 60 * 60)
             ),
             crate::components::action_bar::button_text("Clear", Message::ClearNotifications),
         ]

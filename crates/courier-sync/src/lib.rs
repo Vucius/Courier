@@ -1,10 +1,11 @@
 #![allow(clippy::manual_async_fn)]
 
 use courier_adapter::{
-    MailRemote, NoopRemote, OutgoingMessage, RemoteDelta, RemoteMessage, RemoteOp,
+    MailRemote, NoopRemote, OutgoingMessage, RemoteDelta, RemoteMailbox, RemoteMessage, RemoteOp,
 };
 use courier_proto::{
-    AccountId, DraftId, DraftMessage, MailboxId, MessageBody, MessageId, TaskId, ThreadSummary,
+    AccountId, DraftId, DraftMessage, MailboxId, MailboxSummary, MessageBody, MessageId, TaskId,
+    ThreadSummary,
 };
 use courier_storage::{QueuedOp, Storage};
 use serde::Deserialize;
@@ -251,13 +252,34 @@ where
         &self,
         account_id: &AccountId,
     ) -> Result<Vec<MailboxSyncReport>> {
-        let mailboxes = self.storage.list_mailboxes()?;
+        let remote_mailboxes = self.remote.list_mailboxes().await?;
+        let remote_summaries = remote_mailboxes
+            .iter()
+            .map(|mailbox| remote_mailbox_summary(account_id, mailbox))
+            .collect::<Vec<_>>();
+        let reconciled = self
+            .storage
+            .reconcile_remote_mailboxes(account_id, &remote_summaries)?;
+        if reconciled > 0 {
+            tracing::info!(
+                account_id = %account_id.0,
+                mailboxes = reconciled,
+                "remote mailbox discovery reconciled into local storage"
+            );
+        }
+
+        let mailboxes = if remote_summaries.is_empty() {
+            self.storage
+                .list_mailboxes()?
+                .into_iter()
+                .filter(|mailbox| mailbox.account_id == *account_id)
+                .collect::<Vec<_>>()
+        } else {
+            remote_summaries
+        };
         let mut mailbox_updates = Vec::new();
 
-        for mailbox in mailboxes
-            .into_iter()
-            .filter(|mailbox| mailbox.account_id == *account_id)
-        {
+        for mailbox in mailboxes {
             let cursor = self.storage.mailbox_sync_cursor(&mailbox.id)?;
             let delta = self
                 .remote
@@ -380,6 +402,10 @@ where
 
         self.storage.upsert_thread(&thread)?;
         self.storage.upsert_message(mailbox_id, &thread, &body)?;
+        if let Some(raw) = message.raw.as_deref() {
+            self.storage
+                .persist_raw_message_for_existing(&body.id, raw)?;
+        }
 
         Ok(true)
     }
@@ -407,6 +433,16 @@ impl DeltaPersistReport {
             || self.moved_messages > 0
             || self.uidvalidity_reset
             || self.conflicts > 0
+    }
+}
+
+fn remote_mailbox_summary(account_id: &AccountId, mailbox: &RemoteMailbox) -> MailboxSummary {
+    MailboxSummary {
+        id: mailbox.id.clone(),
+        account_id: account_id.clone(),
+        name: mailbox.name.clone(),
+        role: mailbox.role.clone(),
+        unread_count: 0,
     }
 }
 
@@ -643,6 +679,7 @@ mod tests {
                 content_type: "text/plain".to_string(),
                 timestamp: 1234,
                 read: false,
+                raw: None,
             }],
             deleted_messages: Vec::new(),
             moved_messages: Vec::new(),
@@ -751,6 +788,7 @@ mod tests {
                     content_type: "text/plain".to_string(),
                     timestamp: 9,
                     read: false,
+                    raw: None,
                 },
             )
             .expect("persist remote message");
@@ -836,6 +874,7 @@ mod tests {
                 content_type: "text/plain".to_string(),
                 timestamp: 9,
                 read: false,
+                raw: None,
             }],
             deleted_messages: Vec::new(),
             moved_messages: Vec::new(),

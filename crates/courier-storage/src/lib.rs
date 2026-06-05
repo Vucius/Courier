@@ -392,6 +392,79 @@ impl Storage {
         Ok(())
     }
 
+    pub fn reconcile_remote_mailboxes(
+        &self,
+        account_id: &AccountId,
+        mailboxes: &[MailboxSummary],
+    ) -> Result<usize> {
+        if mailboxes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let discovered_ids = mailboxes
+            .iter()
+            .map(|mailbox| mailbox.id.0.clone())
+            .collect::<HashSet<_>>();
+        let discovered_roles = mailboxes
+            .iter()
+            .filter(|mailbox| !matches!(mailbox.role, MailboxRole::Custom))
+            .map(|mailbox| mailbox_role_to_str(&mailbox.role).to_string())
+            .collect::<HashSet<_>>();
+
+        for mailbox in mailboxes {
+            transaction.execute(
+                r#"
+                INSERT INTO mailboxes (
+                    id, account_id, name, role, unread_count, total_count
+                )
+                VALUES (?1, ?2, ?3, ?4, 0, 0)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    role = excluded.role
+                "#,
+                params![
+                    mailbox.id.0,
+                    &account_id.0,
+                    &mailbox.name,
+                    mailbox_role_to_str(&mailbox.role),
+                ],
+            )?;
+        }
+
+        for role in discovered_roles {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT mb.id
+                FROM mailboxes mb
+                WHERE mb.account_id = ?1
+                  AND mb.role = ?2
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM message_mailboxes mm
+                      WHERE mm.mailbox_id = mb.id
+                  )
+                "#,
+            )?;
+            let alias_ids = collect_rows(
+                statement
+                    .query_map(params![&account_id.0, &role], |row| row.get::<_, String>(0))?,
+            )?;
+            drop(statement);
+
+            for alias_id in alias_ids {
+                if !discovered_ids.contains(&alias_id) {
+                    transaction
+                        .execute("DELETE FROM mailboxes WHERE id = ?1", params![alias_id])?;
+                }
+            }
+        }
+
+        transaction.commit()?;
+        Ok(mailboxes.len())
+    }
+
     pub fn list_mailboxes(&self) -> Result<Vec<MailboxSummary>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -692,6 +765,17 @@ impl Storage {
         Ok(message_id)
     }
 
+    pub fn persist_raw_message_for_existing(
+        &self,
+        message_id: &MessageId,
+        raw: &[u8],
+    ) -> Result<()> {
+        let parsed = parse_rfc822(raw)?;
+        let raw_path = self.persist_raw_message_blob(message_id, raw)?;
+        self.persist_message_attachments(message_id, &parsed.attachments)?;
+        self.update_message_blob_state(message_id, Some(&raw_path), !parsed.attachments.is_empty())
+    }
+
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
         self.list_threads_for_mailbox(None)
     }
@@ -990,6 +1074,52 @@ impl Storage {
             )
             .optional()
             .map_err(Error::from)
+    }
+
+    pub fn attachment_message_id(&self, attachment_id: &AttachmentId) -> Result<Option<MessageId>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT message_id FROM attachments WHERE id = ?1",
+                params![attachment_id.0],
+                |row| Ok(MessageId(row.get(0)?)),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    pub fn store_attachment_blob(
+        &self,
+        attachment_id: &AttachmentId,
+        bytes: &[u8],
+    ) -> Result<Option<StoredAttachment>> {
+        let Some(message_id) = self.attachment_message_id(attachment_id)? else {
+            return Ok(None);
+        };
+        let relative = PathBuf::from("attachments")
+            .join(safe_path_segment(&message_id.0))
+            .join(safe_path_segment(&attachment_id.0));
+        let absolute = self.data_dir.join(&relative);
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&absolute, bytes)?;
+
+        let connection = self.connection()?;
+        connection.execute(
+            r#"
+            UPDATE attachments
+            SET blob_path = ?2, size = ?3
+            WHERE id = ?1
+            "#,
+            params![
+                attachment_id.0,
+                relative.to_string_lossy(),
+                u64_to_i64(bytes.len() as u64),
+            ],
+        )?;
+
+        self.attachment_by_id(attachment_id)
     }
 
     pub fn attachment_transfer(
@@ -1618,9 +1748,10 @@ impl Storage {
         let connection = self.connection()?;
 
         for attachment in attachments {
+            let stored_id = stored_attachment_id(message_id, &attachment.id);
             let relative = PathBuf::from("attachments")
                 .join(safe_path_segment(&message_id.0))
-                .join(safe_path_segment(&attachment.id.0));
+                .join(safe_path_segment(&stored_id.0));
             let absolute = self.data_dir.join(&relative);
             if let Some(parent) = absolute.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1642,7 +1773,7 @@ impl Storage {
                     inline = excluded.inline
                 "#,
                 params![
-                    attachment.id.0,
+                    stored_id.0,
                     message_id.0,
                     attachment.filename,
                     attachment.mime_type,
@@ -1951,6 +2082,14 @@ fn safe_identifier(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn stored_attachment_id(message_id: &MessageId, attachment_id: &AttachmentId) -> AttachmentId {
+    if attachment_id.0.starts_with(&format!("{}:", message_id.0)) {
+        return attachment_id.clone();
+    }
+
+    AttachmentId(format!("{}:{}", message_id.0, attachment_id.0))
 }
 
 fn safe_path_segment(value: &str) -> String {

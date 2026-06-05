@@ -197,8 +197,8 @@ impl NotificationPolicy {
                 if self.suppressed_count == 0 {
                     match self.quiet_until.filter(|until| *until > now) {
                         Some(until) => format!(
-                            "Quiet notifications enabled for {} more minute(s)",
-                            ((until - now) / 60).max(1)
+                            "Quiet notifications enabled for {}",
+                            quiet_remaining_label(until, now)
                         ),
                         None => "Quiet notifications enabled".to_string(),
                     }
@@ -941,7 +941,23 @@ impl EngineRuntime {
             }
         };
 
+        let message_id = match storage.attachment_message_id(&transfer.attachment.id) {
+            Ok(Some(message_id)) => message_id,
+            Ok(None) => {
+                publish_attachment_missing(&self.event_tx, attachment_id);
+                return;
+            }
+            Err(error) => {
+                let mut failed = transfer;
+                failed.status = AttachmentTransferStatus::Failed;
+                failed.progress = 0.0;
+                failed.message = error.to_string();
+                self.upsert_attachment_transfer(failed);
+                return;
+            }
+        };
         let request = AttachmentFetchRequest {
+            message_id,
             attachment_id: transfer.attachment.id.clone(),
             filename: transfer.attachment.filename.clone(),
             expected_size: transfer.attachment.size,
@@ -960,7 +976,23 @@ impl EngineRuntime {
 
         match remote.fetch_attachment(request).await {
             Ok(result) => {
-                let mut completed = transfer;
+                let mut completed =
+                    match storage.store_attachment_blob(&result.attachment_id, &result.bytes) {
+                        Ok(Some(_)) => storage
+                            .attachment_transfer(&result.attachment_id)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(transfer),
+                        Ok(None) => transfer,
+                        Err(error) => {
+                            let mut failed = transfer;
+                            failed.status = AttachmentTransferStatus::Failed;
+                            failed.progress = 0.0;
+                            failed.message = error.to_string();
+                            self.upsert_attachment_transfer(failed);
+                            return;
+                        }
+                    };
                 completed.status = AttachmentTransferStatus::Ready;
                 completed.progress = 1.0;
                 completed.message = format!(
@@ -1744,6 +1776,24 @@ fn unix_timestamp() -> i64 {
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
         .min(i64::MAX as u64) as i64
+}
+
+fn quiet_remaining_label(until: i64, now: i64) -> String {
+    let minutes = until.saturating_sub(now).div_euclid(60).max(1);
+    if minutes < 60 {
+        if minutes == 1 {
+            "1 more minute".to_string()
+        } else {
+            format!("{minutes} more minutes")
+        }
+    } else {
+        let hours = (minutes + 59) / 60;
+        if hours == 1 {
+            "1 more hour".to_string()
+        } else {
+            format!("{hours} more hours")
+        }
+    }
 }
 
 fn notification_key(notification: &DesktopNotification) -> String {

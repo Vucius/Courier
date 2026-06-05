@@ -5,14 +5,17 @@ use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use async_imap::types::NameAttribute;
 use courier_domain::SyncCursor;
+use courier_mime::{BodyKind, parse_rfc822};
 use courier_proto::{
-    AccountConfig, AttachmentId, AuthType, CredentialKind, CredentialRef, MailboxId, MessageId,
-    ProviderKind, ThreadId,
+    AccountConfig, AttachmentId, AuthType, CredentialKind, CredentialRef, MailboxId, MailboxRole,
+    MessageId, ProviderKind, ThreadId,
 };
 use courier_provider::{
     AuthMechanism, ProviderCapabilities, ProviderEndpoint, TransportSecurity, capabilities_for,
 };
+use futures_util::TryStreamExt;
 use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
@@ -33,14 +36,19 @@ pub enum Error {
     Credential(String),
     #[error("smtp transport error: {0}")]
     Smtp(String),
+    #[error("imap transport error: {0}")]
+    Imap(String),
     #[error("message envelope is invalid: {0}")]
     InvalidEnvelope(String),
+    #[error("remote message is invalid: {0}")]
+    InvalidRemoteMessage(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RemoteMailbox {
     pub id: MailboxId,
     pub name: String,
+    pub role: MailboxRole,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +94,7 @@ pub struct RemoteMessage {
     pub content_type: String,
     pub timestamp: i64,
     pub read: bool,
+    pub raw: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +132,7 @@ pub struct SendResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentFetchRequest {
+    pub message_id: MessageId,
     pub attachment_id: AttachmentId,
     pub filename: String,
     pub expected_size: u64,
@@ -795,6 +805,12 @@ fn parse_smtp_address(value: &str) -> Result<Address> {
         .map_err(|error| Error::InvalidEnvelope(format!("{address}: {error}")))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImapMessageRef {
+    uid_validity: u32,
+    uid: u32,
+}
+
 fn unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -803,9 +819,654 @@ fn unix_timestamp() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImapAuthSecret {
+    Password(String),
+    OAuthAccessToken(String),
+}
+
+struct Xoauth2Authenticator {
+    user: String,
+    access_token: String,
+}
+
+impl async_imap::Authenticator for &Xoauth2Authenticator {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        format!(
+            "user={}\x01auth=Bearer {}\x01\x01",
+            self.user, self.access_token
+        )
+    }
+}
+
+type TlsImapSession = async_imap::Session<async_native_tls::TlsStream<tokio::net::TcpStream>>;
+
+async fn open_tls_imap_session(
+    account: &AccountConfig,
+    plan: &ProtocolConnectionPlan,
+    secret_resolver: Option<&CredentialSecretResolver>,
+) -> Result<TlsImapSession> {
+    let endpoint = plan
+        .imap_endpoint
+        .as_ref()
+        .ok_or(Error::MissingEndpoint("imap"))?;
+    let auth_secret = resolve_imap_auth_secret(account, plan, secret_resolver)?;
+
+    let client = match endpoint.security {
+        TransportSecurity::Tls => {
+            let tcp = tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?;
+            let tls = async_native_tls::TlsConnector::new()
+                .connect(endpoint.host.as_str(), tcp)
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?;
+            let mut client = async_imap::Client::new(tls);
+            client
+                .read_response()
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?
+                .ok_or_else(|| Error::Imap("imap server closed before greeting".to_string()))?;
+            client
+        }
+        TransportSecurity::StartTls => {
+            let tcp = tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?;
+            let mut plain_client = async_imap::Client::new(tcp);
+            plain_client
+                .read_response()
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?
+                .ok_or_else(|| Error::Imap("imap server closed before greeting".to_string()))?;
+            plain_client
+                .run_command_and_check_ok("STARTTLS", None)
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?;
+            let tcp = plain_client.into_inner();
+            let tls = async_native_tls::TlsConnector::new()
+                .connect(endpoint.host.as_str(), tcp)
+                .await
+                .map_err(|error| Error::Imap(error.to_string()))?;
+            async_imap::Client::new(tls)
+        }
+        TransportSecurity::Plain => {
+            return Err(Error::NotImplemented(
+                "imap plain transport without STARTTLS",
+            ));
+        }
+    };
+
+    match auth_secret {
+        ImapAuthSecret::Password(password) => client
+            .login(&account.email, password)
+            .await
+            .map_err(|(error, _)| Error::Imap(error.to_string())),
+        ImapAuthSecret::OAuthAccessToken(access_token) => {
+            let auth = Xoauth2Authenticator {
+                user: account.email.clone(),
+                access_token,
+            };
+            client
+                .authenticate("XOAUTH2", &auth)
+                .await
+                .map_err(|(error, _)| Error::Imap(error.to_string()))
+        }
+    }
+}
+
+fn resolve_imap_auth_secret(
+    account: &AccountConfig,
+    plan: &ProtocolConnectionPlan,
+    secret_resolver: Option<&CredentialSecretResolver>,
+) -> Result<ImapAuthSecret> {
+    let Some(secret_resolver) = secret_resolver else {
+        return Err(Error::MissingCredential("credential resolver"));
+    };
+
+    match &account.auth_type {
+        AuthType::Password => {
+            let reference = plan
+                .credential_refs
+                .iter()
+                .find(|reference| matches!(reference.kind, CredentialKind::Password))
+                .ok_or(Error::MissingCredential("password reference"))?;
+            let secret = secret_resolver
+                .get_secret(reference)?
+                .ok_or(Error::MissingCredential("password"))?;
+            Ok(ImapAuthSecret::Password(secret))
+        }
+        AuthType::OAuth2 => {
+            let reference = plan
+                .credential_refs
+                .iter()
+                .find(|reference| matches!(reference.kind, CredentialKind::OAuthAccessToken))
+                .ok_or(Error::MissingCredential("oauth access token reference"))?;
+            let secret = secret_resolver
+                .get_secret(reference)?
+                .ok_or(Error::MissingCredential("oauth access token"))?;
+            Ok(ImapAuthSecret::OAuthAccessToken(secret))
+        }
+    }
+}
+
+async fn list_imap_mailboxes(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+) -> Result<Vec<RemoteMailbox>> {
+    let mut session = open_tls_imap_session(&account, &plan, secret_resolver.as_ref()).await?;
+    let names = session
+        .list(None, Some("*"))
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?;
+    let _ = session.logout().await;
+
+    Ok(names
+        .into_iter()
+        .filter(|name| {
+            !name
+                .attributes()
+                .iter()
+                .any(|attribute| matches!(attribute, NameAttribute::NoSelect))
+        })
+        .map(|name| {
+            let remote_name = name.name().to_string();
+            let role = remote_mailbox_role(&remote_name, name.attributes());
+            RemoteMailbox {
+                id: remote_mailbox_id(&account.id.0, &remote_name),
+                name: remote_name,
+                role,
+            }
+        })
+        .collect())
+}
+
+async fn fetch_imap_delta(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+    mailbox: MailboxId,
+    cursor: SyncCursor,
+) -> Result<RemoteDelta> {
+    let mut session = open_tls_imap_session(&account, &plan, secret_resolver.as_ref()).await?;
+    let remote_mailbox = remote_mailbox_name(&account.id.0, &mailbox.0);
+    let selected = session
+        .select(&remote_mailbox)
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?;
+    let uid_validity = selected.uid_validity.unwrap_or_default();
+    let uid_next = selected
+        .uid_next
+        .unwrap_or(cursor.last_uid.saturating_add(1));
+    let max_uid = uid_next.saturating_sub(1);
+    let start_uid = if cursor.uid_validity == uid_validity {
+        cursor.last_uid.saturating_add(1)
+    } else {
+        1
+    };
+
+    if start_uid == 0 || start_uid > max_uid {
+        let _ = session.logout().await;
+        return Ok(RemoteDelta::empty(SyncCursor {
+            uid_validity,
+            last_uid: max_uid.max(cursor.last_uid),
+            highest_modseq: selected.highest_modseq.or(cursor.highest_modseq),
+        }));
+    }
+
+    let uid_set = format!("{start_uid}:{max_uid}");
+    let fetches = session
+        .uid_fetch(uid_set, "(UID FLAGS INTERNALDATE RFC822)")
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?;
+    let _ = session.logout().await;
+
+    let mut messages = Vec::new();
+    let mut last_uid = cursor.last_uid;
+    let mut highest_modseq = selected.highest_modseq.or(cursor.highest_modseq);
+
+    for fetch in fetches {
+        let uid = fetch
+            .uid
+            .ok_or_else(|| Error::InvalidRemoteMessage("fetch result missing UID".to_string()))?;
+        last_uid = last_uid.max(uid);
+        highest_modseq = match (highest_modseq, fetch.modseq) {
+            (Some(current), Some(next)) => Some(current.max(next)),
+            (None, Some(next)) => Some(next),
+            (current, None) => current,
+        };
+
+        let raw = fetch.body().ok_or_else(|| {
+            Error::InvalidRemoteMessage("fetch result missing RFC822".to_string())
+        })?;
+        let raw_message = raw.to_vec();
+        let parsed =
+            parse_rfc822(raw).map_err(|error| Error::InvalidRemoteMessage(error.to_string()))?;
+        let message_id = MessageId(format!("imap:{}:{}:{}", account.id.0, uid_validity, uid));
+        let thread_id = ThreadId(format!(
+            "thread:imap:{}:{}",
+            account.id.0,
+            sanitize_remote_id(
+                parsed
+                    .headers
+                    .message_id
+                    .as_deref()
+                    .unwrap_or(message_id.0.as_str())
+            )
+        ));
+        let body = parsed.body.content;
+        let snippet = snippet_from_body(&body);
+        let content_type = match parsed.body.kind {
+            BodyKind::Html => "text/html",
+            BodyKind::PlainText => "text/plain",
+        }
+        .to_string();
+        let read = fetch
+            .flags()
+            .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
+
+        messages.push(RemoteMessage {
+            id: message_id,
+            thread_id,
+            subject: parsed.headers.subject,
+            from: parsed.headers.from,
+            to: parsed.headers.to,
+            snippet,
+            body,
+            content_type,
+            timestamp: unix_timestamp(),
+            read,
+            raw: Some(raw_message),
+        });
+    }
+
+    Ok(RemoteDelta {
+        cursor: SyncCursor {
+            uid_validity,
+            last_uid: last_uid.max(max_uid),
+            highest_modseq,
+        },
+        messages,
+        deleted_messages: Vec::new(),
+        moved_messages: Vec::new(),
+    })
+}
+
+async fn apply_imap_ops(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+    ops: Vec<RemoteOp>,
+) -> Result<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+
+    let mut session = open_tls_imap_session(&account, &plan, secret_resolver.as_ref()).await?;
+    session
+        .select("INBOX")
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?;
+
+    for op in ops {
+        match op {
+            RemoteOp::MarkRead { message_id, read } => {
+                let uid = imap_uid_from_message_id(&message_id)?;
+                let query = if read {
+                    "+FLAGS.SILENT (\\Seen)"
+                } else {
+                    "-FLAGS.SILENT (\\Seen)"
+                };
+                session
+                    .uid_store(uid.to_string(), query)
+                    .await
+                    .map_err(|error| Error::Imap(error.to_string()))?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(|error| Error::Imap(error.to_string()))?;
+            }
+            RemoteOp::Move {
+                message_id,
+                mailbox_id,
+            } => {
+                let uid = imap_uid_from_message_id(&message_id)?;
+                let target = remote_mailbox_name(&account.id.0, &mailbox_id);
+                if let Err(error) = session.uid_mv(uid.to_string(), &target).await {
+                    tracing::warn!(
+                        uid,
+                        target = %target,
+                        error = %error,
+                        "imap UID MOVE failed; falling back to UID COPY plus delete"
+                    );
+                    session
+                        .uid_copy(uid.to_string(), &target)
+                        .await
+                        .map_err(|error| Error::Imap(error.to_string()))?;
+                    mark_imap_uid_deleted(&mut session, uid).await?;
+                }
+            }
+            RemoteOp::Delete { message_id } => {
+                let uid = imap_uid_from_message_id(&message_id)?;
+                mark_imap_uid_deleted(&mut session, uid).await?;
+            }
+        }
+    }
+
+    let _ = session.logout().await;
+    Ok(())
+}
+
+async fn fetch_imap_attachment(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+    request: AttachmentFetchRequest,
+) -> Result<AttachmentFetchResult> {
+    let message_ref = imap_message_ref_from_message_id(&request.message_id.0)?;
+    let mut session = open_tls_imap_session(&account, &plan, secret_resolver.as_ref()).await?;
+    let mailboxes = session
+        .list(None, Some("*"))
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?;
+
+    for mailbox in mailboxes {
+        let remote_name = mailbox.name().to_string();
+        let selected = match session.select(&remote_name).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::debug!(
+                    mailbox = %remote_name,
+                    error = %error,
+                    "imap attachment fetch skipped unselectable mailbox"
+                );
+                continue;
+            }
+        };
+        if selected.uid_validity.unwrap_or_default() != message_ref.uid_validity {
+            continue;
+        }
+
+        let fetches = session
+            .uid_fetch(message_ref.uid.to_string(), "(RFC822)")
+            .await
+            .map_err(|error| Error::Imap(error.to_string()))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| Error::Imap(error.to_string()))?;
+
+        for fetch in fetches {
+            let Some(raw) = fetch.body() else {
+                continue;
+            };
+            let parsed = parse_rfc822(raw)
+                .map_err(|error| Error::InvalidRemoteMessage(error.to_string()))?;
+            if let Some(attachment) = parsed.attachments.into_iter().find(|attachment| {
+                attachment_matches_request(
+                    &request.message_id,
+                    &request.attachment_id,
+                    &request.filename,
+                    request.expected_size,
+                    &attachment.id,
+                    &attachment.filename,
+                    attachment.size,
+                )
+            }) {
+                let _ = session.logout().await;
+                return Ok(AttachmentFetchResult {
+                    attachment_id: request.attachment_id,
+                    bytes: attachment.data,
+                });
+            }
+        }
+    }
+
+    let _ = session.logout().await;
+    Err(Error::InvalidRemoteMessage(format!(
+        "attachment {} was not found in remote message {}",
+        request.attachment_id.0, request.message_id.0
+    )))
+}
+
+async fn mark_imap_uid_deleted(session: &mut TlsImapSession, uid: u32) -> Result<()> {
+    session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Error::Imap(error.to_string()))?;
+
+    let uid_expunge = async {
+        session
+            .uid_expunge(uid.to_string())
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok::<(), async_imap::error::Error>(())
+    }
+    .await;
+
+    if let Err(error) = uid_expunge {
+        tracing::warn!(
+            uid,
+            error = %error,
+            "imap UID EXPUNGE failed; falling back to EXPUNGE for selected mailbox"
+        );
+        session
+            .expunge()
+            .await
+            .map_err(|error| Error::Imap(error.to_string()))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| Error::Imap(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn imap_uid_from_message_id(message_id: &str) -> Result<u32> {
+    message_id
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            Error::InvalidRemoteMessage(format!("message id has no IMAP UID: {message_id}"))
+        })
+}
+
+fn imap_message_ref_from_message_id(message_id: &str) -> Result<ImapMessageRef> {
+    let mut parts = message_id.rsplit(':');
+    let uid = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            Error::InvalidRemoteMessage(format!("message id has no IMAP UID: {message_id}"))
+        })?;
+    let uid_validity = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            Error::InvalidRemoteMessage(format!("message id has no IMAP UIDVALIDITY: {message_id}"))
+        })?;
+
+    Ok(ImapMessageRef { uid_validity, uid })
+}
+
+fn attachment_matches_request(
+    message_id: &MessageId,
+    requested_id: &AttachmentId,
+    requested_filename: &str,
+    expected_size: u64,
+    parsed_id: &AttachmentId,
+    parsed_filename: &str,
+    parsed_size: u64,
+) -> bool {
+    let namespaced_parsed_id = format!("{}:{}", message_id.0, parsed_id.0);
+    requested_id.0 == parsed_id.0
+        || requested_id.0 == namespaced_parsed_id
+        || (parsed_filename.eq_ignore_ascii_case(requested_filename)
+            && (expected_size == 0 || expected_size == parsed_size))
+}
+
+fn remote_mailbox_id(account_id: &str, remote_name: &str) -> MailboxId {
+    MailboxId(format!("{account_id}:remote:{}", hex_encode(remote_name)))
+}
+
+fn remote_mailbox_name(account_id: &str, mailbox_id: &str) -> String {
+    if let Some(remote) = mailbox_id.strip_prefix(&format!("{account_id}:remote:")) {
+        return hex_decode(remote).unwrap_or_else(|| remote.replace('-', "/"));
+    }
+
+    let role = mailbox_id
+        .rsplit(':')
+        .next()
+        .unwrap_or(mailbox_id)
+        .to_ascii_lowercase();
+    match role.as_str() {
+        "inbox" => "INBOX".to_string(),
+        "sent" => "Sent".to_string(),
+        "drafts" => "Drafts".to_string(),
+        "archive" => "Archive".to_string(),
+        "trash" => "Trash".to_string(),
+        "spam" | "junk" => "Spam".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn remote_mailbox_role(remote_name: &str, attributes: &[NameAttribute<'_>]) -> MailboxRole {
+    if attributes
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::Sent))
+    {
+        return MailboxRole::Sent;
+    }
+    if attributes
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::Drafts))
+    {
+        return MailboxRole::Drafts;
+    }
+    if attributes
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::Trash))
+    {
+        return MailboxRole::Trash;
+    }
+    if attributes
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::Junk))
+    {
+        return MailboxRole::Spam;
+    }
+    if attributes
+        .iter()
+        .any(|attribute| matches!(attribute, NameAttribute::Archive))
+    {
+        return MailboxRole::Archive;
+    }
+
+    for attribute in attributes {
+        if let NameAttribute::Extension(value) = attribute {
+            match normalized_mailbox_token(value).as_str() {
+                "sent" | "sentmail" | "sentitems" => return MailboxRole::Sent,
+                "draft" | "drafts" => return MailboxRole::Drafts,
+                "trash" | "bin" | "deleted" | "deleteditems" => return MailboxRole::Trash,
+                "junk" | "spam" => return MailboxRole::Spam,
+                "archive" | "archives" => return MailboxRole::Archive,
+                _ => {}
+            }
+        }
+    }
+
+    match normalized_mailbox_token(
+        remote_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(remote_name),
+    )
+    .as_str()
+    {
+        "inbox" => MailboxRole::Inbox,
+        "sent" | "sentmail" | "sentitems" => MailboxRole::Sent,
+        "draft" | "drafts" => MailboxRole::Drafts,
+        "trash" | "bin" | "deleted" | "deleteditems" => MailboxRole::Trash,
+        "junk" | "spam" => MailboxRole::Spam,
+        "archive" | "archives" | "allmail" => MailboxRole::Archive,
+        _ => MailboxRole::Custom,
+    }
+}
+
+fn normalized_mailbox_token(value: &str) -> String {
+    value
+        .trim_start_matches('\\')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn hex_encode(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            out.push_str(&format!("{byte:02x}"));
+            out
+        })
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+
+    String::from_utf8(bytes).ok()
+}
+
+fn snippet_from_body(body: &str) -> String {
+    body.split_whitespace()
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sanitize_remote_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 impl MailRemote for ImapSmtpRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send {
-        async { Err(Error::NotImplemented("imap/smtp list_mailboxes")) }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { list_imap_mailboxes(account, plan, secret_resolver).await }
     }
 
     fn fetch_delta(
@@ -813,17 +1474,17 @@ impl MailRemote for ImapSmtpRemote {
         mailbox: MailboxId,
         cursor: SyncCursor,
     ) -> impl Future<Output = Result<RemoteDelta>> + Send {
-        async move {
-            let _ = (mailbox, cursor);
-            Err(Error::NotImplemented("imap fetch_delta"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_imap_delta(account, plan, secret_resolver, mailbox, cursor).await }
     }
 
     fn apply_ops(&self, ops: Vec<RemoteOp>) -> impl Future<Output = Result<()>> + Send {
-        async move {
-            let _ = ops;
-            Err(Error::NotImplemented("imap/smtp apply_ops"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { apply_imap_ops(account, plan, secret_resolver, ops).await }
     }
 
     fn send_message(
@@ -840,16 +1501,19 @@ impl MailRemote for ImapSmtpRemote {
         &self,
         request: AttachmentFetchRequest,
     ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
-        async move {
-            let _ = request;
-            Err(Error::NotImplemented("imap fetch_attachment"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_imap_attachment(account, plan, secret_resolver, request).await }
     }
 }
 
 impl MailRemote for GmailRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send {
-        async { Err(Error::NotImplemented("gmail list_mailboxes")) }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { list_imap_mailboxes(account, plan, secret_resolver).await }
     }
 
     fn fetch_delta(
@@ -857,17 +1521,17 @@ impl MailRemote for GmailRemote {
         mailbox: MailboxId,
         cursor: SyncCursor,
     ) -> impl Future<Output = Result<RemoteDelta>> + Send {
-        async move {
-            let _ = (mailbox, cursor);
-            Err(Error::NotImplemented("gmail fetch_delta"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_imap_delta(account, plan, secret_resolver, mailbox, cursor).await }
     }
 
     fn apply_ops(&self, ops: Vec<RemoteOp>) -> impl Future<Output = Result<()>> + Send {
-        async move {
-            let _ = ops;
-            Err(Error::NotImplemented("gmail apply_ops"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { apply_imap_ops(account, plan, secret_resolver, ops).await }
     }
 
     fn send_message(
@@ -884,16 +1548,19 @@ impl MailRemote for GmailRemote {
         &self,
         request: AttachmentFetchRequest,
     ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
-        async move {
-            let _ = request;
-            Err(Error::NotImplemented("gmail fetch_attachment"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_imap_attachment(account, plan, secret_resolver, request).await }
     }
 }
 
 impl MailRemote for OutlookRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send {
-        async { Err(Error::NotImplemented("outlook list_mailboxes")) }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { list_imap_mailboxes(account, plan, secret_resolver).await }
     }
 
     fn fetch_delta(
@@ -901,17 +1568,17 @@ impl MailRemote for OutlookRemote {
         mailbox: MailboxId,
         cursor: SyncCursor,
     ) -> impl Future<Output = Result<RemoteDelta>> + Send {
-        async move {
-            let _ = (mailbox, cursor);
-            Err(Error::NotImplemented("outlook fetch_delta"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_imap_delta(account, plan, secret_resolver, mailbox, cursor).await }
     }
 
     fn apply_ops(&self, ops: Vec<RemoteOp>) -> impl Future<Output = Result<()>> + Send {
-        async move {
-            let _ = ops;
-            Err(Error::NotImplemented("outlook apply_ops"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { apply_imap_ops(account, plan, secret_resolver, ops).await }
     }
 
     fn send_message(
@@ -928,10 +1595,10 @@ impl MailRemote for OutlookRemote {
         &self,
         request: AttachmentFetchRequest,
     ) -> impl Future<Output = Result<AttachmentFetchResult>> + Send {
-        async move {
-            let _ = request;
-            Err(Error::NotImplemented("outlook fetch_attachment"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { fetch_imap_attachment(account, plan, secret_resolver, request).await }
     }
 }
 
