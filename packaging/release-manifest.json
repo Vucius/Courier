@@ -9,15 +9,22 @@
   "artifacts": {
     "windows": {
       "binary": "courier-ui.exe",
-      "installer": "pending-msi"
+      "installer": "Courier-Setup-${version}-x64.msi"
     },
     "linux": {
       "binary": "courier-ui",
-      "installer": "pending-appimage-or-deb"
+      "appimage": "Courier-${version}-x86_64.AppImage",
+      "deb": "courier_${version}_amd64.deb",
+      "rpm": "courier-${version}-1.x86_64.rpm"
     },
     "macos": {
-      "bundle": "pending-app",
-      "dmg": "pending-dmg"
+      "bundle": "Courier.app",
+      "dmg": "Courier-${version}-macos.dmg"
     }
+  },
+  "installer_metadata": "packaging/installers/courier.installers.toml",
+  "data_preservation": {
+    "user_data_dir": ".courier",
+    "preserve_on_uninstall": true
   }
 }

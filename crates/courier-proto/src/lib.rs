@@ -222,6 +222,7 @@ pub struct AttachmentSummary {
 pub enum AttachmentPreviewKind {
     Text,
     Image,
+    Pdf,
     Unsupported,
     MissingBlob,
     Blocked,
@@ -310,6 +311,15 @@ pub struct DesktopNotification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationPolicyState {
+    pub quiet: bool,
+    pub quiet_until: Option<i64>,
+    pub suppressed_count: u32,
+    pub last_suppressed_at: Option<i64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub online: bool,
     pub reason: String,
@@ -355,6 +365,7 @@ pub enum EngineCommand {
     RetrySend(DraftId),
     CancelSend(DraftId),
     RunDueSendQueue,
+    ProbeNetwork,
     PreviewAttachment(AttachmentId),
     OpenAttachment(AttachmentId),
     ConfirmOpenAttachment(AttachmentId),
@@ -362,6 +373,8 @@ pub enum EngineCommand {
     CancelAttachmentDownload(AttachmentId),
     RetryAttachmentDownload(AttachmentId),
     SetNetworkOnline(bool),
+    SetNotificationsQuiet(bool),
+    SetNotificationsQuietFor(i64),
     ListConflicts,
     ResolveConflict(MessageId, ConflictResolution),
     Snooze(MessageId, i64),
@@ -399,6 +412,7 @@ pub enum EngineEvent {
     NetworkStatusChanged(NetworkStatus),
     ConflictsUpdated(Vec<ConflictSummary>),
     NotificationRaised(DesktopNotification),
+    NotificationPolicyChanged(NotificationPolicyState),
     SendResult {
         task_id: TaskId,
         result: Result<(), String>,

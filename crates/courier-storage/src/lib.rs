@@ -1057,6 +1057,21 @@ impl Storage {
             }));
         }
 
+        if mime_type == "application/pdf"
+            || attachment.filename.to_ascii_lowercase().ends_with(".pdf")
+        {
+            return Ok(Some(AttachmentPreview {
+                attachment: summary,
+                kind: AttachmentPreviewKind::Pdf,
+                content: None,
+                path,
+                message: format!(
+                    "PDF preview ready: {}. Open with the system viewer for full reading.",
+                    file_size_label(attachment.size)
+                ),
+            }));
+        }
+
         Ok(Some(AttachmentPreview {
             attachment: summary,
             kind: AttachmentPreviewKind::Unsupported,
@@ -1949,6 +1964,18 @@ fn safe_path_segment(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn file_size_label(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{size} B")
+    }
 }
 
 fn unix_timestamp() -> i64 {

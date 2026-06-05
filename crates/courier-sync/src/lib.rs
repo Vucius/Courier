@@ -185,7 +185,14 @@ where
             .ok_or_else(|| Error::DraftNotFound(draft_id.0.clone()))?;
 
         self.storage.mark_draft_sending(&draft_id)?;
-        let outgoing = outgoing_message_from_draft(&draft);
+        let sender = self
+            .storage
+            .list_accounts()?
+            .into_iter()
+            .find(|account| account.id == draft.account_id)
+            .map(|account| account.email)
+            .ok_or_else(|| Error::WorkerNotRunning(draft.account_id.0.clone()))?;
+        let outgoing = outgoing_message_from_draft(&draft, sender);
 
         match self.remote.send_message(outgoing).await {
             Ok(result) => {
@@ -443,8 +450,9 @@ fn unix_timestamp() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
-fn outgoing_message_from_draft(draft: &DraftMessage) -> OutgoingMessage {
+fn outgoing_message_from_draft(draft: &DraftMessage, from: String) -> OutgoingMessage {
     let mut headers = vec![
+        format!("From: {}", sanitize_header(&from)),
         format!("To: {}", sanitize_header_list(&draft.to)),
         format!("Subject: {}", sanitize_header(&draft.subject)),
         "MIME-Version: 1.0".to_string(),
@@ -452,14 +460,23 @@ fn outgoing_message_from_draft(draft: &DraftMessage) -> OutgoingMessage {
     ];
 
     if !draft.cc.is_empty() {
-        headers.insert(1, format!("Cc: {}", sanitize_header_list(&draft.cc)));
-    }
-    if !draft.bcc.is_empty() {
-        headers.insert(2, format!("Bcc: {}", sanitize_header_list(&draft.bcc)));
+        headers.insert(2, format!("Cc: {}", sanitize_header_list(&draft.cc)));
     }
 
+    let recipients = draft
+        .to
+        .iter()
+        .chain(draft.cc.iter())
+        .chain(draft.bcc.iter())
+        .map(|recipient| sanitize_header(recipient))
+        .filter(|recipient| !recipient.is_empty())
+        .collect();
     let rfc822 = format!("{}\r\n\r\n{}", headers.join("\r\n"), draft.body).into_bytes();
-    OutgoingMessage { rfc822 }
+    OutgoingMessage {
+        rfc822,
+        from,
+        recipients,
+    }
 }
 
 fn sanitize_header(value: &str) -> String {

@@ -10,25 +10,31 @@ use iced::{Background, Border, Element, Font, Length};
 
 use crate::app::Message;
 
-pub fn view<'a>(
-    body: Option<&'a MessageBody>,
-    render_tree: Option<&'a RenderTree>,
-    attachment_preview: Option<&'a AttachmentPreview>,
-    attachment_open: Option<&'a AttachmentOpenRequest>,
-    attachment_transfers: &'a [AttachmentTransfer],
-) -> Element<'a, Message> {
-    match body {
+pub struct ReaderViewState<'a> {
+    pub body: Option<&'a MessageBody>,
+    pub render_tree: Option<&'a RenderTree>,
+    pub attachment_preview: Option<&'a AttachmentPreview>,
+    pub attachment_open: Option<&'a AttachmentOpenRequest>,
+    pub attachment_transfers: &'a [AttachmentTransfer],
+    pub inline_reply_open: bool,
+    pub draft_to: &'a str,
+    pub draft_subject: &'a str,
+    pub draft_body: &'a str,
+}
+
+pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
+    match state.body {
         Some(body) => {
             let recipients = if body.to.is_empty() {
                 "No recipients".to_string()
             } else {
                 body.to.join(", ")
             };
-            let rendered_body = render_tree_view(render_tree, &body.body, &body.attachments);
+            let rendered_body = render_tree_view(state.render_tree, &body.body, &body.attachments);
             let mut content = column![
                 crate::components::surface::header(
                     &body.subject,
-                    crate::components::action_bar::button_text("Reply", Message::Compose),
+                    crate::components::action_bar::button_text("Reply", Message::ReplyInline),
                 ),
                 crate::components::surface::divider(),
                 row![
@@ -46,21 +52,69 @@ pub fn view<'a>(
             if !body.attachments.is_empty() {
                 content = content.push(attachments_view(
                     &body.attachments,
-                    attachment_preview,
-                    attachment_open,
-                    attachment_transfers,
+                    state.attachment_preview,
+                    state.attachment_open,
+                    state.attachment_transfers,
                 ));
             }
 
             content = content.push(rendered_body);
 
+            if state.inline_reply_open {
+                content = content.push(inline_reply_view(
+                    state.draft_to,
+                    state.draft_subject,
+                    state.draft_body,
+                ));
+            }
+
             container(content).height(Length::FillPortion(3)).into()
         }
         None => crate::components::empty_state::view(
             "Select a message",
-            "The message body and reply actions will appear here.",
+            "Choose a thread to read its message and reply.",
         ),
     }
+}
+
+fn inline_reply_view<'a>(to: &'a str, subject: &'a str, body: &'a str) -> Element<'a, Message> {
+    container(
+        column![
+            row![
+                crate::components::list::section_label("Reply"),
+                iced::widget::horizontal_space(),
+                crate::components::action_bar::button_text("Close", Message::CloseInlineReply),
+                crate::components::action_bar::button_primary("Send", Message::SendDraft),
+            ]
+            .align_y(iced::Alignment::Center),
+            crate::components::form::labeled_input(
+                "To",
+                "name@example.com",
+                to,
+                Message::DraftToChanged,
+            ),
+            crate::components::form::labeled_input(
+                "Subject",
+                "Subject",
+                subject,
+                Message::DraftSubjectChanged,
+            ),
+            crate::components::form::body_input("Write a reply", body, Message::DraftBodyChanged),
+        ]
+        .spacing(crate::theme::SPACE_SM),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(Background::Color(crate::theme::SURFACE_ALT)),
+        border: Border {
+            width: 1.0,
+            radius: crate::theme::RADIUS_LG.into(),
+            color: crate::theme::BORDER,
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn attachments_view<'a>(
@@ -227,6 +281,34 @@ fn attachment_preview_view<'a>(preview: &'a AttachmentPreview) -> Element<'a, Me
             content = content.push(crate::components::attachment::image_placeholder(
                 preview.path.as_deref().unwrap_or("Image attachment"),
             ));
+        }
+        AttachmentPreviewKind::Pdf => {
+            content = content.push(
+                container(
+                    column![
+                        text("PDF document").size(14).color(crate::theme::TEXT),
+                        text(preview.path.as_deref().unwrap_or("Local PDF attachment"))
+                            .size(12)
+                            .color(crate::theme::TEXT_MUTED),
+                        crate::components::action_bar::button_text(
+                            "Open PDF",
+                            Message::OpenAttachment(preview.attachment.id.clone()),
+                        ),
+                    ]
+                    .spacing(6),
+                )
+                .padding(8)
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(crate::theme::SURFACE)),
+                    border: Border {
+                        width: 1.0,
+                        radius: 4.0.into(),
+                        color: crate::theme::BORDER,
+                    },
+                    ..container::Style::default()
+                }),
+            );
         }
         AttachmentPreviewKind::Unsupported
         | AttachmentPreviewKind::MissingBlob

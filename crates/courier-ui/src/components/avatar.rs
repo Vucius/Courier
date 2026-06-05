@@ -7,13 +7,9 @@ pub fn view(name: &str, selected: bool) -> Element<'_, Message> {
     let color = if selected {
         crate::theme::ACCENT
     } else {
-        crate::theme::AVATAR
+        avatar_color(name)
     };
-    let text_color = if selected {
-        crate::theme::SURFACE
-    } else {
-        crate::theme::TEXT
-    };
+    let text_color = crate::theme::SURFACE;
 
     container(text(initials(name)).size(12).color(text_color))
         .width(Length::Fixed(32.0))
@@ -30,6 +26,21 @@ pub fn view(name: &str, selected: bool) -> Element<'_, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+fn avatar_color(value: &str) -> iced::Color {
+    const PALETTE: [iced::Color; 6] = [
+        iced::Color::from_rgb(0.32, 0.52, 0.86),
+        iced::Color::from_rgb(0.12, 0.55, 0.42),
+        iced::Color::from_rgb(0.69, 0.42, 0.18),
+        iced::Color::from_rgb(0.53, 0.38, 0.73),
+        iced::Color::from_rgb(0.72, 0.31, 0.36),
+        iced::Color::from_rgb(0.20, 0.48, 0.58),
+    ];
+    let hash = value.bytes().fold(0usize, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as usize)
+    });
+    PALETTE[hash % PALETTE.len()]
 }
 
 fn initials(value: &str) -> String {

@@ -5,7 +5,7 @@ use iced::{Alignment, Background, Border};
 use crate::app::Message;
 use crate::components::notice::NoticeKind;
 
-pub fn view(status: &str) -> Element<'_, Message> {
+pub fn view<'a>(status: &'a str, hint: &'a str) -> Element<'a, Message> {
     let kind = status_kind(status);
     let accent = match kind {
         NoticeKind::Info => crate::theme::ACCENT,
@@ -18,6 +18,8 @@ pub fn view(status: &str) -> Element<'_, Message> {
         row![
             text("Status").size(11).color(accent),
             text(status).size(12).color(crate::theme::TEXT_MUTED),
+            iced::widget::horizontal_space(),
+            text(hint).size(11).color(crate::theme::TEXT_MUTED),
         ]
         .spacing(8)
         .align_y(Alignment::Center),

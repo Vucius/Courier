@@ -126,6 +126,18 @@ fn node_to_nodes(node: NodeRef<'_, Node>, quote_depth: u8) -> Vec<RenderNode> {
 
 fn element_to_nodes(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode> {
     let name = element.value().name();
+    if is_hidden_element(element) {
+        return Vec::new();
+    }
+
+    if is_quote_container(element) {
+        let depth = quote_depth.saturating_add(1);
+        return vec![RenderNode::BlockQuote {
+            depth,
+            collapsed: depth >= 2,
+            children: block_children(element, depth),
+        }];
+    }
 
     match name {
         "html" | "body" | "main" | "article" | "section" | "div" | "center" => {
@@ -176,6 +188,46 @@ fn element_to_nodes(element: ElementRef<'_>, quote_depth: u8) -> Vec<RenderNode>
         "span" | "small" | "label" | "font" => inline_children(element, quote_depth),
         _ => block_children(element, quote_depth),
     }
+}
+
+fn is_hidden_element(element: ElementRef<'_>) -> bool {
+    if element.value().attr("hidden").is_some() {
+        return true;
+    }
+    if element
+        .value()
+        .attr("aria-hidden")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    let class = element.value().attr("class").unwrap_or_default();
+    class
+        .split_whitespace()
+        .any(|name| matches!(name, "hidden" | "sr-only" | "visually-hidden" | "MsoHidden"))
+}
+
+fn is_quote_container(element: ElementRef<'_>) -> bool {
+    let name = element.value().name();
+    if !matches!(name, "div" | "section" | "blockquote") {
+        return false;
+    }
+
+    let class = element.value().attr("class").unwrap_or_default();
+    let id = element.value().attr("id").unwrap_or_default();
+    let marker = format!("{class} {id}").to_ascii_lowercase();
+    [
+        "gmail_quote",
+        "gmail_attr",
+        "yahoo_quoted",
+        "moz-cite-prefix",
+        "protonmail_quote",
+        "outlookmessageheader",
+        "ms-outlook-mobile-signature",
+        "x_gmail_quote",
+    ]
+    .iter()
+    .any(|needle| marker.contains(needle))
 }
 
 fn preformatted_node(element: ElementRef<'_>) -> Option<RenderNode> {

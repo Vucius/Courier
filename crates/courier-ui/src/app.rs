@@ -6,12 +6,15 @@ use courier_proto::{
     AttachmentTransfer, AuthType, ConflictResolution, ConflictSummary, CredentialKind,
     CredentialRef, CredentialSecret, DesktopNotification, DraftId, DraftMessage, EngineCommand,
     EngineEvent, IdentityConfig, IdentityId, IdentitySummary, MailboxId, MailboxSummary,
-    MessageBody, MessageId, NotificationKind, ProviderKind, SendQueueItem, ThreadId, ThreadSummary,
+    MessageBody, MessageId, NotificationKind, NotificationPolicyState, ProviderKind, SendQueueItem,
+    ThreadId, ThreadSummary,
 };
 use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
-use iced::widget::{column, container, row, text};
+use iced::keyboard::{Key, Modifiers, key};
+use iced::widget::{column, container, progress_bar, row, text};
 use iced::{Element, Length, Subscription, Task, Theme};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -21,6 +24,10 @@ pub enum Message {
     MailboxSelected(Option<MailboxId>, String),
     AddAccount,
     Compose,
+    CloseCompose,
+    ReplyInline,
+    CloseInlineReply,
+    CancelActivePanel,
     ArchiveSelected,
     MarkReadSelected,
     TrashSelected,
@@ -39,6 +46,9 @@ pub enum Message {
     CancelAttachmentDownload(AttachmentId),
     RetryAttachmentDownload(AttachmentId),
     SetNetworkOnline(bool),
+    ProbeNetwork,
+    SetNotificationsQuiet(bool),
+    SetNotificationsQuietFor(i64),
     DismissAttachmentNotice,
     ClearNotifications,
     ResolveConflict(MessageId, ConflictResolution),
@@ -58,6 +68,18 @@ pub enum Message {
     IdentityEmailChanged(String),
     SaveIdentity,
     DeleteIdentity(IdentityId),
+    SelectNextThread,
+    SelectPreviousThread,
+    OpenThreadContext(ThreadId),
+    OpenSelectedThreadContext,
+    CloseThreadContext,
+    UiTick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Reader,
+    Compose,
 }
 
 pub struct App {
@@ -78,11 +100,17 @@ pub struct App {
     conflicts: Vec<ConflictSummary>,
     notifications: Vec<DesktopNotification>,
     unread_notifications: u32,
+    notification_policy: NotificationPolicyState,
     network_online: bool,
     search_query: String,
     draft_to: String,
     draft_subject: String,
     draft_body: String,
+    view_mode: ViewMode,
+    inline_reply_open: bool,
+    context_thread: Option<ThreadId>,
+    transition_label: String,
+    transition_ticks_remaining: u8,
     account_setup_visible: bool,
     editing_account_id: Option<AccountId>,
     account_email: String,
@@ -119,11 +147,23 @@ pub fn init() -> (App, Task<Message>) {
         conflicts: Vec::new(),
         notifications: Vec::new(),
         unread_notifications: 0,
+        notification_policy: NotificationPolicyState {
+            quiet: false,
+            quiet_until: None,
+            suppressed_count: 0,
+            last_suppressed_at: None,
+            reason: "Notifications enabled".to_string(),
+        },
         network_online: true,
         search_query: String::new(),
         draft_to: String::new(),
         draft_subject: String::new(),
         draft_body: String::new(),
+        view_mode: ViewMode::Reader,
+        inline_reply_open: false,
+        context_thread: None,
+        transition_label: String::new(),
+        transition_ticks_remaining: 0,
         account_setup_visible: false,
         editing_account_id: None,
         account_email: String::new(),
@@ -145,12 +185,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::SyncNow => {
             let engine = app.engine.clone();
+            let account_ids = enabled_account_ids(app);
             app.status = "Sync queued".to_string();
             Task::perform(
                 async move {
-                    let _ = engine
-                        .send(EngineCommand::SyncNow(AccountId("local-demo".to_string())))
-                        .await;
+                    for account_id in account_ids {
+                        let _ = engine.send(EngineCommand::SyncNow(account_id)).await;
+                    }
                 },
                 |_| Message::SyncQueued,
             )
@@ -169,6 +210,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.attachment_preview = None;
             app.attachment_open = None;
             app.selected_thread = None;
+            app.view_mode = ViewMode::Reader;
+            app.inline_reply_open = false;
+            app.context_thread = None;
+            start_view_transition(app, "Mailbox view");
             app.status = format!("{name} selected");
 
             let engine = app.engine.clone();
@@ -191,69 +236,142 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.attachment_preview = None;
             app.attachment_open = None;
             app.selected_thread = None;
+            app.view_mode = ViewMode::Reader;
+            app.inline_reply_open = false;
+            app.context_thread = None;
+            start_view_transition(app, "Account setup");
             app.status = "Account setup ready".to_string();
             Task::none()
         }
         Message::Compose => {
             app.account_setup_visible = false;
+            app.view_mode = ViewMode::Compose;
+            app.inline_reply_open = false;
+            app.context_thread = None;
+            start_view_transition(app, "Compose");
             app.status = "Draft ready".to_string();
             Task::none()
         }
-        Message::ArchiveSelected => {
+        Message::CloseCompose => {
+            app.view_mode = ViewMode::Reader;
+            start_view_transition(app, "Reader");
+            app.status = "Reading view ready".to_string();
+            Task::none()
+        }
+        Message::ReplyInline => {
             if let Some(body) = app.selected_body.as_ref() {
-                let engine = app.engine.clone();
-                let message_id = body.id.clone();
-                app.selected_body = None;
-                app.selected_render = None;
-                app.attachment_preview = None;
-                app.attachment_open = None;
-                app.selected_thread = None;
-                app.status = "Archive queued".to_string();
-                Task::perform(
-                    async move {
-                        let _ = engine.send(EngineCommand::ArchiveMessage(message_id)).await;
-                    },
-                    |_| Message::SyncQueued,
-                )
+                let reply_to = body.from.clone();
+                let subject = reply_subject(&body.subject);
+                app.account_setup_visible = false;
+                app.view_mode = ViewMode::Reader;
+                app.inline_reply_open = true;
+                app.context_thread = None;
+                start_view_transition(app, "Inline reply");
+                app.draft_to = reply_to;
+                app.draft_subject = subject;
+                app.status = "Reply ready".to_string();
             } else {
-                app.status = selected_action_status(app, "Archive");
+                app.status = "Select a message to reply".to_string();
+            }
+            Task::none()
+        }
+        Message::CloseInlineReply => {
+            app.inline_reply_open = false;
+            start_view_transition(app, "Reader");
+            app.status = "Reply closed".to_string();
+            Task::none()
+        }
+        Message::CancelActivePanel => {
+            if app.account_setup_visible {
+                app.account_setup_visible = false;
+                start_view_transition(app, "Reader");
+                app.status = "Account panel closed".to_string();
+            } else if app.context_thread.is_some() {
+                app.context_thread = None;
+                start_view_transition(app, "Thread list");
+                app.status = "Thread actions closed".to_string();
+            } else if app.inline_reply_open {
+                app.inline_reply_open = false;
+                start_view_transition(app, "Reader");
+                app.status = "Reply closed".to_string();
+            } else if app.view_mode == ViewMode::Compose {
+                app.view_mode = ViewMode::Reader;
+                start_view_transition(app, "Reader");
+                app.status = "Reading view ready".to_string();
+            }
+            Task::none()
+        }
+        Message::ArchiveSelected => {
+            if app.view_mode == ViewMode::Reader && !app.account_setup_visible {
+                if let Some(body) = app.selected_body.as_ref() {
+                    let engine = app.engine.clone();
+                    let message_id = body.id.clone();
+                    app.selected_body = None;
+                    app.selected_render = None;
+                    app.attachment_preview = None;
+                    app.attachment_open = None;
+                    app.selected_thread = None;
+                    app.inline_reply_open = false;
+                    app.context_thread = None;
+                    app.status = "Archive queued".to_string();
+                    Task::perform(
+                        async move {
+                            let _ = engine.send(EngineCommand::ArchiveMessage(message_id)).await;
+                        },
+                        |_| Message::SyncQueued,
+                    )
+                } else {
+                    app.status = selected_action_status(app, "Archive");
+                    Task::none()
+                }
+            } else {
                 Task::none()
             }
         }
         Message::MarkReadSelected => {
-            if let Some(body) = app.selected_body.as_ref() {
-                let engine = app.engine.clone();
-                let message_id = body.id.clone();
-                app.status = "Mark read queued".to_string();
-                Task::perform(
-                    async move {
-                        let _ = engine.send(EngineCommand::MarkRead(message_id, true)).await;
-                    },
-                    |_| Message::SyncQueued,
-                )
+            if app.view_mode == ViewMode::Reader && !app.account_setup_visible {
+                if let Some(body) = app.selected_body.as_ref() {
+                    let engine = app.engine.clone();
+                    let message_id = body.id.clone();
+                    app.status = "Mark read queued".to_string();
+                    Task::perform(
+                        async move {
+                            let _ = engine.send(EngineCommand::MarkRead(message_id, true)).await;
+                        },
+                        |_| Message::SyncQueued,
+                    )
+                } else {
+                    app.status = selected_action_status(app, "Mark read");
+                    Task::none()
+                }
             } else {
-                app.status = selected_action_status(app, "Mark read");
                 Task::none()
             }
         }
         Message::TrashSelected => {
-            if let Some(body) = app.selected_body.as_ref() {
-                let engine = app.engine.clone();
-                let message_id = body.id.clone();
-                app.selected_body = None;
-                app.selected_render = None;
-                app.attachment_preview = None;
-                app.attachment_open = None;
-                app.selected_thread = None;
-                app.status = "Move to trash queued".to_string();
-                Task::perform(
-                    async move {
-                        let _ = engine.send(EngineCommand::MoveToTrash(message_id)).await;
-                    },
-                    |_| Message::SyncQueued,
-                )
+            if app.view_mode == ViewMode::Reader && !app.account_setup_visible {
+                if let Some(body) = app.selected_body.as_ref() {
+                    let engine = app.engine.clone();
+                    let message_id = body.id.clone();
+                    app.selected_body = None;
+                    app.selected_render = None;
+                    app.attachment_preview = None;
+                    app.attachment_open = None;
+                    app.selected_thread = None;
+                    app.inline_reply_open = false;
+                    app.context_thread = None;
+                    app.status = "Move to trash queued".to_string();
+                    Task::perform(
+                        async move {
+                            let _ = engine.send(EngineCommand::MoveToTrash(message_id)).await;
+                        },
+                        |_| Message::SyncQueued,
+                    )
+                } else {
+                    app.status = selected_action_status(app, "Move to trash");
+                    Task::none()
+                }
             } else {
-                app.status = selected_action_status(app, "Move to trash");
                 Task::none()
             }
         }
@@ -273,6 +391,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SelectThread(thread_id) => {
             app.account_setup_visible = false;
             app.selected_thread = Some(thread_id.clone());
+            app.view_mode = ViewMode::Reader;
+            app.inline_reply_open = false;
+            app.context_thread = None;
+            start_view_transition(app, "Reader");
             app.attachment_preview = None;
             app.attachment_open = None;
             app.status = "Loading message".to_string();
@@ -418,6 +540,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SetNetworkOnline(online) => {
             let engine = app.engine.clone();
+            let account_ids = enabled_account_ids(app);
             app.network_online = online;
             app.status = if online {
                 "Network sends and sync enabled".to_string()
@@ -427,6 +550,52 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::perform(
                 async move {
                     let _ = engine.send(EngineCommand::SetNetworkOnline(online)).await;
+                    if online {
+                        let _ = engine.send(EngineCommand::RunDueSendQueue).await;
+                        for account_id in account_ids {
+                            let _ = engine.send(EngineCommand::SyncNow(account_id)).await;
+                        }
+                    }
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::ProbeNetwork => {
+            let engine = app.engine.clone();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::ProbeNetwork).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::SetNotificationsQuiet(quiet) => {
+            let engine = app.engine.clone();
+            app.notification_policy.quiet = quiet;
+            app.notification_policy.quiet_until = None;
+            app.status = if quiet {
+                "Quiet notifications enabled".to_string()
+            } else {
+                "Notifications enabled".to_string()
+            };
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::SetNotificationsQuiet(quiet))
+                        .await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::SetNotificationsQuietFor(seconds) => {
+            let engine = app.engine.clone();
+            app.notification_policy.quiet = true;
+            app.status = "Quiet notifications enabled for 1 hour".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine
+                        .send(EngineCommand::SetNotificationsQuietFor(seconds))
+                        .await;
                 },
                 |_| Message::SyncQueued,
             )
@@ -628,13 +797,53 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 |_| Message::SyncQueued,
             )
         }
+        Message::SelectNextThread => select_relative_thread(app, 1),
+        Message::SelectPreviousThread => select_relative_thread(app, -1),
+        Message::OpenSelectedThreadContext => {
+            if let Some(thread_id) = app.selected_thread.clone() {
+                app.context_thread = Some(thread_id);
+                start_view_transition(app, "Quick actions");
+                app.status = "Thread actions ready".to_string();
+            } else {
+                app.status = "Select a thread for actions".to_string();
+            }
+            Task::none()
+        }
+        Message::OpenThreadContext(thread_id) => {
+            app.context_thread = Some(thread_id.clone());
+            app.account_setup_visible = false;
+            app.view_mode = ViewMode::Reader;
+            app.inline_reply_open = false;
+            app.selected_thread = Some(thread_id.clone());
+            app.attachment_preview = None;
+            app.attachment_open = None;
+            start_view_transition(app, "Quick actions");
+            app.status = "Thread actions ready".to_string();
+            let engine = app.engine.clone();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::LoadThread(thread_id)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::CloseThreadContext => {
+            app.context_thread = None;
+            start_view_transition(app, "Thread list");
+            app.status = "Thread actions closed".to_string();
+            Task::none()
+        }
+        Message::UiTick => {
+            app.transition_ticks_remaining = app.transition_ticks_remaining.saturating_sub(1);
+            Task::none()
+        }
     }
 }
 
 pub fn subscription(app: &App) -> Subscription<Message> {
     let mut receiver = app.engine.subscribe();
 
-    Subscription::run_with_id(
+    let engine_events = Subscription::run_with_id(
         "courier-engine-events",
         iced::stream::channel(100, move |mut output| async move {
             loop {
@@ -647,7 +856,18 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 }
             }
         }),
-    )
+    );
+
+    let mut subscriptions = vec![
+        engine_events,
+        iced::keyboard::on_key_press(keyboard_shortcut),
+        iced::time::every(Duration::from_secs(60)).map(|_| Message::ProbeNetwork),
+    ];
+    if app.transition_ticks_remaining > 0 {
+        subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::UiTick));
+    }
+
+    Subscription::batch(subscriptions)
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -659,7 +879,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         app.selected_thread.as_ref(),
         &app.selected_mailbox_name,
     );
-    let reader = if app.account_setup_visible {
+    let mut reader = if app.account_setup_visible {
         column![crate::views::account_setup::view(
             crate::views::account_setup::AccountSetupViewState {
                 accounts: &app.accounts,
@@ -678,8 +898,19 @@ pub fn view(app: &App) -> Element<'_, Message> {
         )]
         .height(Length::Fill)
         .spacing(10)
+    } else if app.view_mode == ViewMode::Compose {
+        column![crate::views::composer::view(
+            &app.draft_to,
+            &app.draft_subject,
+            &app.draft_body,
+            &app.send_queue,
+        )]
+        .height(Length::Fill)
+        .spacing(0)
     } else {
-        let mut reader_stack = column![].height(Length::Fill).spacing(10);
+        let mut reader_stack = column![reader_action_bar(app)]
+            .height(Length::Fill)
+            .spacing(10);
         if !app.conflicts.is_empty() {
             reader_stack = reader_stack.push(conflicts_view(&app.conflicts));
         }
@@ -687,78 +918,299 @@ pub fn view(app: &App) -> Element<'_, Message> {
             reader_stack = reader_stack.push(notifications_view(
                 &app.notifications,
                 app.unread_notifications,
+                &app.notification_policy,
             ));
         }
         reader_stack = reader_stack.push(crate::views::reader::view(
-            app.selected_body.as_ref(),
-            app.selected_render.as_ref(),
-            app.attachment_preview.as_ref(),
-            app.attachment_open.as_ref(),
-            &app.attachment_transfers,
-        ));
-        reader_stack = reader_stack.push(crate::views::composer::view(
-            &app.draft_to,
-            &app.draft_subject,
-            &app.draft_body,
-            &app.send_queue,
+            crate::views::reader::ReaderViewState {
+                body: app.selected_body.as_ref(),
+                render_tree: app.selected_render.as_ref(),
+                attachment_preview: app.attachment_preview.as_ref(),
+                attachment_open: app.attachment_open.as_ref(),
+                attachment_transfers: &app.attachment_transfers,
+                inline_reply_open: app.inline_reply_open,
+                draft_to: &app.draft_to,
+                draft_subject: &app.draft_subject,
+                draft_body: &app.draft_body,
+            },
         ));
         reader_stack
     };
+    if app.transition_ticks_remaining > 0 {
+        reader = column![transition_strip(app), reader]
+            .height(Length::Fill)
+            .spacing(crate::theme::SPACE_SM);
+    }
 
-    let left_actions = row![
-        crate::components::action_bar::button_primary("Compose", Message::Compose),
-        crate::components::action_bar::button_toolbar("Account", Message::AddAccount),
-        crate::components::action_bar::button_toolbar("Sync", Message::SyncNow),
-        crate::components::action_bar::button_toolbar(
-            if app.network_online {
-                "Go offline"
+    let sidebar = column![
+        crate::components::surface::header(
+            "Courier",
+            text(if app.network_online {
+                "Online"
             } else {
-                "Go online"
-            },
-            Message::SetNetworkOnline(!app.network_online),
+                "Offline"
+            })
+            .size(12)
+            .color(crate::theme::TEXT_MUTED),
         ),
+        sidebar_summary(app),
+        crate::components::list::section_label("PRIMARY"),
+        crate::components::action_bar::button_primary("Compose", Message::Compose),
+        crate::components::action_bar::button_toolbar(add_account_label(), Message::AddAccount),
+        crate::components::surface::divider(),
+        mailboxes,
+        iced::widget::vertical_space(),
+        crate::components::surface::divider(),
+        crate::components::list::section_label("CONTROLS"),
+        crate::components::action_bar::button_toolbar("Account", Message::AddAccount),
+        crate::components::action_bar::button_toolbar(
+            if app.notification_policy.quiet {
+                "Notify"
+            } else {
+                "Quiet 1h"
+            },
+            if app.notification_policy.quiet {
+                Message::SetNotificationsQuiet(false)
+            } else {
+                Message::SetNotificationsQuietFor(60 * 60)
+            },
+        ),
+        row![
+            crate::components::action_bar::button_toolbar("Sync", Message::SyncNow),
+            crate::components::action_bar::button_toolbar(
+                if app.network_online {
+                    "Offline"
+                } else {
+                    "Online"
+                },
+                Message::SetNetworkOnline(!app.network_online),
+            ),
+        ]
+        .spacing(crate::theme::SPACE_SM),
     ]
-    .spacing(8);
+    .spacing(crate::theme::SPACE_SM)
+    .padding(crate::theme::SPACE_SM);
 
-    let right_actions = row![
-        crate::components::action_bar::button_text("Archive", Message::ArchiveSelected),
-        crate::components::action_bar::button_text("Mark read", Message::MarkReadSelected),
-        crate::components::action_bar::button_text("Trash", Message::TrashSelected),
-        crate::components::badge::count(app.unread_notifications),
-        crate::components::action_bar::button_text("Clear", Message::ClearNotifications),
-        crate::components::status_bar::view(&app.status),
-    ]
-    .spacing(4)
-    .align_y(iced::Alignment::Center);
-
-    let toolbar = crate::components::surface::toolbar_surface(
-        crate::components::action_bar::toolbar(left_actions, right_actions),
-    );
-
-    let thread_column = column![crate::components::search::view(&app.search_query), threads,]
-        .spacing(8)
-        .padding(8);
+    let mut thread_column = column![crate::components::search::view(&app.search_query)]
+        .spacing(crate::theme::SPACE_SM)
+        .padding(crate::theme::SPACE_SM);
+    if let Some(context_thread) = app.context_thread.as_ref() {
+        thread_column = thread_column.push(thread_context_menu(app, context_thread));
+    }
+    thread_column = thread_column.push(threads);
 
     let content = row![
-        crate::components::surface::pane(mailboxes)
-            .width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+        crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
         crate::components::surface::pane(thread_column)
             .width(Length::Fixed(crate::theme::THREAD_LIST_WIDTH)),
         crate::components::surface::pane(reader).width(Length::Fill),
     ]
     .height(Length::Fill)
-    .spacing(0);
+    .spacing(crate::theme::SPACE_SM);
 
     crate::components::surface::app_background(
-        column![toolbar, content]
-            .spacing(0)
-            .padding(crate::theme::APP_PADDING),
+        column![
+            content,
+            crate::components::status_bar::view(&app.status, shortcut_hint(app))
+        ]
+        .spacing(crate::theme::SPACE_SM)
+        .padding(crate::theme::APP_PADDING),
     )
     .into()
 }
 
 pub fn theme(_app: &App) -> Theme {
     Theme::Light
+}
+
+fn add_account_label() -> &'static str {
+    "\u{6dfb}\u{52a0}\u{8d26}\u{6237}"
+}
+
+fn start_view_transition(app: &mut App, label: &str) {
+    app.transition_label = label.to_string();
+    app.transition_ticks_remaining = 6;
+}
+
+fn transition_progress(app: &App) -> f32 {
+    const TOTAL_TICKS: f32 = 6.0;
+    ((TOTAL_TICKS - app.transition_ticks_remaining as f32) / TOTAL_TICKS).clamp(0.0, 1.0)
+}
+
+fn transition_strip(app: &App) -> Element<'_, Message> {
+    let progress = transition_progress(app);
+    container(
+        column![
+            row![
+                text(&app.transition_label)
+                    .size(crate::theme::FONT_CAPTION)
+                    .color(crate::theme::ACCENT),
+                iced::widget::horizontal_space(),
+                text("view transition")
+                    .size(crate::theme::FONT_CAPTION)
+                    .color(crate::theme::TEXT_MUTED),
+            ]
+            .align_y(iced::Alignment::Center),
+            progress_bar(0.0..=1.0, progress),
+        ]
+        .spacing(crate::theme::SPACE_XS),
+    )
+    .padding([6, 10])
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+        border: iced::Border {
+            width: 1.0,
+            radius: crate::theme::RADIUS_LG.into(),
+            color: crate::theme::ACCENT_MUTED,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn sidebar_summary(app: &App) -> Element<'_, Message> {
+    let enabled_accounts = app
+        .accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .count();
+    container(
+        column![
+            row![
+                text(format!("{} account(s)", enabled_accounts))
+                    .size(crate::theme::FONT_CAPTION)
+                    .color(crate::theme::TEXT),
+                iced::widget::horizontal_space(),
+                text(if app.notification_policy.quiet {
+                    "Quiet"
+                } else {
+                    "Notify"
+                })
+                .size(crate::theme::FONT_CAPTION)
+                .color(if app.notification_policy.quiet {
+                    crate::theme::WARNING
+                } else {
+                    crate::theme::SUCCESS
+                }),
+            ]
+            .align_y(iced::Alignment::Center),
+            text("J/K move · R reply · M actions · D trash")
+                .size(crate::theme::FONT_CAPTION)
+                .color(crate::theme::TEXT_MUTED),
+        ]
+        .spacing(crate::theme::SPACE_XS),
+    )
+    .padding(crate::theme::SPACE_SM)
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+        border: iced::Border {
+            width: 1.0,
+            radius: crate::theme::RADIUS_LG.into(),
+            color: crate::theme::BORDER,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn shortcut_hint(app: &App) -> &'static str {
+    if app.account_setup_visible {
+        "Esc close panel"
+    } else if app.view_mode == ViewMode::Compose {
+        "Esc reader · Send queues after undo window"
+    } else if app.context_thread.is_some() {
+        "R reply · D trash · Esc close actions"
+    } else {
+        "J/K move · R reply · M actions · D trash · Esc close"
+    }
+}
+
+fn reader_action_bar(app: &App) -> Element<'_, Message> {
+    let mut actions = row![].spacing(crate::theme::SPACE_XS);
+    if app.selected_body.is_some() {
+        actions = actions
+            .push(crate::components::action_bar::button_text(
+                "Archive",
+                Message::ArchiveSelected,
+            ))
+            .push(crate::components::action_bar::button_text(
+                "Mark read",
+                Message::MarkReadSelected,
+            ))
+            .push(crate::components::action_bar::button_text(
+                "Trash",
+                Message::TrashSelected,
+            ));
+    }
+
+    let title = app
+        .selected_body
+        .as_ref()
+        .map(|body| body.subject.as_str())
+        .unwrap_or("Reading pane");
+
+    let mut bar = row![
+        text(title).size(13).color(crate::theme::TEXT),
+        iced::widget::horizontal_space(),
+        actions,
+    ]
+    .align_y(iced::Alignment::Center)
+    .spacing(crate::theme::SPACE_SM)
+    .padding(crate::theme::SPACE_SM);
+
+    if app.unread_notifications > 0 {
+        bar = bar.push(crate::components::badge::count(app.unread_notifications));
+    }
+
+    crate::components::surface::toolbar_surface(bar).into()
+}
+
+fn thread_context_menu<'a>(app: &'a App, thread_id: &'a ThreadId) -> Element<'a, Message> {
+    let title = app
+        .threads
+        .iter()
+        .find(|thread| thread.id == *thread_id)
+        .map(|thread| thread.subject.as_str())
+        .unwrap_or("Thread actions");
+
+    container(
+        column![
+            row![
+                text("Focused actions")
+                    .size(crate::theme::FONT_CAPTION)
+                    .color(crate::theme::ACCENT),
+                iced::widget::horizontal_space(),
+                crate::components::action_bar::button_text("Close", Message::CloseThreadContext),
+            ]
+            .align_y(iced::Alignment::Center),
+            text(title).size(13).color(crate::theme::TEXT),
+            row![
+                crate::components::action_bar::button_text("Reply", Message::ReplyInline),
+                crate::components::action_bar::button_text("Archive", Message::ArchiveSelected),
+                crate::components::action_bar::button_text("Mark read", Message::MarkReadSelected),
+                crate::components::action_bar::button_text("Trash", Message::TrashSelected),
+            ]
+            .spacing(crate::theme::SPACE_XS),
+            text("Keyboard: R reply · D trash · Esc close")
+                .size(crate::theme::FONT_CAPTION)
+                .color(crate::theme::TEXT_MUTED),
+        ]
+        .spacing(crate::theme::SPACE_XS)
+        .padding(crate::theme::SPACE_SM),
+    )
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+        border: iced::Border {
+            width: 2.0,
+            radius: crate::theme::RADIUS_LG.into(),
+            color: crate::theme::ACCENT,
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> {
@@ -832,17 +1284,35 @@ fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> 
 fn notifications_view<'a>(
     notifications: &'a [DesktopNotification],
     unread: u32,
+    policy: &'a NotificationPolicyState,
 ) -> Element<'a, Message> {
     let mut content = column![
         row![
             crate::components::list::section_label("Notifications"),
             iced::widget::horizontal_space(),
             crate::components::badge::count(unread),
+            crate::components::action_bar::button_text(
+                if policy.quiet { "Notify" } else { "Quiet" },
+                Message::SetNotificationsQuiet(!policy.quiet),
+            ),
+            crate::components::action_bar::button_text(
+                "Quiet 1h",
+                Message::SetNotificationsQuietFor(60 * 60),
+            ),
+            crate::components::action_bar::button_text("Clear", Message::ClearNotifications),
         ]
         .align_y(iced::Alignment::Center)
     ]
     .spacing(6)
     .padding([8, 12]);
+
+    if policy.quiet || policy.suppressed_count > 0 {
+        content = content.push(
+            text(&policy.reason)
+                .size(crate::theme::FONT_CAPTION)
+                .color(crate::theme::TEXT_MUTED),
+        );
+    }
 
     for notification in notifications.iter().rev().take(3) {
         content = content.push(
@@ -916,6 +1386,7 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
         EngineEvent::AccountSaved(account) => {
             app.account_setup_visible = false;
             app.editing_account_id = None;
+            app.view_mode = ViewMode::Reader;
             reset_account_form(app);
             app.status = format!("Account saved: {}", account.email);
         }
@@ -1017,8 +1488,12 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
             app.status = "Send queue updated".to_string();
         }
         EngineEvent::NetworkStatusChanged(status) => {
+            let was_offline = !app.network_online;
             app.network_online = status.online;
             app.status = status.reason;
+            if was_offline && app.network_online {
+                return network_resume_task(app);
+            }
         }
         EngineEvent::ConflictsUpdated(conflicts) => {
             app.conflicts = conflicts;
@@ -1035,12 +1510,17 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 app.notifications.drain(0..overflow);
             }
         }
+        EngineEvent::NotificationPolicyChanged(policy) => {
+            app.status = policy.reason.clone();
+            app.notification_policy = policy;
+        }
         EngineEvent::SendResult { result, .. } => {
             app.status = match result {
                 Ok(()) => {
                     app.draft_to.clear();
                     app.draft_subject.clear();
                     app.draft_body.clear();
+                    app.view_mode = ViewMode::Reader;
                     "Message sent".to_string()
                 }
                 Err(error) => format!("Send failed: {error}"),
@@ -1052,6 +1532,28 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
     }
 
     Task::none()
+}
+
+fn network_resume_task(app: &App) -> Task<Message> {
+    let engine = app.engine.clone();
+    let account_ids = enabled_account_ids(app);
+    Task::perform(
+        async move {
+            let _ = engine.send(EngineCommand::RunDueSendQueue).await;
+            for account_id in account_ids {
+                let _ = engine.send(EngineCommand::SyncNow(account_id)).await;
+            }
+        },
+        |_| Message::SyncQueued,
+    )
+}
+
+fn enabled_account_ids(app: &App) -> Vec<AccountId> {
+    app.accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .map(|account| account.id.clone())
+        .collect()
 }
 
 fn render_message_body(body: &MessageBody) -> RenderTree {
@@ -1066,6 +1568,65 @@ fn selected_action_status(app: &App, action: &str) -> String {
     match app.selected_thread.as_ref() {
         Some(_) => format!("{action} queued"),
         None => format!("Select a message to {action}"),
+    }
+}
+
+fn keyboard_shortcut(key: Key, modifiers: Modifiers) -> Option<Message> {
+    if modifiers.command() || modifiers.control() || modifiers.alt() {
+        return None;
+    }
+
+    match key.as_ref() {
+        Key::Character("j") | Key::Named(key::Named::ArrowDown) => Some(Message::SelectNextThread),
+        Key::Character("k") | Key::Named(key::Named::ArrowUp) => {
+            Some(Message::SelectPreviousThread)
+        }
+        Key::Character("m") => Some(Message::OpenSelectedThreadContext),
+        Key::Character("r") => Some(Message::ReplyInline),
+        Key::Character("d") | Key::Named(key::Named::Delete) => Some(Message::TrashSelected),
+        Key::Named(key::Named::Escape) => Some(Message::CancelActivePanel),
+        _ => None,
+    }
+}
+
+fn select_relative_thread(app: &mut App, direction: isize) -> Task<Message> {
+    if app.account_setup_visible || app.view_mode != ViewMode::Reader || app.threads.is_empty() {
+        return Task::none();
+    }
+
+    let current_index = app
+        .selected_thread
+        .as_ref()
+        .and_then(|selected| app.threads.iter().position(|thread| thread.id == *selected));
+    let next_index = match (current_index, direction.is_negative()) {
+        (Some(index), true) => index.saturating_sub(1),
+        (Some(index), false) => (index + 1).min(app.threads.len() - 1),
+        (None, true) => app.threads.len() - 1,
+        (None, false) => 0,
+    };
+    let thread_id = app.threads[next_index].id.clone();
+    let engine = app.engine.clone();
+
+    app.selected_thread = Some(thread_id.clone());
+    app.inline_reply_open = false;
+    app.context_thread = None;
+    app.attachment_preview = None;
+    app.attachment_open = None;
+    app.status = "Loading message".to_string();
+
+    Task::perform(
+        async move {
+            let _ = engine.send(EngineCommand::LoadThread(thread_id)).await;
+        },
+        |_| Message::SyncQueued,
+    )
+}
+
+fn reply_subject(subject: &str) -> String {
+    if subject.trim_start().to_ascii_lowercase().starts_with("re:") {
+        subject.to_string()
+    } else {
+        format!("Re: {subject}")
     }
 }
 

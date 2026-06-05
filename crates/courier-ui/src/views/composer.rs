@@ -15,7 +15,11 @@ pub fn view<'a>(
         let mut content = column![
             crate::components::surface::header(
                 "Compose",
-                crate::components::action_bar::button_primary("Send", Message::SendDraft),
+                row![
+                    crate::components::action_bar::button_text("Close", Message::CloseCompose),
+                    crate::components::action_bar::button_primary("Send", Message::SendDraft),
+                ]
+                .spacing(crate::theme::SPACE_SM),
             ),
             crate::components::surface::divider(),
             crate::components::form::labeled_input(
@@ -44,7 +48,7 @@ pub fn view<'a>(
 
         content
     })
-    .height(Length::FillPortion(2))
+    .height(Length::Fill)
     .into()
 }
 

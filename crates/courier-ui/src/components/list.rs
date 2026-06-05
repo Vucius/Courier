@@ -1,11 +1,11 @@
 use iced::widget::{button, column, container, row, text};
-use iced::{Alignment, Background, Border, Element, Length};
+use iced::{Alignment, Background, Border, Element, Length, Shadow};
 
 use crate::app::Message;
 
 pub fn section_label<'a>(label: &'a str) -> Element<'a, Message> {
     text(label)
-        .size(11)
+        .size(crate::theme::FONT_CAPTION)
         .color(crate::theme::TEXT_MUTED)
         .width(Length::Fill)
         .into()
@@ -20,10 +20,12 @@ pub fn outline_row<'a>(
 ) -> Element<'a, Message> {
     let mut content = row![
         leading.into(),
-        text(label).size(14).color(crate::theme::TEXT)
+        text(label)
+            .size(crate::theme::FONT_BODY)
+            .color(crate::theme::TEXT)
     ]
     .align_y(Alignment::Center)
-    .spacing(8)
+    .spacing(crate::theme::SPACE_SM)
     .width(Length::Fill);
 
     if let Some(trailing) = trailing {
@@ -33,7 +35,7 @@ pub fn outline_row<'a>(
     }
 
     button(row_frame(content, selected))
-        .style(button::text)
+        .style(move |_, status| row_button_style(selected, status))
         .padding(0)
         .width(Length::Fill)
         .on_press(on_press)
@@ -53,7 +55,7 @@ pub fn message_row<'a>(
         .width(Length::Fill);
 
     button(row_frame(row, selected))
-        .style(button::text)
+        .style(move |_, status| row_button_style(selected, status))
         .padding(0)
         .width(Length::Fill)
         .on_press(on_press)
@@ -84,22 +86,60 @@ pub fn row_frame<'a>(
     content: impl Into<Element<'a, Message>>,
     selected: bool,
 ) -> Element<'a, Message> {
-    let background = if selected {
-        crate::theme::ROW_SELECTED
+    let accent = if selected {
+        crate::theme::ACCENT
     } else {
-        crate::theme::SURFACE
+        iced::Color::TRANSPARENT
     };
 
-    container(content)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(background)),
-            border: Border {
-                width: 1.0,
-                radius: 0.0.into(),
-                color: crate::theme::BORDER,
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        row![
+            container(text(""))
+                .width(Length::Fixed(3.0))
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(accent)),
+                    border: Border {
+                        width: 0.0,
+                        radius: crate::theme::RADIUS_SM.into(),
+                        color: iced::Color::TRANSPARENT,
+                    },
+                    ..container::Style::default()
+                }),
+            content.into(),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Shrink)
+    .style(move |_| container::Style {
+        border: Border {
+            width: 0.0,
+            radius: crate::theme::RADIUS_MD.into(),
+            color: iced::Color::TRANSPARENT,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn row_button_style(selected: bool, status: button::Status) -> button::Style {
+    let background = match (selected, status) {
+        (true, button::Status::Pressed) => crate::theme::ACCENT_MUTED,
+        (true, _) => crate::theme::ROW_SELECTED,
+        (false, button::Status::Hovered) => crate::theme::SURFACE_HOVER,
+        (false, button::Status::Pressed) => crate::theme::ROW_SELECTED,
+        (false, _) => crate::theme::SURFACE,
+    };
+
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: crate::theme::TEXT,
+        border: Border {
+            width: 0.0,
+            radius: crate::theme::RADIUS_MD.into(),
+            color: iced::Color::TRANSPARENT,
+        },
+        shadow: Shadow::default(),
+    }
 }

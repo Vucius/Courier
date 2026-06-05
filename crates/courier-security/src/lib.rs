@@ -278,7 +278,17 @@ fn parse_attrs(input: &str) -> Vec<HtmlAttr> {
 fn is_allowed_attr(name: &str) -> bool {
     matches!(
         name,
-        "href" | "src" | "alt" | "title" | "width" | "height" | "data-courier-remote-image"
+        "href"
+            | "src"
+            | "alt"
+            | "title"
+            | "width"
+            | "height"
+            | "class"
+            | "id"
+            | "hidden"
+            | "aria-hidden"
+            | "data-courier-remote-image"
     )
 }
 

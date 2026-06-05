@@ -1,0 +1,39 @@
+[installers]
+metadata_version = 1
+application = "Courier"
+bundle_identifier = "dev.hephaestus.courier"
+binary = "courier-ui"
+data_dir_name = ".courier"
+preserve_user_data_on_uninstall = true
+upgrade_smoke = "packaging/verify-release-smoke.ps1"
+
+[windows]
+format = "msi"
+toolchain = "wix"
+artifact_name = "Courier-Setup-${version}-x64.msi"
+upgrade_code = "00000000-0000-0000-0000-000000000000"
+install_scope = "perUser"
+icon = "packaging/icons/courier.ico"
+
+[macos]
+bundle_name = "Courier.app"
+format = "dmg"
+artifact_name = "Courier-${version}-macos.dmg"
+category = "public.app-category.productivity"
+icon = "packaging/icons/courier.icns"
+
+[linux.appimage]
+artifact_name = "Courier-${version}-x86_64.AppImage"
+desktop_file = "dev.hephaestus.courier.desktop"
+icon = "packaging/icons/courier.png"
+
+[linux.deb]
+package_name = "courier"
+artifact_name = "courier_${version}_amd64.deb"
+section = "mail"
+priority = "optional"
+
+[linux.rpm]
+package_name = "courier"
+artifact_name = "courier-${version}-1.x86_64.rpm"
+group = "Applications/Internet"

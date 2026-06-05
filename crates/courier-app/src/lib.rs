@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use courier_adapter::{AttachmentFetchRequest, ConfiguredRemote, MailRemote};
+use courier_adapter::{
+    AttachmentFetchRequest, ConfiguredRemote, CredentialSecretResolver, MailRemote,
+};
 use courier_credential::{
     CredentialStore, OsCredentialStore, account_credential_refs, credential_ref,
 };
@@ -11,8 +13,9 @@ use courier_proto::{
     AttachmentId, AttachmentOpenRequest, AttachmentSummary, AttachmentTransfer,
     AttachmentTransferStatus, AuthType, CredentialKind, CredentialSecret, DesktopNotification,
     EndpointCheckResult, EngineCommand, EngineEvent, MailboxId, MailboxRole, MailboxSummary,
-    MessageBody, MessageId, NetworkStatus, NotificationKind, OAuth2AuthorizationRequest,
-    OAuth2Callback, OAuth2ClientConfig, ProviderKind, TaskId, ThreadId, ThreadSummary,
+    MessageBody, MessageId, NetworkStatus, NotificationKind, NotificationPolicyState,
+    OAuth2AuthorizationRequest, OAuth2Callback, OAuth2ClientConfig, ProviderKind, TaskId, ThreadId,
+    ThreadSummary,
 };
 use courier_provider::oauth2_client_config;
 use courier_search::SearchIndex;
@@ -112,6 +115,10 @@ struct PendingOAuth2 {
 #[derive(Default)]
 struct NotificationPolicy {
     recent: Vec<NotificationRecord>,
+    quiet: bool,
+    quiet_until: Option<i64>,
+    suppressed_count: u32,
+    last_suppressed_at: Option<i64>,
 }
 
 struct NotificationRecord {
@@ -125,6 +132,13 @@ impl NotificationPolicy {
 
     fn should_publish(&mut self, notification: &DesktopNotification) -> bool {
         let now = notification.created_at;
+        self.expire_quiet(now);
+        if self.is_quiet(now) && notification.kind != NotificationKind::Error {
+            self.suppressed_count = self.suppressed_count.saturating_add(1);
+            self.last_suppressed_at = Some(now);
+            return false;
+        }
+
         self.recent
             .retain(|record| now.saturating_sub(record.created_at) <= Self::DEDUPE_WINDOW_SECONDS);
 
@@ -144,6 +158,61 @@ impl NotificationPolicy {
 
         true
     }
+
+    fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
+        self.quiet_until = None;
+        if !quiet {
+            self.suppressed_count = 0;
+            self.last_suppressed_at = None;
+        }
+    }
+
+    fn set_quiet_for(&mut self, seconds: i64, now: i64) {
+        self.quiet = false;
+        self.quiet_until = Some(now.saturating_add(seconds.max(0)));
+    }
+
+    fn expire_quiet(&mut self, now: i64) {
+        if self.quiet_until.is_some_and(|until| until <= now) {
+            self.quiet_until = None;
+            self.suppressed_count = 0;
+            self.last_suppressed_at = None;
+        }
+    }
+
+    fn is_quiet(&self, now: i64) -> bool {
+        self.quiet || self.quiet_until.is_some_and(|until| until > now)
+    }
+
+    fn state(&self) -> NotificationPolicyState {
+        let now = unix_timestamp();
+        let quiet = self.is_quiet(now);
+        NotificationPolicyState {
+            quiet,
+            quiet_until: self.quiet_until.filter(|until| *until > now),
+            suppressed_count: self.suppressed_count,
+            last_suppressed_at: self.last_suppressed_at,
+            reason: if quiet {
+                if self.suppressed_count == 0 {
+                    match self.quiet_until.filter(|until| *until > now) {
+                        Some(until) => format!(
+                            "Quiet notifications enabled for {} more minute(s)",
+                            ((until - now) / 60).max(1)
+                        ),
+                        None => "Quiet notifications enabled".to_string(),
+                    }
+                } else {
+                    format!(
+                        "Quiet notifications enabled; {} notification(s) suppressed",
+                        self.suppressed_count
+                    )
+                }
+            } else {
+                "Notifications enabled".to_string()
+            },
+        }
+    }
 }
 
 impl EngineRuntime {
@@ -162,6 +231,7 @@ impl EngineRuntime {
         let mut send_queue_tick = tokio::time::interval(Duration::from_secs(5));
 
         let _ = self.event_tx.send(EngineEvent::Ready);
+        self.publish_notification_policy();
         self.publish_snapshot(&storage);
 
         loop {
@@ -629,6 +699,36 @@ impl EngineRuntime {
             EngineCommand::RunDueSendQueue => {
                 self.run_due_send_queue(storage).await;
             }
+            EngineCommand::ProbeNetwork => {
+                let status = match storage.list_accounts() {
+                    Ok(accounts) => probe_network_status(&accounts).await,
+                    Err(error) => NetworkStatus {
+                        online: false,
+                        reason: format!("Network probe failed: {error}"),
+                        checked_at: unix_timestamp(),
+                    },
+                };
+                let was_online = self.network_online;
+                self.network_online = status.online;
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::NetworkStatusChanged(status.clone()));
+                if was_online != status.online {
+                    self.publish_notification(DesktopNotification {
+                        id: format!("network:{}:{}", status.online, status.checked_at),
+                        kind: NotificationKind::Warning,
+                        title: if status.online {
+                            "Network restored".to_string()
+                        } else {
+                            "Network unavailable".to_string()
+                        },
+                        body: status.reason,
+                        account_id: None,
+                        message_ids: Vec::new(),
+                        created_at: status.checked_at,
+                    });
+                }
+            }
             EngineCommand::SetNetworkOnline(online) => {
                 self.network_online = online;
                 let status = NetworkStatus {
@@ -660,6 +760,19 @@ impl EngineRuntime {
                     message_ids: Vec::new(),
                     created_at: unix_timestamp(),
                 });
+            }
+            EngineCommand::SetNotificationsQuiet(quiet) => {
+                self.notifications.set_quiet(quiet);
+                self.publish_notification_policy();
+                if quiet {
+                    let _ = self.event_tx.send(EngineEvent::Error(
+                        "Quiet notifications enabled; errors will still appear".to_string(),
+                    ));
+                }
+            }
+            EngineCommand::SetNotificationsQuietFor(seconds) => {
+                self.notifications.set_quiet_for(seconds, unix_timestamp());
+                self.publish_notification_policy();
             }
             EngineCommand::PreviewAttachment(attachment_id) => {
                 match storage.attachment_preview(&attachment_id, 64 * 1024) {
@@ -1143,7 +1256,15 @@ impl EngineRuntime {
             let _ = self
                 .event_tx
                 .send(EngineEvent::NotificationRaised(notification));
+        } else {
+            self.publish_notification_policy();
         }
+    }
+
+    fn publish_notification_policy(&self) {
+        let _ = self.event_tx.send(EngineEvent::NotificationPolicyChanged(
+            self.notifications.state(),
+        ));
     }
 
     fn publish_network_paused(&mut self, message: &str) {
@@ -1261,9 +1382,18 @@ fn remote_for_account(
         return Err(format!("Account {} is disabled", account.email));
     }
 
-    Ok(ConfiguredRemote::from_account_config(account_config(
-        account,
-    )))
+    let store = std::sync::Arc::new(OsCredentialStore::new());
+    let resolver_store = store.clone();
+    let resolver = CredentialSecretResolver::new(move |reference| {
+        resolver_store
+            .get_secret(reference)
+            .map_err(|error| error.to_string())
+    });
+
+    Ok(ConfiguredRemote::from_account_config_with_secret_resolver(
+        account_config(account),
+        Some(resolver),
+    ))
 }
 
 fn account_config(account: AccountState) -> AccountConfig {
@@ -1286,6 +1416,70 @@ async fn test_account_connection(
         account_id: account.id.clone(),
         imap: test_endpoint(&account.imap_host, account.imap_port).await,
         smtp: test_endpoint(&account.smtp_host, account.smtp_port).await,
+    }
+}
+
+async fn probe_network_status(accounts: &[AccountState]) -> NetworkStatus {
+    let enabled = accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .collect::<Vec<_>>();
+
+    if enabled.is_empty() {
+        return NetworkStatus {
+            online: true,
+            reason: "No enabled accounts; network probe idle".to_string(),
+            checked_at: unix_timestamp(),
+        };
+    }
+
+    let mut reachable = 0usize;
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+
+    for account in enabled {
+        let imap = test_endpoint(&account.imap_host, account.imap_port).await;
+        let smtp = test_endpoint(&account.smtp_host, account.smtp_port).await;
+        checked += 2;
+        if imap.ok || smtp.ok {
+            reachable += 1;
+        } else {
+            failures.push(format!(
+                "{} IMAP {} SMTP {}",
+                account.email,
+                endpoint_probe_label(&imap),
+                endpoint_probe_label(&smtp)
+            ));
+        }
+    }
+
+    let online = reachable > 0;
+    let reason = if online {
+        format!("Network probe reachable for {reachable} enabled account(s)")
+    } else {
+        format!(
+            "Network probe found no reachable endpoints across {checked} check(s): {}",
+            failures.join("; ")
+        )
+    };
+
+    NetworkStatus {
+        online,
+        reason,
+        checked_at: unix_timestamp(),
+    }
+}
+
+fn endpoint_probe_label(endpoint: &EndpointCheckResult) -> String {
+    if endpoint.ok {
+        format!("{}:{} ok", endpoint.host, endpoint.port)
+    } else {
+        format!(
+            "{}:{} {}",
+            endpoint.host,
+            endpoint.port,
+            endpoint.error.as_deref().unwrap_or("failed")
+        )
     }
 }
 

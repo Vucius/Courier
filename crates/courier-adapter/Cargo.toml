@@ -8,4 +8,5 @@ license.workspace = true
 courier-domain.workspace = true
 courier-provider.workspace = true
 courier-proto.workspace = true
+lettre.workspace = true
 thiserror.workspace = true

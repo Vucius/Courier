@@ -46,6 +46,10 @@ jobs:
       - name: Build release desktop binary
         run: cargo build -p courier-ui --release --locked
 
+      - name: Verify release smoke metadata
+        shell: pwsh
+        run: ./packaging/verify-release-smoke.ps1
+
       - name: Stage release metadata
         shell: bash
         run: |
@@ -53,6 +57,11 @@ jobs:
           cp packaging/courier.app.toml target/release/package/
           cp packaging/release-manifest.json target/release/package/
           cp packaging/migrations.md target/release/package/
+          cp packaging/verify-release-smoke.ps1 target/release/package/
+          mkdir -p target/release/package/installers
+          cp packaging/installers/courier.installers.toml target/release/package/installers/
+          mkdir -p target/release/package/icons
+          cp packaging/icons/courier.svg target/release/package/icons/
           cp README.md LICENSE target/release/package/
 
       - name: Upload release binary (Windows)

@@ -28,6 +28,11 @@ The SQLite database file is `courier.db`.
 
 ## Release Smoke
 
+CI now runs `packaging/verify-release-smoke.ps1` before staging release metadata.
+The automated smoke verifies that release metadata exists, the release manifest and app config schema values match workspace metadata, installer metadata is present, release artifacts no longer use pending installer placeholders, uninstall policy preserves `.courier`, and these notes still name the executable migration runner plus the shipped SQL migrations.
+
+Manual runtime smoke is still required for installer candidates:
+
 1. Start the release binary against an existing `.courier/courier.db`.
 2. Confirm startup logs include the `storage migration runner completed` entry.
 3. Confirm the migration report lists `001_init.sql`, `002_search.sql`, and any compatibility columns added for that database.

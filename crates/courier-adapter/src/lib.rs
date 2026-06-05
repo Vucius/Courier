@@ -1,6 +1,7 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +13,9 @@ use courier_proto::{
 use courier_provider::{
     AuthMechanism, ProviderCapabilities, ProviderEndpoint, TransportSecurity, capabilities_for,
 };
+use lettre::address::Envelope;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -23,6 +27,14 @@ pub enum Error {
     MissingEndpoint(&'static str),
     #[error("account auth is not supported by provider: {0}")]
     UnsupportedAuth(&'static str),
+    #[error("credential is missing: {0}")]
+    MissingCredential(&'static str),
+    #[error("credential backend error: {0}")]
+    Credential(String),
+    #[error("smtp transport error: {0}")]
+    Smtp(String),
+    #[error("message envelope is invalid: {0}")]
+    InvalidEnvelope(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +112,8 @@ pub enum RemoteOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingMessage {
     pub rfc822: Vec<u8>,
+    pub from: String,
+    pub recipients: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,18 +156,21 @@ pub trait MailRemote {
 pub struct ImapSmtpRemote {
     account: AccountConfig,
     plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GmailRemote {
     account: AccountConfig,
     plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutlookRemote {
     account: AccountConfig,
     plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +197,40 @@ pub struct ProtocolConnectionPlan {
     pub jmap_endpoint: Option<ProviderEndpoint>,
     pub auth_mechanisms: Vec<AuthMechanism>,
     pub credential_refs: Vec<CredentialRef>,
+}
+
+type SecretReader =
+    dyn Fn(&CredentialRef) -> std::result::Result<Option<String>, String> + Send + Sync;
+
+#[derive(Clone)]
+pub struct CredentialSecretResolver {
+    read_secret: Arc<SecretReader>,
+}
+
+impl CredentialSecretResolver {
+    pub fn new(
+        read_secret: impl Fn(&CredentialRef) -> std::result::Result<Option<String>, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            read_secret: Arc::new(read_secret),
+        }
+    }
+
+    fn get_secret(&self, reference: &CredentialRef) -> Result<Option<String>> {
+        (self.read_secret)(reference).map_err(Error::Credential)
+    }
+}
+
+impl fmt::Debug for CredentialSecretResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialSecretResolver")
+            .field("read_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 fn auth_supported(account: &AccountConfig, auth_mechanisms: &[AuthMechanism]) -> bool {
@@ -337,10 +388,20 @@ impl ConfiguredRemote {
     }
 
     pub fn from_account_config(account: AccountConfig) -> Self {
+        Self::from_account_config_with_secret_resolver(account, None)
+    }
+
+    pub fn from_account_config_with_secret_resolver(
+        account: AccountConfig,
+        secret_resolver: Option<CredentialSecretResolver>,
+    ) -> Self {
         match account.provider {
-            ProviderKind::GenericImap => Self::ImapSmtp(ImapSmtpRemote::new(account)),
-            ProviderKind::Gmail => Self::Gmail(GmailRemote::new(account)),
-            ProviderKind::Outlook => Self::Outlook(OutlookRemote::new(account)),
+            ProviderKind::GenericImap => Self::ImapSmtp(ImapSmtpRemote::new_with_secret_resolver(
+                account,
+                secret_resolver,
+            )),
+            ProviderKind::Gmail => Self::Gmail(GmailRemote::new(account, secret_resolver)),
+            ProviderKind::Outlook => Self::Outlook(OutlookRemote::new(account, secret_resolver)),
             ProviderKind::Jmap => Self::Jmap(JmapRemote::new(account)),
         }
     }
@@ -348,9 +409,20 @@ impl ConfiguredRemote {
 
 impl ImapSmtpRemote {
     pub fn new(account: AccountConfig) -> Self {
+        Self::new_with_secret_resolver(account, None)
+    }
+
+    pub fn new_with_secret_resolver(
+        account: AccountConfig,
+        secret_resolver: Option<CredentialSecretResolver>,
+    ) -> Self {
         let plan = ProtocolConnectionPlan::from_account(&account)
             .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::ImapSmtp));
-        Self { account, plan }
+        Self {
+            account,
+            plan,
+            secret_resolver,
+        }
     }
 
     pub fn account(&self) -> &AccountConfig {
@@ -363,10 +435,14 @@ impl ImapSmtpRemote {
 }
 
 impl GmailRemote {
-    pub fn new(account: AccountConfig) -> Self {
+    pub fn new(account: AccountConfig, secret_resolver: Option<CredentialSecretResolver>) -> Self {
         let plan = ProtocolConnectionPlan::from_account(&account)
             .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::GmailImapSmtp));
-        Self { account, plan }
+        Self {
+            account,
+            plan,
+            secret_resolver,
+        }
     }
 
     pub fn account(&self) -> &AccountConfig {
@@ -379,10 +455,14 @@ impl GmailRemote {
 }
 
 impl OutlookRemote {
-    pub fn new(account: AccountConfig) -> Self {
+    pub fn new(account: AccountConfig, secret_resolver: Option<CredentialSecretResolver>) -> Self {
         let plan = ProtocolConnectionPlan::from_account(&account)
             .unwrap_or_else(|_| fallback_plan(&account, ProtocolTransport::OutlookImapSmtp));
-        Self { account, plan }
+        Self {
+            account,
+            plan,
+            secret_resolver,
+        }
     }
 
     pub fn account(&self) -> &AccountConfig {
@@ -585,6 +665,144 @@ impl MailRemote for ConfiguredRemote {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SmtpAuthSecret {
+    Password(String),
+    OAuthAccessToken(String),
+}
+
+async fn send_smtp_message(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+    message: OutgoingMessage,
+) -> Result<SendResult> {
+    let endpoint = plan
+        .smtp_endpoint
+        .as_ref()
+        .ok_or(Error::MissingEndpoint("smtp"))?;
+    if !plan.capabilities.supports_smtp {
+        return Err(Error::NotImplemented("provider smtp send_message"));
+    }
+
+    let auth_secret = resolve_smtp_auth_secret(&account, &plan, secret_resolver.as_ref())?;
+    let envelope = smtp_envelope(&message)?;
+    let mailer = smtp_transport(endpoint, &account, auth_secret)?;
+    mailer
+        .send_raw(&envelope, &message.rfc822)
+        .await
+        .map_err(|error| Error::Smtp(error.to_string()))?;
+
+    Ok(SendResult {
+        remote_id: Some(format!("smtp:{}:{}", endpoint.host, unix_timestamp())),
+    })
+}
+
+fn resolve_smtp_auth_secret(
+    account: &AccountConfig,
+    plan: &ProtocolConnectionPlan,
+    secret_resolver: Option<&CredentialSecretResolver>,
+) -> Result<Option<SmtpAuthSecret>> {
+    let Some(secret_resolver) = secret_resolver else {
+        if plan.credential_refs.is_empty() {
+            return Ok(None);
+        }
+        return Err(Error::MissingCredential("credential resolver"));
+    };
+
+    match &account.auth_type {
+        AuthType::Password => {
+            let reference = plan
+                .credential_refs
+                .iter()
+                .find(|reference| matches!(reference.kind, CredentialKind::Password))
+                .ok_or(Error::MissingCredential("password reference"))?;
+            let secret = secret_resolver
+                .get_secret(reference)?
+                .ok_or(Error::MissingCredential("password"))?;
+            Ok(Some(SmtpAuthSecret::Password(secret)))
+        }
+        AuthType::OAuth2 => {
+            let reference = plan
+                .credential_refs
+                .iter()
+                .find(|reference| matches!(reference.kind, CredentialKind::OAuthAccessToken))
+                .ok_or(Error::MissingCredential("oauth access token reference"))?;
+            let secret = secret_resolver
+                .get_secret(reference)?
+                .ok_or(Error::MissingCredential("oauth access token"))?;
+            Ok(Some(SmtpAuthSecret::OAuthAccessToken(secret)))
+        }
+    }
+}
+
+fn smtp_transport(
+    endpoint: &ProviderEndpoint,
+    account: &AccountConfig,
+    auth_secret: Option<SmtpAuthSecret>,
+) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+    let mut builder = match endpoint.security {
+        TransportSecurity::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host)
+            .map_err(|error| Error::Smtp(error.to_string()))?,
+        TransportSecurity::StartTls => {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&endpoint.host)
+                .map_err(|error| Error::Smtp(error.to_string()))?
+        }
+        TransportSecurity::Plain => {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&endpoint.host)
+        }
+    }
+    .port(endpoint.port);
+
+    if let Some(auth_secret) = auth_secret {
+        let (secret, mechanisms) = match auth_secret {
+            SmtpAuthSecret::Password(secret) => (secret, vec![Mechanism::Plain, Mechanism::Login]),
+            SmtpAuthSecret::OAuthAccessToken(secret) => (secret, vec![Mechanism::Xoauth2]),
+        };
+        builder = builder
+            .credentials(Credentials::new(account.email.clone(), secret))
+            .authentication(mechanisms);
+    }
+
+    Ok(builder.build())
+}
+
+fn smtp_envelope(message: &OutgoingMessage) -> Result<Envelope> {
+    let from = parse_smtp_address(&message.from)?;
+    let recipients = message
+        .recipients
+        .iter()
+        .map(|recipient| parse_smtp_address(recipient))
+        .collect::<Result<Vec<_>>>()?;
+
+    Envelope::new(Some(from), recipients).map_err(|error| Error::InvalidEnvelope(error.to_string()))
+}
+
+fn parse_smtp_address(value: &str) -> Result<Address> {
+    let trimmed = value.trim();
+    let address = if let Some(start) = trimmed.rfind('<') {
+        if let Some(end) = trimmed[start + 1..].find('>') {
+            &trimmed[start + 1..start + 1 + end]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    address
+        .parse::<Address>()
+        .map_err(|error| Error::InvalidEnvelope(format!("{address}: {error}")))
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .min(i64::MAX as u64) as i64
+}
+
 impl MailRemote for ImapSmtpRemote {
     fn list_mailboxes(&self) -> impl Future<Output = Result<Vec<RemoteMailbox>>> + Send {
         async { Err(Error::NotImplemented("imap/smtp list_mailboxes")) }
@@ -612,10 +830,10 @@ impl MailRemote for ImapSmtpRemote {
         &self,
         message: OutgoingMessage,
     ) -> impl Future<Output = Result<SendResult>> + Send {
-        async move {
-            let _ = message;
-            Err(Error::NotImplemented("smtp send_message"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { send_smtp_message(account, plan, secret_resolver, message).await }
     }
 
     fn fetch_attachment(
@@ -656,10 +874,10 @@ impl MailRemote for GmailRemote {
         &self,
         message: OutgoingMessage,
     ) -> impl Future<Output = Result<SendResult>> + Send {
-        async move {
-            let _ = message;
-            Err(Error::NotImplemented("gmail send_message"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { send_smtp_message(account, plan, secret_resolver, message).await }
     }
 
     fn fetch_attachment(
@@ -700,10 +918,10 @@ impl MailRemote for OutlookRemote {
         &self,
         message: OutgoingMessage,
     ) -> impl Future<Output = Result<SendResult>> + Send {
-        async move {
-            let _ = message;
-            Err(Error::NotImplemented("outlook send_message"))
-        }
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
+        async move { send_smtp_message(account, plan, secret_resolver, message).await }
     }
 
     fn fetch_attachment(

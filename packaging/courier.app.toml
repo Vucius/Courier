@@ -20,13 +20,16 @@ linux_png = "packaging/icons/courier.png"
 
 [windows]
 installer = "msi"
+installer_metadata = "packaging/installers/courier.installers.toml"
 upgrade_code = "00000000-0000-0000-0000-000000000000"
 install_scope = "perUser"
 
 [linux]
+installer_metadata = "packaging/installers/courier.installers.toml"
 desktop_file = "dev.hephaestus.courier.desktop"
 categories = ["Network", "Email"]
 
 [macos]
+installer_metadata = "packaging/installers/courier.installers.toml"
 bundle_name = "Courier.app"
 category = "public.app-category.productivity"
