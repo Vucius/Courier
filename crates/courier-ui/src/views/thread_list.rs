@@ -14,25 +14,38 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let mut list = column![crate::components::surface::header(
         title,
-        text(format!("{} shown", threads.len()))
-            .size(12)
-            .color(crate::theme::TEXT_MUTED),
+        text(format!(
+            "{} {}",
+            threads.len(),
+            if threads.len() == 1 { "message" } else { "messages" }
+        ))
+        .size(12)
+        .color(crate::theme::TEXT_MUTED),
     )]
-    .spacing(0);
+    .spacing(0)
+    .height(Length::Fill);
 
     if threads.is_empty() {
-        return crate::components::empty_state::view(
-            "No messages found",
-            "Try a different search or sync the account.",
+        list = list.push(
+            container(crate::components::empty_state::view(
+                "No messages found",
+                "Try syncing your inbox or changing filters.",
+            ))
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
         );
+    } else {
+        let mut scroll_col = column![].spacing(0);
+        for thread in threads {
+            let selected = selected_thread == Some(&thread.id);
+            scroll_col = scroll_col.push(thread_row(thread, selected));
+        }
+        list = list.push(scrollable(scroll_col).height(Length::Fill));
     }
 
-    for thread in threads {
-        let selected = selected_thread == Some(&thread.id);
-        list = list.push(thread_row(thread, selected));
-    }
-
-    scrollable(list).height(Length::Fill).into()
+    list.into()
 }
 
 fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Message> {

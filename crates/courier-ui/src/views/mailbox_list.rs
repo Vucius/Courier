@@ -22,15 +22,24 @@ pub fn view<'a>(
     .spacing(crate::theme::SPACE_SM)
     .padding(8);
 
-    for mailbox in mailboxes {
-        let selected = selected_mailbox == Some(&mailbox.id);
-        list = list.push(mailbox_row(
-            &mailbox.name,
-            role_icon(&mailbox.role),
-            Some(&mailbox.id),
-            mailbox.unread_count,
-            selected,
-        ));
+    if mailboxes.is_empty() {
+        list = list
+            .push(mailbox_row("Inbox", Icon::Inbox, None, 0, false))
+            .push(mailbox_row("Sent", Icon::Send, None, 0, false))
+            .push(mailbox_row("Drafts", Icon::Drafts, None, 0, false))
+            .push(mailbox_row("Archive", Icon::Archive, None, 0, false))
+            .push(mailbox_row("Trash", Icon::Delete, None, 0, false));
+    } else {
+        for mailbox in mailboxes {
+            let selected = selected_mailbox == Some(&mailbox.id);
+            list = list.push(mailbox_row(
+                &mailbox.name,
+                role_icon(&mailbox.role),
+                Some(&mailbox.id),
+                mailbox.unread_count,
+                selected,
+            ));
+        }
     }
 
     list.into()

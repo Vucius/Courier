@@ -74,6 +74,7 @@ pub enum Message {
     OpenThreadContext(ThreadId),
     OpenSelectedThreadContext,
     CloseThreadContext,
+    ToggleShortcutsHelp,
     UiTick,
 }
 
@@ -113,6 +114,7 @@ pub struct App {
     transition_label: String,
     transition_ticks_remaining: u8,
     account_setup_visible: bool,
+    shortcuts_help_visible: bool,
     editing_account_id: Option<AccountId>,
     account_email: String,
     account_imap_host: String,
@@ -166,6 +168,7 @@ pub fn init() -> (App, Task<Message>) {
         transition_label: String::new(),
         transition_ticks_remaining: 0,
         account_setup_visible: false,
+        shortcuts_help_visible: false,
         editing_account_id: None,
         account_email: String::new(),
         account_imap_host: String::new(),
@@ -259,6 +262,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = "Reading view ready".to_string();
             Task::none()
         }
+        Message::ToggleShortcutsHelp => {
+            app.shortcuts_help_visible = !app.shortcuts_help_visible;
+            app.account_setup_visible = false;
+            app.context_thread = None;
+            start_view_transition(
+                app,
+                if app.shortcuts_help_visible { "Shortcuts help" } else { "Reader" },
+            );
+            Task::none()
+        }
         Message::ReplyInline => {
             if let Some(body) = app.selected_body.as_ref() {
                 let reply_to = body.from.clone();
@@ -283,7 +296,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::CancelActivePanel => {
-            if app.account_setup_visible {
+            if app.shortcuts_help_visible {
+                app.shortcuts_help_visible = false;
+                start_view_transition(app, "Reader");
+                app.status = "Shortcuts help closed".to_string();
+            } else if app.account_setup_visible {
                 app.account_setup_visible = false;
                 start_view_transition(app, "Reader");
                 app.status = "Account panel closed".to_string();
@@ -883,7 +900,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         app.selected_thread.as_ref(),
         &app.selected_mailbox_name,
     );
-    let mut reader = if app.account_setup_visible {
+    let mut reader = if app.shortcuts_help_visible {
+        shortcuts_help_modal()
+    } else if app.account_setup_visible {
         column![crate::views::account_setup::view(
             crate::views::account_setup::AccountSetupViewState {
                 accounts: &app.accounts,
@@ -1001,7 +1020,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let mut thread_column = column![crate::components::search::view(&app.search_query)]
         .spacing(crate::theme::SPACE_SM)
-        .padding(crate::theme::SPACE_SM);
+        .padding(crate::theme::SPACE_SM)
+        .height(Length::Fill);
     if let Some(context_thread) = app.context_thread.as_ref() {
         thread_column = thread_column.push(thread_context_menu(app, context_thread));
     }
@@ -1120,14 +1140,10 @@ fn sidebar_summary(app: &App) -> Element<'_, Message> {
 }
 
 fn shortcut_hint(app: &App) -> &'static str {
-    if app.account_setup_visible {
-        "Esc close panel"
-    } else if app.view_mode == ViewMode::Compose {
-        "Esc reader · Send queues after undo window"
-    } else if app.context_thread.is_some() {
-        "R reply · D trash · Esc close actions"
+    if app.shortcuts_help_visible {
+        "Press Esc or click Close to return"
     } else {
-        "J/K move · R reply · M actions · D trash · Esc close"
+        "Press ? for keyboard shortcuts"
     }
 }
 
@@ -1687,6 +1703,7 @@ fn keyboard_shortcut(key: Key, modifiers: Modifiers) -> Option<Message> {
         Key::Character("m") => Some(Message::OpenSelectedThreadContext),
         Key::Character("r") => Some(Message::ReplyInline),
         Key::Character("d") | Key::Named(key::Named::Delete) => Some(Message::TrashSelected),
+        Key::Character("?") => Some(Message::ToggleShortcutsHelp),
         Key::Named(key::Named::Escape) => Some(Message::CancelActivePanel),
         _ => None,
     }
@@ -1890,4 +1907,67 @@ fn default_data_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".courier")
+}
+
+fn shortcuts_help_modal<'a>() -> Element<'a, Message> {
+    container(
+        column![
+            row![
+                text("Keyboard Shortcuts").size(crate::theme::FONT_TITLE).color(crate::theme::TEXT),
+                iced::widget::horizontal_space(),
+                crate::components::action_bar::button_text_with_icon(
+                    "Close",
+                    Icon::Delete,
+                    crate::theme::TEXT_MUTED,
+                    Message::ToggleShortcutsHelp,
+                ),
+            ]
+            .align_y(iced::Alignment::Center),
+            crate::components::surface::divider(),
+            column![
+                shortcut_row("J / Arrow Down", "Move to next message"),
+                shortcut_row("K / Arrow Up", "Move to previous message"),
+                shortcut_row("R", "Reply to current message inline"),
+                shortcut_row("D / Delete", "Move current message to trash"),
+                shortcut_row("M", "Open context actions menu"),
+                shortcut_row("Esc", "Close active panels, dialogs, or compose"),
+                shortcut_row("?", "Toggle this shortcuts help dialog"),
+            ]
+            .spacing(12),
+        ]
+        .spacing(16)
+        .padding(24)
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+        border: iced::Border {
+            width: 1.0,
+            radius: crate::theme::RADIUS_LG.into(),
+            color: crate::theme::BORDER,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn shortcut_row<'a>(key: &'static str, description: &'static str) -> Element<'a, Message> {
+    row![
+        container(text(key).size(12).font(iced::Font::MONOSPACE).color(crate::theme::TEXT))
+            .padding([4, 8])
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(crate::theme::SURFACE)),
+                border: iced::Border {
+                    width: 1.0,
+                    radius: crate::theme::RADIUS_SM.into(),
+                    color: crate::theme::BORDER,
+                },
+                ..container::Style::default()
+            }),
+        text(description).size(13).color(crate::theme::TEXT_MUTED),
+    ]
+    .spacing(12)
+    .align_y(iced::Alignment::Center)
+    .into()
 }

@@ -96,7 +96,7 @@ pub fn row_frame<'a>(
         row![
             container(text(""))
                 .width(Length::Fixed(3.0))
-                .height(Length::Fill)
+                .height(Length::Fixed(18.0))
                 .style(move |_| container::Style {
                     background: Some(Background::Color(accent)),
                     border: Border {
@@ -108,10 +108,12 @@ pub fn row_frame<'a>(
                 }),
             content.into(),
         ]
+        .spacing(crate::theme::SPACE_SM)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .height(Length::Shrink)
+    .height(Length::Fixed(34.0))
+    .padding([0, 8])
     .style(move |_| container::Style {
         border: Border {
             width: 0.0,
