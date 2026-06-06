@@ -10,6 +10,7 @@ pub fn view<'a>(
     subject: &'a str,
     body: &'a str,
     send_queue: &'a [SendQueueItem],
+    network_online: bool,
 ) -> Element<'a, Message> {
     container({
         let mut content = column![
@@ -17,7 +18,10 @@ pub fn view<'a>(
                 "Compose",
                 row![
                     crate::components::action_bar::button_text("Close", Message::CloseCompose),
-                    crate::components::action_bar::button_primary("Send", Message::SendDraft),
+                    crate::components::action_bar::button_primary(
+                        if network_online { "Send" } else { "Save to Outbox" },
+                        Message::SendDraft
+                    ),
                 ]
                 .spacing(crate::theme::SPACE_SM),
             ),

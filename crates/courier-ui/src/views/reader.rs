@@ -21,6 +21,8 @@ pub struct ReaderViewState<'a> {
     pub draft_to: &'a str,
     pub draft_subject: &'a str,
     pub draft_body: &'a str,
+    pub account_display: Option<String>,
+    pub network_online: bool,
 }
 
 pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
@@ -31,6 +33,14 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
             } else {
                 body.to.join(", ")
             };
+            let mut metadata = vec![
+                ("From", body.from.clone()),
+                ("To", recipients),
+            ];
+            if let Some(account) = &state.account_display {
+                metadata.push(("Account", account.clone()));
+            }
+
             let rendered_body = render_tree_view(state.render_tree, &body.body, &body.attachments);
             let mut content = column![
                 crate::components::surface::header(
@@ -40,10 +50,7 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
                 crate::components::surface::divider(),
                 row![
                     crate::components::avatar::view(&body.from, false),
-                    crate::components::list::metadata_rows(vec![
-                        ("From", body.from.clone()),
-                        ("To", recipients),
-                    ]),
+                    crate::components::list::metadata_rows(metadata),
                 ]
                 .spacing(10)
                 .padding(12),
@@ -94,7 +101,11 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
                         .color(crate::theme::TEXT_MUTED),
                     row![
                         crate::components::action_bar::button_primary("Compose new email", Message::Compose),
-                        crate::components::action_bar::button_toolbar("Sync inbox", Message::SyncNow),
+                        if state.network_online {
+                            crate::components::action_bar::button_toolbar("Sync inbox", Message::SyncNow)
+                        } else {
+                            crate::components::action_bar::button_toolbar("Reconnect to sync", Message::ReconnectRequested)
+                        },
                     ]
                     .spacing(10)
                     .align_y(iced::Alignment::Center),

@@ -19,6 +19,7 @@ pub fn count(count: u32) -> Element<'static, Message> {
         .into()
 }
 
+#[allow(dead_code)]
 pub fn pill<'a>(label: &'a str) -> Element<'a, Message> {
     container(text(label).size(11).color(crate::theme::TEXT_MUTED))
         .padding([3, 8])

@@ -46,12 +46,16 @@ pub enum Message {
     DownloadAttachment(AttachmentId),
     CancelAttachmentDownload(AttachmentId),
     RetryAttachmentDownload(AttachmentId),
+    #[allow(dead_code)]
     SetNetworkOnline(bool),
     ProbeNetwork,
+    #[allow(dead_code)]
     SetNotificationsQuiet(bool),
+    #[allow(dead_code)]
     SetNotificationsQuietFor(i64),
     DismissAttachmentNotice,
     ClearNotifications,
+    #[allow(dead_code)]
     ResolveConflict(MessageId, ConflictResolution),
     AccountEmailChanged(String),
     AccountImapHostChanged(String),
@@ -76,12 +80,22 @@ pub enum Message {
     CloseThreadContext,
     ToggleShortcutsHelp,
     UiTick,
+    EventOccurred(iced::Event),
+    ShowNarrowList,
+    ReconnectRequested,
+    WorkOfflineRequested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Reader,
     Compose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrowPaneView {
+    List,
+    Detail,
 }
 
 pub struct App {
@@ -126,6 +140,8 @@ pub struct App {
     identity_email: String,
     account_connection_status: String,
     status: String,
+    pub window_size: iced::Size,
+    pub narrow_pane_view: NarrowPaneView,
 }
 
 pub fn init() -> (App, Task<Message>) {
@@ -180,6 +196,8 @@ pub fn init() -> (App, Task<Message>) {
         identity_email: String::new(),
         account_connection_status: String::new(),
         status: "Ready · Last synced just now".to_string(),
+        window_size: iced::Size::new(1280.0, 800.0),
+        narrow_pane_view: NarrowPaneView::List,
     };
 
     (app, Task::none())
@@ -214,6 +232,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.attachment_preview = None;
             app.attachment_open = None;
             app.selected_thread = None;
+            app.narrow_pane_view = NarrowPaneView::List;
             app.view_mode = ViewMode::Reader;
             app.inline_reply_open = false;
             app.context_thread = None;
@@ -411,6 +430,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SelectThread(thread_id) => {
             app.account_setup_visible = false;
             app.selected_thread = Some(thread_id.clone());
+            app.narrow_pane_view = NarrowPaneView::Detail;
             app.view_mode = ViewMode::Reader;
             app.inline_reply_open = false;
             app.context_thread = None;
@@ -860,6 +880,43 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.transition_ticks_remaining = app.transition_ticks_remaining.saturating_sub(1);
             Task::none()
         }
+        Message::EventOccurred(event) => {
+            if let iced::Event::Window(iced::window::Event::Resized(size)) = event {
+                app.window_size = iced::Size::new(size.width, size.height);
+            }
+            Task::none()
+        }
+        Message::ShowNarrowList => {
+            app.narrow_pane_view = NarrowPaneView::List;
+            Task::none()
+        }
+        Message::ReconnectRequested => {
+            let engine = app.engine.clone();
+            let account_ids = enabled_account_ids(app);
+            app.network_online = true;
+            app.status = "Network sends and sync enabled".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::SetNetworkOnline(true)).await;
+                    let _ = engine.send(EngineCommand::RunDueSendQueue).await;
+                    for account_id in account_ids {
+                        let _ = engine.send(EngineCommand::SyncNow(account_id)).await;
+                    }
+                },
+                |_| Message::SyncQueued,
+            )
+        }
+        Message::WorkOfflineRequested => {
+            let engine = app.engine.clone();
+            app.network_online = false;
+            app.status = "Network sends and sync paused".to_string();
+            Task::perform(
+                async move {
+                    let _ = engine.send(EngineCommand::SetNetworkOnline(false)).await;
+                },
+                |_| Message::SyncQueued,
+            )
+        }
     }
 }
 
@@ -885,6 +942,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         engine_events,
         iced::keyboard::on_key_press(keyboard_shortcut),
         iced::time::every(Duration::from_secs(60)).map(|_| Message::ProbeNetwork),
+        iced::event::listen().map(Message::EventOccurred),
     ];
     if app.transition_ticks_remaining > 0 {
         subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::UiTick));
@@ -930,6 +988,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             &app.draft_subject,
             &app.draft_body,
             &app.send_queue,
+            app.network_online,
         )]
         .height(Length::Fill)
         .spacing(0)
@@ -938,16 +997,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
         let mut reader_stack = column![reader_action_bar(app)]
             .height(Length::Fill)
             .spacing(10);
-        if !app.conflicts.is_empty() {
-            reader_stack = reader_stack.push(conflicts_view(&app.conflicts));
-        }
-        if !app.notifications.is_empty() {
-            reader_stack = reader_stack.push(notifications_view(
-                &app.notifications,
-                app.unread_notifications,
-                &app.notification_policy,
-            ));
-        }
+        let account_display = app.selected_thread.as_ref()
+            .and_then(|thread_id| app.threads.iter().find(|t| t.id == *thread_id))
+            .and_then(|thread| app.accounts.iter().find(|a| a.id == thread.account_id))
+            .map(|account| account.email.clone());
+
         reader_stack = reader_stack.push(crate::views::reader::view(
             crate::views::reader::ReaderViewState {
                 body: app.selected_body.as_ref(),
@@ -959,6 +1013,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 draft_to: &app.draft_to,
                 draft_subject: &app.draft_subject,
                 draft_body: &app.draft_body,
+                account_display,
+                network_online: app.network_online,
             },
         ));
         reader_stack.into()
@@ -977,77 +1033,26 @@ pub fn view(app: &App) -> Element<'_, Message> {
             "Courier",
             row![
                 button(
-                    row![
-                        Icon::Sync.view_styled(14.0, crate::theme::TEXT_MUTED),
-                        text("Sync").size(12).color(crate::theme::TEXT_MUTED)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-                )
-                .padding(4)
-                .style(button::text)
-                .on_press(Message::SyncNow),
-                button(
-                    row![
-                        Icon::Compose.view_styled(14.0, crate::theme::TEXT_MUTED),
-                        text("Compose").size(12).color(crate::theme::TEXT_MUTED)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-                )
-                .padding(4)
-                .style(button::text)
-                .on_press(Message::Compose),
-                button(
-                    row![
-                        Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED),
-                        text("Settings").size(12).color(crate::theme::TEXT_MUTED)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
+                    Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED)
                 )
                 .padding(4)
                 .style(button::text)
                 .on_press(Message::AddAccount),
             ]
-            .spacing(8)
             .align_y(iced::Alignment::Center)
         ),
+        button(row![
+            Icon::Compose.view_styled(16.0, iced::Color::WHITE),
+            text("Compose new email").size(14).color(iced::Color::WHITE)
+        ].spacing(8).align_y(iced::Alignment::Center))
+        .width(Length::Fill)
+        .padding(10)
+        .style(iced::widget::button::primary)
+        .on_press(Message::Compose),
         sidebar_accounts(app),
         crate::components::surface::divider(),
         mailboxes,
         iced::widget::vertical_space(),
-        crate::components::surface::divider(),
-        crate::components::list::section_label("SNOOZE NOTIFICATIONS"),
-        notification_sidebar_controls(app),
-        crate::components::surface::divider(),
-        crate::components::list::section_label("CONNECTION"),
-        row![
-            text(if app.network_online {
-                "Status: Online"
-            } else {
-                "Status: Offline"
-            })
-            .size(12)
-            .color(crate::theme::TEXT_MUTED)
-            .width(Length::Fill),
-            crate::components::action_bar::button_toolbar_with_icon(
-                if app.network_online {
-                    "Work Offline"
-                } else {
-                    "Go Online"
-                },
-                if app.network_online {
-                    Icon::WifiOff
-                } else {
-                    Icon::Wifi
-                },
-                crate::theme::TEXT_MUTED,
-                Message::SetNetworkOnline(!app.network_online),
-            ),
-        ]
-        .align_y(iced::Alignment::Center)
-        .spacing(crate::theme::SPACE_SM),
     ]
     .spacing(crate::theme::SPACE_SM)
     .padding(crate::theme::SPACE_SM);
@@ -1061,20 +1066,65 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     thread_column = thread_column.push(threads);
 
-    let content = row![
-        crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
-        crate::components::surface::pane(thread_column)
-            .width(Length::Fixed(crate::theme::THREAD_LIST_WIDTH)),
-        crate::components::surface::pane(reader).width(Length::Fill),
-    ]
+    let content = if app.window_size.width > 1200.0 {
+        row![
+            crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+            crate::components::surface::pane(thread_column)
+                .width(Length::Fixed(crate::theme::THREAD_LIST_WIDTH)),
+            crate::components::surface::pane(reader).width(Length::Fill),
+        ]
+    } else {
+        if app.narrow_pane_view == NarrowPaneView::List {
+            row![
+                crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+                crate::components::surface::pane(thread_column).width(Length::Fill),
+            ]
+        } else {
+            row![
+                crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+                crate::components::surface::pane(reader).width(Length::Fill),
+            ]
+        }
+    }
     .height(Length::Fill)
     .spacing(crate::theme::SPACE_SM);
 
+    let mut main_col = column![];
+    
+    if !app.network_online {
+        main_col = main_col.push(
+            container(
+                row![
+                    Icon::Warning.view_styled(16.0, crate::theme::DANGER),
+                    text("Working Offline").size(13).color(crate::theme::TEXT),
+                    iced::widget::horizontal_space(),
+                    crate::components::action_bar::button_text("Reconnect", Message::ReconnectRequested)
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(8)
+            )
+            .padding(8)
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+                border: iced::Border {
+                    width: 1.0,
+                    radius: 4.0.into(),
+                    color: crate::theme::WARNING,
+                },
+                ..container::Style::default()
+            })
+        );
+    }
+    
+    if !app.conflicts.is_empty() || !app.notifications.is_empty() {
+        main_col = main_col.push(global_banners_view(app));
+    }
+
+    main_col = main_col.push(content).push(crate::components::status_bar::view(&app.status, shortcut_hint(app)));
+
     crate::components::surface::app_background(
-        column![
-            content,
-            crate::components::status_bar::view(&app.status, shortcut_hint(app))
-        ]
+        main_col
         .spacing(crate::theme::SPACE_SM)
         .padding(crate::theme::APP_PADDING),
     )
@@ -1173,6 +1223,18 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
 
             let provider_lbl = provider_name(&account.provider);
 
+            let network_action = if account.enabled && app.network_online {
+                button(text("Work offline").size(10).color(crate::theme::TEXT_MUTED))
+                    .style(button::text)
+                    .on_press(Message::WorkOfflineRequested)
+            } else if account.enabled {
+                button(text("Reconnect").size(10).color(crate::theme::ACCENT))
+                    .style(button::text)
+                    .on_press(Message::ReconnectRequested)
+            } else {
+                button(text("").size(10)).style(button::text)
+            };
+
             let account_card = container(
                 column![
                     row![
@@ -1187,21 +1249,21 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
                         .spacing(2)
                         .width(Length::Fill),
                         button(
-                            row![
-                                Icon::Settings.view_styled(12.0, crate::theme::ACCENT),
-                                text("Manage").size(11).color(crate::theme::ACCENT)
-                            ]
-                            .spacing(4)
-                            .align_y(iced::Alignment::Center)
+                            Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED)
                         )
                         .padding(4)
                         .style(button::text)
                         .on_press(Message::EditAccount(account.id.clone())),
                     ]
                     .align_y(iced::Alignment::Center),
-                    text(status_text)
-                        .size(11)
-                        .color(status_color),
+                    row![
+                        text(status_text)
+                            .size(11)
+                            .color(status_color),
+                        iced::widget::horizontal_space(),
+                        network_action,
+                    ]
+                    .align_y(iced::Alignment::Center),
                 ]
                 .spacing(4)
             )
@@ -1300,8 +1362,19 @@ fn reader_action_bar(app: &App) -> Element<'_, Message> {
         .map(|body| body.subject.as_str())
         .unwrap_or("Message");
 
+    let mut left_content = row![].spacing(crate::theme::SPACE_SM).align_y(iced::Alignment::Center);
+    if app.window_size.width <= 1200.0 && app.narrow_pane_view == NarrowPaneView::Detail {
+        left_content = left_content.push(
+            crate::components::action_bar::button_text(
+                "❮ Back",
+                Message::ShowNarrowList
+            )
+        );
+    }
+    left_content = left_content.push(text(title).size(13).color(crate::theme::TEXT));
+
     let mut bar = row![
-        text(title).size(13).color(crate::theme::TEXT),
+        left_content,
         iced::widget::horizontal_space(),
         actions,
     ]
@@ -1362,6 +1435,74 @@ fn thread_context_menu<'a>(app: &'a App, thread_id: &'a ThreadId) -> Element<'a,
     .into()
 }
 
+fn global_banners_view(app: &App) -> Element<'_, Message> {
+    let mut banner_row = row![].spacing(16).align_y(iced::Alignment::Center);
+    
+    if !app.conflicts.is_empty() {
+        let text_lbl = if app.conflicts.len() == 1 {
+            "1 sync conflict".to_string()
+        } else {
+            format!("{} sync conflicts", app.conflicts.len())
+        };
+        banner_row = banner_row.push(
+            row![
+                Icon::Warning.view_styled(16.0, crate::theme::WARNING),
+                text(text_lbl).size(13).color(crate::theme::TEXT),
+                crate::components::action_bar::button_text("Resolve", Message::SyncQueued) // In a real app we'd open a modal
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        );
+    }
+    
+    if !app.notifications.is_empty() {
+        let unread_errors = app.notifications.iter().filter(|n| n.kind == NotificationKind::Error).count();
+        if unread_errors > 0 {
+            let text_lbl = if unread_errors == 1 {
+                "1 error".to_string()
+            } else {
+                format!("{} errors", unread_errors)
+            };
+            banner_row = banner_row.push(
+                row![
+                    Icon::Error.view_styled(16.0, crate::theme::DANGER),
+                    text(text_lbl).size(13).color(crate::theme::TEXT),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+            );
+        } else {
+            let unread_count = app.unread_notifications;
+            if unread_count > 0 {
+                banner_row = banner_row.push(
+                    row![
+                        Icon::Bell.view_styled(16.0, crate::theme::ACCENT),
+                        text(format!("{} notifications", unread_count)).size(13).color(crate::theme::TEXT),
+                        crate::components::action_bar::button_text("Clear", Message::ClearNotifications)
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                );
+            }
+        }
+    }
+    
+    container(banner_row)
+        .padding(8)
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+            border: iced::Border {
+                width: 1.0,
+                radius: 4.0.into(),
+                color: crate::theme::BORDER,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+#[allow(dead_code)]
 fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> {
     let mut content = column![
         row![
@@ -1430,6 +1571,7 @@ fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> 
         .into()
 }
 
+#[allow(dead_code)]
 fn notification_sidebar_controls(app: &App) -> Element<'_, Message> {
     if app.notification_policy.quiet {
         return crate::components::action_bar::button_toolbar_with_icon(
@@ -1486,6 +1628,7 @@ fn quiet_duration_label(seconds: i64) -> String {
 
 
 
+#[allow(dead_code)]
 fn notifications_view<'a>(
     notifications: &'a [DesktopNotification],
     unread: u32,
@@ -1559,6 +1702,7 @@ fn notifications_view<'a>(
         .into()
 }
 
+#[allow(dead_code)]
 fn notification_kind_label(kind: &NotificationKind) -> &'static str {
     match kind {
         NotificationKind::NewMail => "MAIL",

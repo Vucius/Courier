@@ -12,6 +12,10 @@ fn main() -> iced::Result {
         .init();
 
     iced::application("Courier", app::update, app::view)
+        .window(iced::window::Settings {
+            size: iced::Size::new(1280.0, 800.0),
+            ..Default::default()
+        })
         .theme(app::theme)
         .subscription(app::subscription)
         .run_with(app::init)
