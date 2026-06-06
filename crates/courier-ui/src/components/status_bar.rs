@@ -17,21 +17,26 @@ pub fn view<'a>(status: &'a str, hint: &'a str) -> Element<'a, Message> {
     let category_prefix = match kind {
         NoticeKind::Info => "INFO",
         NoticeKind::Warning => "WARN",
-        NoticeKind::Success => "OK",
+        NoticeKind::Success => {
+            if status.to_ascii_lowercase().starts_with("ready") {
+                ""
+            } else {
+                "OK"
+            }
+        }
         NoticeKind::Error => "ERR",
     };
 
-    container(
-        row![
-            text(category_prefix).size(11).color(accent),
-            text(status).size(12).color(crate::theme::TEXT_MUTED),
-            iced::widget::horizontal_space(),
-            text(hint).size(11).color(crate::theme::TEXT_MUTED),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .padding([5, 8])
+    let mut status_row = row![].spacing(8).align_y(Alignment::Center);
+    if !category_prefix.is_empty() {
+        status_row = status_row.push(text(category_prefix).size(11).color(accent));
+    }
+    status_row = status_row.push(text(status).size(12).color(crate::theme::TEXT_MUTED));
+    status_row = status_row.push(iced::widget::horizontal_space());
+    status_row = status_row.push(text(hint).size(11).color(crate::theme::TEXT_MUTED));
+
+    container(status_row)
+        .padding([5, 8])
     .style(move |_| container::Style {
         background: Some(Background::Color(crate::theme::SURFACE)),
         border: Border {

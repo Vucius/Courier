@@ -85,13 +85,19 @@ fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Mess
         crate::theme::TEXT_MUTED
     };
 
+    let display_account = if thread.account_id.0 == "local-demo" {
+        "you@example.test"
+    } else {
+        &thread.account_id.0
+    };
+
     let content = column![
         row![
             text(&thread.sender)
                 .size(13)
                 .color(crate::theme::TEXT)
                 .font(sender_font),
-            text(format!("· {}", thread.account_id.0))
+            text(format!("· {}", display_account))
                 .size(11)
                 .color(crate::theme::TEXT_MUTED),
             iced::widget::horizontal_space(),

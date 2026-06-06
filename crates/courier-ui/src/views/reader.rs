@@ -79,6 +79,18 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
             container(content).height(Length::FillPortion(3)).into()
         }
         None => {
+            let mut action_row = row![
+                crate::components::action_bar::button_primary("Compose new email", Message::Compose),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+
+            if !state.network_online {
+                action_row = action_row.push(
+                    crate::components::action_bar::button_toolbar("Reconnect to sync", Message::ReconnectRequested)
+                );
+            }
+
             container(
                 column![
                     container(Icon::Inbox.view_styled(24.0, crate::theme::ACCENT))
@@ -99,16 +111,7 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
                     text("Select an email from the list to read, reply, archive, or delete it.")
                         .size(13)
                         .color(crate::theme::TEXT_MUTED),
-                    row![
-                        crate::components::action_bar::button_primary("Compose new email", Message::Compose),
-                        if state.network_online {
-                            crate::components::action_bar::button_toolbar("Sync inbox", Message::SyncNow)
-                        } else {
-                            crate::components::action_bar::button_toolbar("Reconnect to sync", Message::ReconnectRequested)
-                        },
-                    ]
-                    .spacing(10)
-                    .align_y(iced::Alignment::Center),
+                    action_row,
                 ]
                 .align_x(iced::Alignment::Center)
                 .spacing(12),

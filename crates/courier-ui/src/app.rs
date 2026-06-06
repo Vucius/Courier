@@ -1049,6 +1049,30 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .padding(10)
         .style(iced::widget::button::primary)
         .on_press(Message::Compose),
+        button(row![
+            Icon::Sync.view_styled(16.0, crate::theme::TEXT),
+            text("Sync all").size(14).color(crate::theme::TEXT)
+        ].spacing(8).align_y(iced::Alignment::Center))
+        .width(Length::Fill)
+        .padding(10)
+        .on_press(Message::SyncNow)
+        .style(|_, status| {
+            let bg = match status {
+                button::Status::Hovered => crate::theme::SURFACE_HOVER,
+                button::Status::Pressed => crate::theme::ROW_SELECTED,
+                _ => crate::theme::SURFACE,
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                text_color: crate::theme::TEXT,
+                border: iced::Border {
+                    color: crate::theme::BORDER,
+                    width: 1.0,
+                    radius: crate::theme::RADIUS_MD.into(),
+                },
+                shadow: iced::Shadow::default(),
+            }
+        }),
         sidebar_accounts(app),
         crate::components::surface::divider(),
         mailboxes,
@@ -1224,16 +1248,41 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
             let provider_lbl = provider_name(&account.provider);
 
             let network_action = if account.enabled && app.network_online {
-                button(text("Work offline").size(10).color(crate::theme::TEXT_MUTED))
-                    .style(button::text)
-                    .on_press(Message::WorkOfflineRequested)
+                button(
+                    row![
+                        Icon::WifiOff.view_styled(12.0, crate::theme::TEXT_MUTED),
+                        text("Work offline").size(11).color(crate::theme::TEXT_MUTED)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                )
+                .style(button::text)
+                .on_press(Message::WorkOfflineRequested)
             } else if account.enabled {
-                button(text("Reconnect").size(10).color(crate::theme::ACCENT))
-                    .style(button::text)
-                    .on_press(Message::ReconnectRequested)
+                button(
+                    row![
+                        Icon::Wifi.view_styled(12.0, crate::theme::ACCENT),
+                        text("Reconnect").size(11).color(crate::theme::ACCENT)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                )
+                .style(button::text)
+                .on_press(Message::ReconnectRequested)
             } else {
-                button(text("").size(10)).style(button::text)
+                button(text("").size(11)).style(button::text)
             };
+
+            let manage_btn = button(
+                row![
+                    Icon::Settings.view_styled(12.0, crate::theme::ACCENT),
+                    text("Manage account").size(11).color(crate::theme::ACCENT)
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+            )
+            .style(button::text)
+            .on_press(Message::EditAccount(account.id.clone()));
 
             let account_card = container(
                 column![
@@ -1260,12 +1309,17 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
                         text(status_text)
                             .size(11)
                             .color(status_color),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    crate::components::surface::divider(),
+                    row![
+                        manage_btn,
                         iced::widget::horizontal_space(),
                         network_action,
                     ]
                     .align_y(iced::Alignment::Center),
                 ]
-                .spacing(4)
+                .spacing(6)
             )
             .padding(crate::theme::SPACE_SM)
             .width(Length::Fill)
@@ -1283,14 +1337,52 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
         }
     }
 
-    col = col.push(
-        crate::components::action_bar::button_toolbar_with_icon(
-            "Add account",
-            Icon::AccountAdd,
-            crate::theme::TEXT_MUTED,
-            Message::AddAccount,
-        )
-    );
+    let add_account_btn = button(
+        row![
+            Icon::AccountAdd.view_styled(14.0, crate::theme::ACCENT),
+            text("+ Add account").size(13).color(crate::theme::ACCENT)
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+    )
+    .width(Length::Fill)
+    .padding([8, 12])
+    .on_press(Message::AddAccount)
+    .style(|_, status| {
+        let bg_color = match status {
+            button::Status::Hovered => iced::Color {
+                r: crate::theme::ACCENT_MUTED.r,
+                g: crate::theme::ACCENT_MUTED.g,
+                b: crate::theme::ACCENT_MUTED.b,
+                a: 0.25,
+            },
+            button::Status::Pressed => iced::Color {
+                r: crate::theme::ACCENT_MUTED.r,
+                g: crate::theme::ACCENT_MUTED.g,
+                b: crate::theme::ACCENT_MUTED.b,
+                a: 0.35,
+            },
+            _ => iced::Color {
+                r: crate::theme::ACCENT_MUTED.r,
+                g: crate::theme::ACCENT_MUTED.g,
+                b: crate::theme::ACCENT_MUTED.b,
+                a: 0.15,
+            },
+        };
+
+        button::Style {
+            background: Some(iced::Background::Color(bg_color)),
+            text_color: crate::theme::ACCENT,
+            border: iced::Border {
+                color: crate::theme::ACCENT,
+                width: 1.0,
+                radius: crate::theme::RADIUS_MD.into(),
+            },
+            shadow: iced::Shadow::default(),
+        }
+    });
+
+    col = col.push(add_account_btn);
 
     col.into()
 }

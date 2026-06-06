@@ -1,7 +1,7 @@
 use iced::Color;
 
 pub const APP_PADDING: u16 = 10;
-pub const SIDEBAR_WIDTH: f32 = 224.0;
+pub const SIDEBAR_WIDTH: f32 = 260.0;
 pub const THREAD_LIST_WIDTH: f32 = 336.0;
 
 pub const SPACE_XS: u16 = 4;
