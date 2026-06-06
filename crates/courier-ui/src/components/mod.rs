@@ -4,8 +4,10 @@ pub mod avatar;
 pub mod badge;
 pub mod empty_state;
 pub mod form;
+pub mod icon;
 pub mod list;
 pub mod notice;
 pub mod search;
 pub mod status_bar;
 pub mod surface;
+

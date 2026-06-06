@@ -1,12 +1,13 @@
-use iced::widget::{container, row, text, text_input};
+use iced::widget::{container, row, text_input};
 use iced::{Alignment, Background, Border, Element, Length};
 
 use crate::app::Message;
+use crate::components::icon::Icon;
 
 pub fn view<'a>(query: &'a str) -> Element<'a, Message> {
     container(
         row![
-            text("Search").size(12).color(crate::theme::TEXT_MUTED),
+            Icon::Search.view_styled(16.0, crate::theme::TEXT_MUTED),
             text_input("Search mail", query)
                 .on_input(Message::SearchChanged)
                 .size(13)
@@ -29,3 +30,4 @@ pub fn view<'a>(query: &'a str) -> Element<'a, Message> {
     .width(Length::Fill)
     .into()
 }
+

@@ -15,6 +15,7 @@ use iced::keyboard::{Key, Modifiers, key};
 use iced::widget::{column, container, progress_bar, row, text};
 use iced::{Element, Length, Subscription, Task, Theme};
 use std::time::Duration;
+use crate::components::icon::Icon;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -948,33 +949,48 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let sidebar = column![
         crate::components::surface::header(
             "Courier",
-            text(if app.network_online {
-                "Online"
-            } else {
-                "Offline"
-            })
-            .size(12)
-            .color(crate::theme::TEXT_MUTED),
+            row![
+                if app.network_online {
+                    Icon::Wifi.view_styled(14.0, crate::theme::SUCCESS)
+                } else {
+                    Icon::WifiOff.view_styled(14.0, crate::theme::DANGER)
+                },
+                text(if app.network_online {
+                    "Online"
+                } else {
+                    "Offline"
+                })
+                .size(12)
+                .color(crate::theme::TEXT_MUTED),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
         ),
         sidebar_summary(app),
         crate::components::list::section_label("PRIMARY"),
-        crate::components::action_bar::button_primary("Compose", Message::Compose),
-        crate::components::action_bar::button_toolbar(add_account_label(), Message::AddAccount),
+        crate::components::action_bar::button_primary_with_icon("Compose", Icon::Compose, Message::Compose),
+        crate::components::action_bar::button_toolbar_with_icon(add_account_label(), Icon::AccountAdd, crate::theme::TEXT_MUTED, Message::AddAccount),
         crate::components::surface::divider(),
         mailboxes,
         iced::widget::vertical_space(),
         crate::components::surface::divider(),
         crate::components::list::section_label("CONTROLS"),
-        crate::components::action_bar::button_toolbar("Account", Message::AddAccount),
+        crate::components::action_bar::button_toolbar_with_icon("Accounts", Icon::AccountManage, crate::theme::TEXT_MUTED, Message::AddAccount),
         notification_sidebar_controls(app),
         row![
-            crate::components::action_bar::button_toolbar("Sync", Message::SyncNow),
-            crate::components::action_bar::button_toolbar(
+            crate::components::action_bar::button_toolbar_with_icon("Sync", Icon::Sync, crate::theme::TEXT_MUTED, Message::SyncNow),
+            crate::components::action_bar::button_toolbar_with_icon(
                 if app.network_online {
-                    "Offline"
+                    "Go Offline"
                 } else {
-                    "Online"
+                    "Go Online"
                 },
+                if app.network_online {
+                    Icon::WifiOff
+                } else {
+                    Icon::Wifi
+                },
+                crate::theme::TEXT_MUTED,
                 Message::SetNetworkOnline(!app.network_online),
             ),
         ]
@@ -1119,16 +1135,22 @@ fn reader_action_bar(app: &App) -> Element<'_, Message> {
     let mut actions = row![].spacing(crate::theme::SPACE_XS);
     if app.selected_body.is_some() {
         actions = actions
-            .push(crate::components::action_bar::button_text(
+            .push(crate::components::action_bar::button_text_with_icon(
                 "Archive",
+                Icon::Archive,
+                crate::theme::TEXT_MUTED,
                 Message::ArchiveSelected,
             ))
-            .push(crate::components::action_bar::button_text(
+            .push(crate::components::action_bar::button_text_with_icon(
                 "Mark read",
+                Icon::CheckCircle,
+                crate::theme::TEXT_MUTED,
                 Message::MarkReadSelected,
             ))
-            .push(crate::components::action_bar::button_text(
+            .push(crate::components::action_bar::button_text_with_icon(
                 "Trash",
+                Icon::Delete,
+                crate::theme::TEXT_MUTED,
                 Message::TrashSelected,
             ));
     }
@@ -1175,10 +1197,10 @@ fn thread_context_menu<'a>(app: &'a App, thread_id: &'a ThreadId) -> Element<'a,
             .align_y(iced::Alignment::Center),
             text(title).size(13).color(crate::theme::TEXT),
             row![
-                crate::components::action_bar::button_text("Reply", Message::ReplyInline),
-                crate::components::action_bar::button_text("Archive", Message::ArchiveSelected),
-                crate::components::action_bar::button_text("Mark read", Message::MarkReadSelected),
-                crate::components::action_bar::button_text("Trash", Message::TrashSelected),
+                crate::components::action_bar::button_text_with_icon("Reply", Icon::Reply, crate::theme::TEXT_MUTED, Message::ReplyInline),
+                crate::components::action_bar::button_text_with_icon("Archive", Icon::Archive, crate::theme::TEXT_MUTED, Message::ArchiveSelected),
+                crate::components::action_bar::button_text_with_icon("Mark read", Icon::CheckCircle, crate::theme::TEXT_MUTED, Message::MarkReadSelected),
+                crate::components::action_bar::button_text_with_icon("Trash", Icon::Delete, crate::theme::TEXT_MUTED, Message::TrashSelected),
             ]
             .spacing(crate::theme::SPACE_XS),
             text("Keyboard: R reply · D trash · Esc close")
@@ -1271,23 +1293,31 @@ fn conflicts_view<'a>(conflicts: &'a [ConflictSummary]) -> Element<'a, Message> 
 
 fn notification_sidebar_controls(app: &App) -> Element<'_, Message> {
     if app.notification_policy.quiet {
-        return crate::components::action_bar::button_toolbar(
-            "Notify",
+        return crate::components::action_bar::button_toolbar_with_icon(
+            "Unmute",
+            Icon::Bell,
+            crate::theme::TEXT_MUTED,
             Message::SetNotificationsQuiet(false),
         );
     }
 
     row![
-        crate::components::action_bar::button_toolbar(
+        crate::components::action_bar::button_toolbar_with_icon(
             "15m",
+            Icon::BellOff,
+            crate::theme::TEXT_MUTED,
             Message::SetNotificationsQuietFor(900)
         ),
-        crate::components::action_bar::button_toolbar(
+        crate::components::action_bar::button_toolbar_with_icon(
             "1h",
+            Icon::BellOff,
+            crate::theme::TEXT_MUTED,
             Message::SetNotificationsQuietFor(60 * 60)
         ),
-        crate::components::action_bar::button_toolbar(
+        crate::components::action_bar::button_toolbar_with_icon(
             "4h",
+            Icon::BellOff,
+            crate::theme::TEXT_MUTED,
             Message::SetNotificationsQuietFor(4 * 60 * 60)
         ),
     ]

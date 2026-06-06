@@ -9,6 +9,7 @@ use iced::widget::{column, container, progress_bar, row, scrollable, text};
 use iced::{Background, Border, Element, Font, Length};
 
 use crate::app::Message;
+use crate::components::icon::Icon;
 
 pub struct ReaderViewState<'a> {
     pub body: Option<&'a MessageBody>,
@@ -34,7 +35,7 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
             let mut content = column![
                 crate::components::surface::header(
                     &body.subject,
-                    crate::components::action_bar::button_text("Reply", Message::ReplyInline),
+                    crate::components::action_bar::button_primary_with_icon("Reply", Icon::Reply, Message::ReplyInline),
                 ),
                 crate::components::surface::divider(),
                 row![
@@ -83,8 +84,8 @@ fn inline_reply_view<'a>(to: &'a str, subject: &'a str, body: &'a str) -> Elemen
             row![
                 crate::components::list::section_label("Reply"),
                 iced::widget::horizontal_space(),
-                crate::components::action_bar::button_text("Close", Message::CloseInlineReply),
-                crate::components::action_bar::button_primary("Send", Message::SendDraft),
+                crate::components::action_bar::button_text_with_icon("Close", Icon::Delete, crate::theme::TEXT_MUTED, Message::CloseInlineReply),
+                crate::components::action_bar::button_primary_with_icon("Send", Icon::Send, Message::SendDraft),
             ]
             .align_y(iced::Alignment::Center),
             crate::components::form::labeled_input(

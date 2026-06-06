@@ -2,11 +2,12 @@ use iced::widget::{container, row, text};
 use iced::{Alignment, Background, Border, Element, Length};
 
 use crate::app::Message;
+use crate::components::icon::Icon;
 
 pub fn chip<'a>(name: impl Into<String>, detail: impl Into<String>) -> Element<'a, Message> {
     container(
         row![
-            crate::components::badge::role("FILE"),
+            Icon::Paperclip.view_styled(16.0, crate::theme::TEXT_MUTED),
             text(name.into()).size(13).color(crate::theme::TEXT),
             text(detail.into()).size(12).color(crate::theme::TEXT_MUTED),
         ]
@@ -30,7 +31,7 @@ pub fn chip<'a>(name: impl Into<String>, detail: impl Into<String>) -> Element<'
 pub fn image_placeholder<'a>(label: &'a str) -> Element<'a, Message> {
     container(
         row![
-            crate::components::badge::role("IMG"),
+            Icon::Paperclip.view_styled(16.0, crate::theme::TEXT_MUTED),
             text(label).size(12).color(crate::theme::TEXT_MUTED),
         ]
         .spacing(8)
@@ -48,3 +49,4 @@ pub fn image_placeholder<'a>(label: &'a str) -> Element<'a, Message> {
     })
     .into()
 }
+

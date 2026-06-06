@@ -3,6 +3,7 @@ use iced::Element;
 use iced::widget::column;
 
 use crate::app::Message;
+use crate::components::icon::Icon;
 
 pub fn view<'a>(
     mailboxes: &'a [MailboxSummary],
@@ -12,7 +13,7 @@ pub fn view<'a>(
         crate::components::list::section_label("MAILBOXES"),
         mailbox_row(
             "Unified Inbox",
-            "\u{25ce}",
+            Icon::Inbox,
             None,
             0,
             selected_mailbox.is_none(),
@@ -25,7 +26,7 @@ pub fn view<'a>(
         let selected = selected_mailbox == Some(&mailbox.id);
         list = list.push(mailbox_row(
             &mailbox.name,
-            role_code(&mailbox.role),
+            role_icon(&mailbox.role),
             Some(&mailbox.id),
             mailbox.unread_count,
             selected,
@@ -37,7 +38,7 @@ pub fn view<'a>(
 
 fn mailbox_row<'a>(
     name: &'a str,
-    role: &'a str,
+    icon: Icon,
     mailbox_id: Option<&'a MailboxId>,
     unread_count: u32,
     selected: bool,
@@ -48,8 +49,14 @@ fn mailbox_row<'a>(
         Some(crate::components::badge::count(unread_count))
     };
 
+    let icon_color = if selected {
+        crate::theme::ACCENT
+    } else {
+        crate::theme::TEXT_MUTED
+    };
+
     crate::components::list::outline_row(
-        crate::components::badge::role(role),
+        icon.view_styled(16.0, icon_color),
         name,
         trailing,
         selected,
@@ -57,14 +64,15 @@ fn mailbox_row<'a>(
     )
 }
 
-fn role_code(role: &MailboxRole) -> &'static str {
+fn role_icon(role: &MailboxRole) -> Icon {
     match role {
-        MailboxRole::Inbox => "\u{21e3}",
-        MailboxRole::Sent => "\u{2197}",
-        MailboxRole::Drafts => "\u{270e}",
-        MailboxRole::Archive => "\u{25a3}",
-        MailboxRole::Trash => "\u{232b}",
-        MailboxRole::Spam => "!",
-        MailboxRole::Custom => "\u{25a1}",
+        MailboxRole::Inbox => Icon::Inbox,
+        MailboxRole::Sent => Icon::Send,
+        MailboxRole::Drafts => Icon::Drafts,
+        MailboxRole::Archive => Icon::Archive,
+        MailboxRole::Trash => Icon::Delete,
+        MailboxRole::Spam => Icon::Warning,
+        MailboxRole::Custom => Icon::Folder,
     }
 }
+
