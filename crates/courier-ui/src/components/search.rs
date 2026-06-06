@@ -5,6 +5,8 @@ use crate::app::Message;
 use crate::components::icon::Icon;
 
 pub fn view<'a>(query: &'a str) -> Element<'a, Message> {
+    use iced::widget::button;
+
     container(
         row![
             Icon::Search.view_styled(16.0, crate::theme::TEXT_MUTED),
@@ -13,6 +15,17 @@ pub fn view<'a>(query: &'a str) -> Element<'a, Message> {
                 .size(13)
                 .padding(6)
                 .width(Length::Fill),
+            button(
+                row![
+                    Icon::Filter.view_styled(14.0, crate::theme::TEXT_MUTED),
+                    iced::widget::text("Filter").size(12).color(crate::theme::TEXT_MUTED),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center)
+            )
+            .padding(4)
+            .style(button::text)
+            .on_press(Message::ProbeNetwork),
         ]
         .align_y(Alignment::Center)
         .spacing(8),

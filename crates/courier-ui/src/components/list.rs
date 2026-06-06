@@ -42,6 +42,49 @@ pub fn outline_row<'a>(
         .into()
 }
 
+pub fn message_row_frame<'a>(
+    content: impl Into<Element<'a, Message>>,
+    selected: bool,
+) -> Element<'a, Message> {
+    let accent = if selected {
+        crate::theme::ACCENT
+    } else {
+        iced::Color::TRANSPARENT
+    };
+
+    container(
+        row![
+            container(text(""))
+                .width(Length::Fixed(3.0))
+                .height(Length::Fixed(48.0))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(accent)),
+                    border: Border {
+                        width: 0.0,
+                        radius: crate::theme::RADIUS_SM.into(),
+                        color: iced::Color::TRANSPARENT,
+                    },
+                    ..container::Style::default()
+                }),
+            content.into(),
+        ]
+        .spacing(crate::theme::SPACE_SM)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Shrink)
+    .padding([0, 8])
+    .style(move |_| container::Style {
+        border: Border {
+            width: 0.0,
+            radius: crate::theme::RADIUS_MD.into(),
+            color: iced::Color::TRANSPARENT,
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 pub fn message_row<'a>(
     leading: impl Into<Element<'a, Message>>,
     content: impl Into<Element<'a, Message>>,
@@ -54,7 +97,7 @@ pub fn message_row<'a>(
         .padding(10)
         .width(Length::Fill);
 
-    button(row_frame(row, selected))
+    button(message_row_frame(row, selected))
         .style(move |_, status| row_button_style(selected, status))
         .padding(0)
         .width(Length::Fill)

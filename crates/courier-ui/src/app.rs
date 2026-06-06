@@ -893,7 +893,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let mailboxes =
-        crate::views::mailbox_list::view(&app.mailboxes, app.selected_mailbox_id.as_ref());
+        crate::views::mailbox_list::view(&app.mailboxes, app.selected_mailbox_id.as_ref(), &app.selected_mailbox_name);
     let visible_threads = app.threads.iter().collect::<Vec<_>>();
     let threads = crate::views::thread_list::view(
         &visible_threads,
@@ -921,6 +921,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         )]
         .height(Length::Fill)
         .spacing(10)
+        .into()
     } else if app.view_mode == ViewMode::Compose {
         column![crate::views::composer::view(
             &app.draft_to,
@@ -930,6 +931,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         )]
         .height(Length::Fill)
         .spacing(0)
+        .into()
     } else {
         let mut reader_stack = column![reader_action_bar(app)]
             .height(Length::Fill)
@@ -957,47 +959,45 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 draft_body: &app.draft_body,
             },
         ));
-        reader_stack
+        reader_stack.into()
     };
     if app.transition_ticks_remaining > 0 {
         reader = column![transition_strip(app), reader]
             .height(Length::Fill)
-            .spacing(crate::theme::SPACE_SM);
+            .spacing(crate::theme::SPACE_SM)
+            .into();
     }
+
+    use iced::widget::button;
 
     let sidebar = column![
         crate::components::surface::header(
             "Courier",
             row![
-                if app.network_online {
-                    Icon::Wifi.view_styled(14.0, crate::theme::SUCCESS)
-                } else {
-                    Icon::WifiOff.view_styled(14.0, crate::theme::DANGER)
-                },
-                text(if app.network_online {
-                    "Online"
-                } else {
-                    "Offline"
-                })
-                .size(12)
-                .color(crate::theme::TEXT_MUTED),
+                button(Icon::Sync.view_styled(14.0, crate::theme::TEXT_MUTED))
+                    .padding(4)
+                    .style(button::text)
+                    .on_press(Message::SyncNow),
+                button(Icon::Compose.view_styled(14.0, crate::theme::TEXT_MUTED))
+                    .padding(4)
+                    .style(button::text)
+                    .on_press(Message::Compose),
+                button(Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED))
+                    .padding(4)
+                    .style(button::text)
+                    .on_press(Message::AddAccount),
             ]
-            .spacing(4)
+            .spacing(8)
             .align_y(iced::Alignment::Center)
         ),
-        sidebar_summary(app),
-        crate::components::list::section_label("PRIMARY"),
-        crate::components::action_bar::button_primary_with_icon("Compose", Icon::Compose, Message::Compose),
-        crate::components::action_bar::button_toolbar_with_icon(add_account_label(), Icon::AccountAdd, crate::theme::TEXT_MUTED, Message::AddAccount),
+        sidebar_accounts(app),
         crate::components::surface::divider(),
         mailboxes,
         iced::widget::vertical_space(),
         crate::components::surface::divider(),
         crate::components::list::section_label("CONTROLS"),
-        crate::components::action_bar::button_toolbar_with_icon("Accounts", Icon::AccountManage, crate::theme::TEXT_MUTED, Message::AddAccount),
         notification_sidebar_controls(app),
         row![
-            crate::components::action_bar::button_toolbar_with_icon("Sync", Icon::Sync, crate::theme::TEXT_MUTED, Message::SyncNow),
             crate::components::action_bar::button_toolbar_with_icon(
                 if app.network_online {
                     "Go Offline"
@@ -1051,9 +1051,6 @@ pub fn theme(_app: &App) -> Theme {
     Theme::Light
 }
 
-fn add_account_label() -> &'static str {
-    "\u{6dfb}\u{52a0}\u{8d26}\u{6237}"
-}
 
 fn start_view_transition(app: &mut App, label: &str) {
     app.transition_label = label.to_string();
@@ -1097,46 +1094,102 @@ fn transition_strip(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn sidebar_summary(app: &App) -> Element<'_, Message> {
-    let enabled_accounts = app
-        .accounts
-        .iter()
-        .filter(|account| account.enabled)
-        .count();
-    container(
-        column![
-            row![
-                text(format!("{} account(s)", enabled_accounts))
-                    .size(crate::theme::FONT_CAPTION)
-                    .color(crate::theme::TEXT),
-                iced::widget::horizontal_space(),
-                text(notification_policy_label(&app.notification_policy))
-                    .size(crate::theme::FONT_CAPTION)
-                    .color(if app.notification_policy.quiet {
-                        crate::theme::WARNING
-                    } else {
-                        crate::theme::SUCCESS
-                    }),
-            ]
-            .align_y(iced::Alignment::Center),
-            text("J/K move · R reply · M actions · D trash")
-                .size(crate::theme::FONT_CAPTION)
-                .color(crate::theme::TEXT_MUTED),
-        ]
-        .spacing(crate::theme::SPACE_XS),
-    )
-    .padding(crate::theme::SPACE_SM)
-    .width(Length::Fill)
-    .style(|_| container::Style {
-        background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
-        border: iced::Border {
-            width: 1.0,
-            radius: crate::theme::RADIUS_LG.into(),
-            color: crate::theme::BORDER,
-        },
-        ..container::Style::default()
-    })
-    .into()
+fn provider_name(provider: &ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::GenericImap => "IMAP",
+        ProviderKind::Gmail => "Gmail",
+        ProviderKind::Outlook => "Outlook",
+        ProviderKind::Jmap => "JMAP",
+    }
+}
+
+fn sidebar_accounts(app: &App) -> Element<'_, Message> {
+    use iced::widget::button;
+
+    let mut col = column![
+        crate::components::list::section_label("ACCOUNTS")
+    ]
+    .spacing(crate::theme::SPACE_XS);
+
+    if app.accounts.is_empty() {
+        col = col.push(
+            container(
+                text("No accounts configured")
+                    .size(12)
+                    .color(crate::theme::TEXT_MUTED)
+            )
+            .padding(crate::theme::SPACE_SM)
+            .width(Length::Fill)
+        );
+    } else {
+        for account in &app.accounts {
+            let status_text = if !account.enabled {
+                "Disabled".to_string()
+            } else if !app.network_online {
+                "Offline".to_string()
+            } else {
+                "Online · Synced".to_string()
+            };
+
+            let status_color = if account.enabled && app.network_online {
+                crate::theme::SUCCESS
+            } else {
+                crate::theme::TEXT_MUTED
+            };
+
+            let provider_lbl = provider_name(&account.provider);
+
+            let account_card = container(
+                column![
+                    row![
+                        column![
+                            text(provider_lbl)
+                                .size(11)
+                                .color(crate::theme::TEXT_MUTED),
+                            text(&account.email)
+                                .size(13)
+                                .color(crate::theme::TEXT),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED))
+                            .padding(4)
+                            .style(button::text)
+                            .on_press(Message::EditAccount(account.id.clone())),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    text(status_text)
+                        .size(11)
+                        .color(status_color),
+                ]
+                .spacing(4)
+            )
+            .padding(crate::theme::SPACE_SM)
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(crate::theme::SURFACE_ALT)),
+                border: iced::Border {
+                    width: 1.0,
+                    radius: crate::theme::RADIUS_MD.into(),
+                    color: crate::theme::BORDER,
+                },
+                ..container::Style::default()
+            });
+
+            col = col.push(account_card);
+        }
+    }
+
+    col = col.push(
+        crate::components::action_bar::button_toolbar_with_icon(
+            "Add account",
+            Icon::AccountAdd,
+            crate::theme::TEXT_MUTED,
+            Message::AddAccount,
+        )
+    );
+
+    col.into()
 }
 
 fn shortcut_hint(app: &App) -> &'static str {
@@ -1175,7 +1228,7 @@ fn reader_action_bar(app: &App) -> Element<'_, Message> {
         .selected_body
         .as_ref()
         .map(|body| body.subject.as_str())
-        .unwrap_or("Reading pane");
+        .unwrap_or("Message");
 
     let mut bar = row![
         text(title).size(13).color(crate::theme::TEXT),
@@ -1341,30 +1394,7 @@ fn notification_sidebar_controls(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn notification_policy_label(policy: &NotificationPolicyState) -> String {
-    if policy.quiet {
-        if let Some(until) = policy.quiet_until {
-            return format!("Quiet {}", relative_minutes_label(until));
-        }
 
-        return "Quiet".to_string();
-    }
-
-    "Notify".to_string()
-}
-
-fn relative_minutes_label(unix_until: i64) -> String {
-    let remaining = unix_until
-        .saturating_sub(unix_timestamp())
-        .div_euclid(60)
-        .max(1);
-    if remaining < 60 {
-        format!("{remaining}m")
-    } else {
-        let hours = (remaining + 59) / 60;
-        format!("{hours}h")
-    }
-}
 
 fn quiet_duration_label(seconds: i64) -> String {
     let minutes = (seconds.max(60) + 59) / 60;
@@ -1384,13 +1414,7 @@ fn quiet_duration_label(seconds: i64) -> String {
     }
 }
 
-fn unix_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
-        .min(i64::MAX as u64) as i64
-}
+
 
 fn notifications_view<'a>(
     notifications: &'a [DesktopNotification],
@@ -1533,7 +1557,7 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
         }
         EngineEvent::CredentialStoreChecked(status) => {
             app.status = if status.available {
-                format!("Credential store ready: {}", status.backend)
+                "Ready".to_string()
             } else {
                 status.message
             };

@@ -71,10 +71,40 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
 
             container(content).height(Length::FillPortion(3)).into()
         }
-        None => crate::components::empty_state::view(
-            "Select a message",
-            "Choose a thread to read its message and reply.",
-        ),
+        None => {
+            container(
+                column![
+                    container(text("@").size(24).color(crate::theme::ACCENT))
+                        .width(Length::Fixed(48.0))
+                        .height(Length::Fixed(48.0))
+                        .center_x(Length::Fixed(48.0))
+                        .center_y(Length::Fixed(48.0))
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(crate::theme::ROW_SELECTED)),
+                            border: Border {
+                                width: 1.0,
+                                radius: 24.0.into(),
+                                color: crate::theme::ACCENT_MUTED,
+                            },
+                            ..container::Style::default()
+                        }),
+                    text("No message selected").size(16).color(crate::theme::TEXT),
+                    text("Select an email from the list to read, reply, archive, or delete it.")
+                        .size(13)
+                        .color(crate::theme::TEXT_MUTED),
+                    row![
+                        crate::components::action_bar::button_primary("Compose new email", Message::Compose),
+                        crate::components::action_bar::button_toolbar("Sync inbox", Message::SyncNow),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .align_x(iced::Alignment::Center)
+                .spacing(12),
+            )
+            .center(Length::Fill)
+            .into()
+        }
     }
 }
 
