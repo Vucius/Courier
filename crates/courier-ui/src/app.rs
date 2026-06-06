@@ -179,7 +179,7 @@ pub fn init() -> (App, Task<Message>) {
         identity_name: String::new(),
         identity_email: String::new(),
         account_connection_status: String::new(),
-        status: "Engine starting".to_string(),
+        status: "Ready · Last synced just now".to_string(),
     };
 
     (app, Task::none())
@@ -349,12 +349,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::MarkReadSelected => {
             if app.view_mode == ViewMode::Reader && !app.account_setup_visible {
                 if let Some(body) = app.selected_body.as_ref() {
+                    let is_unread = app.threads.iter().any(|t| t.id == body.thread_id && t.unread);
+                    let target_read = is_unread;
                     let engine = app.engine.clone();
                     let message_id = body.id.clone();
-                    app.status = "Mark read queued".to_string();
+                    app.status = if target_read { "Marking read...".to_string() } else { "Marking unread...".to_string() };
                     Task::perform(
                         async move {
-                            let _ = engine.send(EngineCommand::MarkRead(message_id, true)).await;
+                            let _ = engine.send(EngineCommand::MarkRead(message_id, target_read)).await;
                         },
                         |_| Message::SyncQueued,
                     )
@@ -974,18 +976,39 @@ pub fn view(app: &App) -> Element<'_, Message> {
         crate::components::surface::header(
             "Courier",
             row![
-                button(Icon::Sync.view_styled(14.0, crate::theme::TEXT_MUTED))
-                    .padding(4)
-                    .style(button::text)
-                    .on_press(Message::SyncNow),
-                button(Icon::Compose.view_styled(14.0, crate::theme::TEXT_MUTED))
-                    .padding(4)
-                    .style(button::text)
-                    .on_press(Message::Compose),
-                button(Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED))
-                    .padding(4)
-                    .style(button::text)
-                    .on_press(Message::AddAccount),
+                button(
+                    row![
+                        Icon::Sync.view_styled(14.0, crate::theme::TEXT_MUTED),
+                        text("Sync").size(12).color(crate::theme::TEXT_MUTED)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                )
+                .padding(4)
+                .style(button::text)
+                .on_press(Message::SyncNow),
+                button(
+                    row![
+                        Icon::Compose.view_styled(14.0, crate::theme::TEXT_MUTED),
+                        text("Compose").size(12).color(crate::theme::TEXT_MUTED)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                )
+                .padding(4)
+                .style(button::text)
+                .on_press(Message::Compose),
+                button(
+                    row![
+                        Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED),
+                        text("Settings").size(12).color(crate::theme::TEXT_MUTED)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                )
+                .padding(4)
+                .style(button::text)
+                .on_press(Message::AddAccount),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -995,12 +1018,22 @@ pub fn view(app: &App) -> Element<'_, Message> {
         mailboxes,
         iced::widget::vertical_space(),
         crate::components::surface::divider(),
-        crate::components::list::section_label("CONTROLS"),
+        crate::components::list::section_label("SNOOZE NOTIFICATIONS"),
         notification_sidebar_controls(app),
+        crate::components::surface::divider(),
+        crate::components::list::section_label("CONNECTION"),
         row![
+            text(if app.network_online {
+                "Status: Online"
+            } else {
+                "Status: Offline"
+            })
+            .size(12)
+            .color(crate::theme::TEXT_MUTED)
+            .width(Length::Fill),
             crate::components::action_bar::button_toolbar_with_icon(
                 if app.network_online {
-                    "Go Offline"
+                    "Work Offline"
                 } else {
                     "Go Online"
                 },
@@ -1013,6 +1046,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 Message::SetNetworkOnline(!app.network_online),
             ),
         ]
+        .align_y(iced::Alignment::Center)
         .spacing(crate::theme::SPACE_SM),
     ]
     .spacing(crate::theme::SPACE_SM)
@@ -1128,7 +1162,7 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
             } else if !app.network_online {
                 "Offline".to_string()
             } else {
-                "Online · Synced".to_string()
+                "Online · Synced just now".to_string()
             };
 
             let status_color = if account.enabled && app.network_online {
@@ -1152,10 +1186,17 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
                         ]
                         .spacing(2)
                         .width(Length::Fill),
-                        button(Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED))
-                            .padding(4)
-                            .style(button::text)
-                            .on_press(Message::EditAccount(account.id.clone())),
+                        button(
+                            row![
+                                Icon::Settings.view_styled(12.0, crate::theme::ACCENT),
+                                text("Manage").size(11).color(crate::theme::ACCENT)
+                            ]
+                            .spacing(4)
+                            .align_y(iced::Alignment::Center)
+                        )
+                        .padding(4)
+                        .style(button::text)
+                        .on_press(Message::EditAccount(account.id.clone())),
                     ]
                     .align_y(iced::Alignment::Center),
                     text(status_text)
@@ -1203,7 +1244,30 @@ fn shortcut_hint(app: &App) -> &'static str {
 fn reader_action_bar(app: &App) -> Element<'_, Message> {
     let mut actions = row![].spacing(crate::theme::SPACE_XS);
     if app.selected_body.is_some() {
+        let is_unread = app.selected_body.as_ref().map(|body| {
+            app.threads.iter().any(|t| t.id == body.thread_id && t.unread)
+        }).unwrap_or(false);
+        let mark_label = if is_unread { "Mark read" } else { "Mark unread" };
+
         actions = actions
+            .push(crate::components::action_bar::button_text_with_icon(
+                "Reply",
+                Icon::Reply,
+                crate::theme::TEXT_MUTED,
+                Message::ReplyInline,
+            ))
+            .push(crate::components::action_bar::button_text_with_icon(
+                "Reply all",
+                Icon::Reply,
+                crate::theme::TEXT_MUTED,
+                Message::ReplyInline,
+            ))
+            .push(crate::components::action_bar::button_text_with_icon(
+                "Forward",
+                Icon::Forward,
+                crate::theme::TEXT_MUTED,
+                Message::ReplyInline,
+            ))
             .push(crate::components::action_bar::button_text_with_icon(
                 "Archive",
                 Icon::Archive,
@@ -1211,16 +1275,22 @@ fn reader_action_bar(app: &App) -> Element<'_, Message> {
                 Message::ArchiveSelected,
             ))
             .push(crate::components::action_bar::button_text_with_icon(
-                "Mark read",
+                "Delete",
+                Icon::Delete,
+                crate::theme::TEXT_MUTED,
+                Message::TrashSelected,
+            ))
+            .push(crate::components::action_bar::button_text_with_icon(
+                mark_label,
                 Icon::CheckCircle,
                 crate::theme::TEXT_MUTED,
                 Message::MarkReadSelected,
             ))
             .push(crate::components::action_bar::button_text_with_icon(
-                "Trash",
-                Icon::Delete,
+                "More",
+                Icon::More,
                 crate::theme::TEXT_MUTED,
-                Message::TrashSelected,
+                Message::ToggleShortcutsHelp,
             ));
     }
 
@@ -1502,7 +1572,7 @@ fn notification_kind_label(kind: &NotificationKind) -> &'static str {
 fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
     match event {
         EngineEvent::Ready => {
-            app.status = "Engine ready".to_string();
+            app.status = "Ready · Last synced just now".to_string();
             let engine = app.engine.clone();
             return Task::perform(
                 async move {
@@ -1557,7 +1627,7 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
         }
         EngineEvent::CredentialStoreChecked(status) => {
             app.status = if status.available {
-                "Ready".to_string()
+                "Ready · Last synced just now".to_string()
             } else {
                 status.message
             };

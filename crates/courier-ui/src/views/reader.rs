@@ -74,7 +74,7 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
         None => {
             container(
                 column![
-                    container(text("@").size(24).color(crate::theme::ACCENT))
+                    container(Icon::Inbox.view_styled(24.0, crate::theme::ACCENT))
                         .width(Length::Fixed(48.0))
                         .height(Length::Fixed(48.0))
                         .center_x(Length::Fixed(48.0))

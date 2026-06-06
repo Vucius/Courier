@@ -41,6 +41,7 @@ pub fn view<'a>(
         for thread in threads {
             let selected = selected_thread == Some(&thread.id);
             scroll_col = scroll_col.push(thread_row(thread, selected));
+            scroll_col = scroll_col.push(crate::components::surface::divider());
         }
         list = list.push(scrollable(scroll_col).height(Length::Fill));
     }
@@ -51,7 +52,7 @@ pub fn view<'a>(
 fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Message> {
     let sender_font = if thread.unread {
         Font {
-            weight: Weight::Semibold,
+            weight: Weight::Bold,
             ..Font::DEFAULT
         }
     } else {
@@ -59,7 +60,15 @@ fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Mess
     };
     let subject_font = if thread.unread {
         Font {
-            weight: Weight::Semibold,
+            weight: Weight::Bold,
+            ..Font::DEFAULT
+        }
+    } else {
+        Font::DEFAULT
+    };
+    let date_font = if thread.unread {
+        Font {
+            weight: Weight::Bold,
             ..Font::DEFAULT
         }
     } else {
@@ -70,6 +79,11 @@ fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Mess
     } else {
         crate::theme::TEXT_MUTED
     };
+    let date_color = if thread.unread {
+        crate::theme::ACCENT
+    } else {
+        crate::theme::TEXT_MUTED
+    };
 
     let content = column![
         row![
@@ -77,10 +91,14 @@ fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Mess
                 .size(13)
                 .color(crate::theme::TEXT)
                 .font(sender_font),
+            text(format!("· {}", thread.account_id.0))
+                .size(11)
+                .color(crate::theme::TEXT_MUTED),
             iced::widget::horizontal_space(),
             text(timestamp_label(thread.last_message_ts))
                 .size(crate::theme::FONT_CAPTION)
-                .color(crate::theme::TEXT_MUTED),
+                .color(date_color)
+                .font(date_font),
         ]
         .align_y(Alignment::Center)
         .spacing(crate::theme::SPACE_SM),

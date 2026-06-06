@@ -22,7 +22,7 @@ pub fn view<'a>(
     let trash_mailbox = mailboxes.iter().find(|m| matches!(m.role, MailboxRole::Trash));
 
     let mut list = column![
-        crate::components::list::section_label("MAILBOXES"),
+        crate::components::list::section_label("UNIFIED"),
         mailbox_row(
             "Inbox",
             Icon::Inbox,
