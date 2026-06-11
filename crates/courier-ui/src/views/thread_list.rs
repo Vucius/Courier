@@ -1,4 +1,4 @@
-use courier_proto::{ThreadId, ThreadSummary};
+use courier_proto::{AccountState, ThreadId, ThreadSummary};
 use iced::Element;
 use iced::font::Weight;
 use iced::widget::{column, container, mouse_area, row, scrollable, text};
@@ -9,18 +9,15 @@ use crate::app::Message;
 
 pub fn view<'a>(
     threads: &[&'a ThreadSummary],
+    accounts: &'a [AccountState],
     selected_thread: Option<&ThreadId>,
     title: &'a str,
 ) -> Element<'a, Message> {
     let mut list = column![crate::components::surface::header(
         title,
-        text(format!(
-            "{} {}",
-            threads.len(),
-            if threads.len() == 1 { "message" } else { "messages" }
-        ))
-        .size(12)
-        .color(crate::theme::TEXT_MUTED),
+        text(summary_label(threads, accounts, title))
+            .size(12)
+            .color(crate::theme::TEXT_MUTED),
     )]
     .spacing(0)
     .height(Length::Fill);
@@ -40,7 +37,7 @@ pub fn view<'a>(
         let mut scroll_col = column![].spacing(0);
         for thread in threads {
             let selected = selected_thread == Some(&thread.id);
-            scroll_col = scroll_col.push(thread_row(thread, selected));
+            scroll_col = scroll_col.push(thread_row(thread, accounts, selected));
             scroll_col = scroll_col.push(crate::components::surface::divider());
         }
         list = list.push(scrollable(scroll_col).height(Length::Fill));
@@ -49,7 +46,45 @@ pub fn view<'a>(
     list.into()
 }
 
-fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Message> {
+fn summary_label(threads: &[&ThreadSummary], accounts: &[AccountState], title: &str) -> String {
+    let message_label = if threads.len() == 1 {
+        "message"
+    } else {
+        "messages"
+    };
+
+    if title == "Unified Inbox" {
+        let mut account_count = 0;
+        for account in accounts {
+            if threads.iter().any(|thread| thread.account_id == account.id) {
+                account_count += 1;
+            }
+        }
+        if account_count == 0 && !threads.is_empty() {
+            account_count = 1;
+        }
+        let account_label = if account_count == 1 {
+            "account"
+        } else {
+            "accounts"
+        };
+        return format!(
+            "{} {} from {} {}",
+            threads.len(),
+            message_label,
+            account_count,
+            account_label
+        );
+    }
+
+    format!("{} {}", threads.len(), message_label)
+}
+
+fn thread_row<'a>(
+    thread: &'a ThreadSummary,
+    accounts: &'a [AccountState],
+    selected: bool,
+) -> Element<'a, Message> {
     let sender_font = if thread.unread {
         Font {
             weight: Weight::Bold,
@@ -85,11 +120,17 @@ fn thread_row<'a>(thread: &'a ThreadSummary, selected: bool) -> Element<'a, Mess
         crate::theme::TEXT_MUTED
     };
 
-    let display_account = if thread.account_id.0 == "local-demo" {
-        "you@example.test"
-    } else {
-        &thread.account_id.0
-    };
+    let display_account = accounts
+        .iter()
+        .find(|account| account.id == thread.account_id)
+        .map(|account| account.email.as_str())
+        .unwrap_or_else(|| {
+            if thread.account_id.0 == "local-demo" {
+                "you@example.test"
+            } else {
+                thread.account_id.0.as_str()
+            }
+        });
 
     let content = column![
         row![

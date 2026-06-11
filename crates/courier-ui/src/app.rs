@@ -957,6 +957,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let visible_threads = app.threads.iter().collect::<Vec<_>>();
     let threads = crate::views::thread_list::view(
         &visible_threads,
+        &app.accounts,
         app.selected_thread.as_ref(),
         &app.selected_mailbox_name,
     );
@@ -1043,7 +1044,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ),
         button(row![
             Icon::Compose.view_styled(16.0, iced::Color::WHITE),
-            text("Compose new email").size(14).color(iced::Color::WHITE)
+            text("Compose").size(14).color(iced::Color::WHITE)
         ].spacing(8).align_y(iced::Alignment::Center))
         .width(Length::Fill)
         .padding(10)
@@ -1231,12 +1232,11 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
         );
     } else {
         for account in &app.accounts {
-            let status_text = if !account.enabled {
-                "Disabled".to_string()
-            } else if !app.network_online {
-                "Offline".to_string()
-            } else {
-                "Online · Synced just now".to_string()
+            let provider_lbl = provider_name(&account.provider);
+            let status_text = match (account.enabled, app.network_online) {
+                (false, _) => format!("{provider_lbl} - Disabled"),
+                (true, false) => format!("{provider_lbl} - Offline"),
+                (true, true) => format!("{provider_lbl} - Synced just now"),
             };
 
             let status_color = if account.enabled && app.network_online {
@@ -1245,79 +1245,61 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
                 crate::theme::TEXT_MUTED
             };
 
-            let provider_lbl = provider_name(&account.provider);
-
-            let network_action = if account.enabled && app.network_online {
-                button(
-                    row![
-                        Icon::WifiOff.view_styled(12.0, crate::theme::TEXT_MUTED),
-                        text("Work offline").size(11).color(crate::theme::TEXT_MUTED)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-                )
-                .style(button::text)
-                .on_press(Message::WorkOfflineRequested)
-            } else if account.enabled {
-                button(
-                    row![
-                        Icon::Wifi.view_styled(12.0, crate::theme::ACCENT),
-                        text("Reconnect").size(11).color(crate::theme::ACCENT)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center)
-                )
-                .style(button::text)
-                .on_press(Message::ReconnectRequested)
-            } else {
-                button(text("").size(11)).style(button::text)
-            };
-
             let manage_btn = button(
                 row![
-                    Icon::Settings.view_styled(12.0, crate::theme::ACCENT),
-                    text("Manage account").size(11).color(crate::theme::ACCENT)
+                    Icon::Settings.view_styled(13.0, crate::theme::ACCENT),
+                    text("Manage account").size(12).color(crate::theme::ACCENT),
+                    iced::widget::horizontal_space(),
                 ]
-                .spacing(4)
+                .spacing(6)
                 .align_y(iced::Alignment::Center)
             )
-            .style(button::text)
+            .width(Length::Fill)
+            .padding([6, 8])
+            .style(|_, status| account_action_style(crate::theme::ACCENT, status))
             .on_press(Message::EditAccount(account.id.clone()));
+
+            let mut actions = column![manage_btn].spacing(4).width(Length::Fill);
+            if account.enabled {
+                let (icon, label, color, message) = if app.network_online {
+                    (
+                        Icon::WifiOff,
+                        "Work offline",
+                        crate::theme::TEXT_MUTED,
+                        Message::WorkOfflineRequested,
+                    )
+                } else {
+                    (
+                        Icon::Wifi,
+                        "Reconnect",
+                        crate::theme::ACCENT,
+                        Message::ReconnectRequested,
+                    )
+                };
+
+                actions = actions.push(
+                    button(
+                        row![
+                            icon.view_styled(13.0, color),
+                            text(label).size(12).color(color),
+                            iced::widget::horizontal_space(),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([6, 8])
+                    .style(move |_, status| account_action_style(color, status))
+                    .on_press(message),
+                );
+            }
 
             let account_card = container(
                 column![
-                    row![
-                        column![
-                            text(provider_lbl)
-                                .size(11)
-                                .color(crate::theme::TEXT_MUTED),
-                            text(&account.email)
-                                .size(13)
-                                .color(crate::theme::TEXT),
-                        ]
-                        .spacing(2)
-                        .width(Length::Fill),
-                        button(
-                            Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED)
-                        )
-                        .padding(4)
-                        .style(button::text)
-                        .on_press(Message::EditAccount(account.id.clone())),
-                    ]
-                    .align_y(iced::Alignment::Center),
-                    row![
-                        text(status_text)
-                            .size(11)
-                            .color(status_color),
-                    ]
-                    .align_y(iced::Alignment::Center),
+                    text(&account.email).size(13).color(crate::theme::TEXT),
+                    text(status_text).size(11).color(status_color),
                     crate::components::surface::divider(),
-                    row![
-                        manage_btn,
-                        iced::widget::horizontal_space(),
-                        network_action,
-                    ]
-                    .align_y(iced::Alignment::Center),
+                    actions,
                 ]
                 .spacing(6)
             )
@@ -1385,6 +1367,28 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
     col = col.push(add_account_btn);
 
     col.into()
+}
+
+fn account_action_style(
+    text_color: iced::Color,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let background = match status {
+        iced::widget::button::Status::Hovered => crate::theme::SURFACE_HOVER,
+        iced::widget::button::Status::Pressed => crate::theme::ROW_SELECTED,
+        _ => crate::theme::SURFACE,
+    };
+
+    iced::widget::button::Style {
+        background: Some(iced::Background::Color(background)),
+        text_color,
+        border: iced::Border {
+            color: crate::theme::BORDER,
+            width: 1.0,
+            radius: crate::theme::RADIUS_MD.into(),
+        },
+        shadow: iced::Shadow::default(),
+    }
 }
 
 fn shortcut_hint(app: &App) -> &'static str {
