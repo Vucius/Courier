@@ -16,10 +16,18 @@ pub fn view<'a>(
         .map(|m| m.unread_count)
         .sum();
 
-    let sent_mailbox = mailboxes.iter().find(|m| matches!(m.role, MailboxRole::Sent));
-    let drafts_mailbox = mailboxes.iter().find(|m| matches!(m.role, MailboxRole::Drafts));
-    let archive_mailbox = mailboxes.iter().find(|m| matches!(m.role, MailboxRole::Archive));
-    let trash_mailbox = mailboxes.iter().find(|m| matches!(m.role, MailboxRole::Trash));
+    let sent_mailbox = mailboxes
+        .iter()
+        .find(|m| matches!(m.role, MailboxRole::Sent));
+    let drafts_mailbox = mailboxes
+        .iter()
+        .find(|m| matches!(m.role, MailboxRole::Drafts));
+    let archive_mailbox = mailboxes
+        .iter()
+        .find(|m| matches!(m.role, MailboxRole::Archive));
+    let trash_mailbox = mailboxes
+        .iter()
+        .find(|m| matches!(m.role, MailboxRole::Trash));
 
     let mut list = column![
         crate::components::list::section_label("UNIFIED"),
@@ -28,7 +36,8 @@ pub fn view<'a>(
             Icon::Inbox,
             None,
             inbox_unread,
-            selected_mailbox.is_none() && (selected_mailbox_name == "Inbox" || selected_mailbox_name == "Unified Inbox"),
+            selected_mailbox.is_none()
+                && (selected_mailbox_name == "Inbox" || selected_mailbox_name == "Unified Inbox"),
         ),
         mailbox_row(
             "Starred",
@@ -42,32 +51,42 @@ pub fn view<'a>(
             Icon::Send,
             sent_mailbox.map(|m| &m.id),
             0,
-            selected_mailbox_name == "Sent" || (sent_mailbox.is_some() && selected_mailbox == sent_mailbox.map(|m| &m.id)),
+            selected_mailbox_name == "Sent"
+                || (sent_mailbox.is_some() && selected_mailbox == sent_mailbox.map(|m| &m.id)),
         ),
         mailbox_row(
             "Drafts",
             Icon::Drafts,
             drafts_mailbox.map(|m| &m.id),
             0,
-            selected_mailbox_name == "Drafts" || (drafts_mailbox.is_some() && selected_mailbox == drafts_mailbox.map(|m| &m.id)),
+            selected_mailbox_name == "Drafts"
+                || (drafts_mailbox.is_some() && selected_mailbox == drafts_mailbox.map(|m| &m.id)),
         ),
         mailbox_row(
             "Archive",
             Icon::Archive,
             archive_mailbox.map(|m| &m.id),
             0,
-            selected_mailbox_name == "Archive" || (archive_mailbox.is_some() && selected_mailbox == archive_mailbox.map(|m| &m.id)),
+            selected_mailbox_name == "Archive"
+                || (archive_mailbox.is_some()
+                    && selected_mailbox == archive_mailbox.map(|m| &m.id)),
         ),
         mailbox_row(
             "Trash",
             Icon::Delete,
             trash_mailbox.map(|m| &m.id),
             0,
-            selected_mailbox_name == "Trash" || (trash_mailbox.is_some() && selected_mailbox == trash_mailbox.map(|m| &m.id)),
+            selected_mailbox_name == "Trash"
+                || (trash_mailbox.is_some() && selected_mailbox == trash_mailbox.map(|m| &m.id)),
         ),
     ]
     .spacing(crate::theme::SPACE_SM)
-    .padding(8);
+    .padding(iced::Padding {
+        top: 8.0,
+        right: 8.0,
+        bottom: 16.0,
+        left: 8.0,
+    });
 
     let custom_mailboxes: Vec<&MailboxSummary> = mailboxes
         .iter()
@@ -119,5 +138,3 @@ fn mailbox_row<'a>(
         Message::MailboxSelected(mailbox_id.cloned(), name.to_string()),
     )
 }
-
-

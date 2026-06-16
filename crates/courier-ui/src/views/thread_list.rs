@@ -142,10 +142,13 @@ fn thread_row<'a>(
                 .size(11)
                 .color(crate::theme::TEXT_MUTED),
             iced::widget::horizontal_space(),
-            text(timestamp_label(thread.last_message_ts))
-                .size(crate::theme::FONT_CAPTION)
-                .color(date_color)
-                .font(date_font),
+            container(
+                text(timestamp_label(thread.last_message_ts))
+                    .size(crate::theme::FONT_CAPTION)
+                    .color(date_color)
+                    .font(date_font),
+            )
+            .width(Length::Fixed(72.0)),
         ]
         .align_y(Alignment::Center)
         .spacing(crate::theme::SPACE_SM),

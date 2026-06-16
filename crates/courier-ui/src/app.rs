@@ -14,8 +14,14 @@ use courier_render::{RenderTree, render_tree_from_html, render_tree_from_text};
 use iced::futures::SinkExt;
 use iced::keyboard::{Key, Modifiers, key};
 use iced::widget::{column, container, progress_bar, row, text};
-use iced::{Element, Length, Subscription, Task, Theme};
+use iced::{Element, Length, Subscription, Task, Theme, window};
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    Main,
+    AccountSettings,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -63,6 +69,7 @@ pub enum Message {
     AccountSmtpHostChanged(String),
     AccountSmtpPortChanged(String),
     AccountPasswordChanged(String),
+    AccountManualConfigToggled(bool),
     SaveAccount,
     TestAccountConnection,
     BeginOAuth2(AccountId),
@@ -81,6 +88,8 @@ pub enum Message {
     ToggleShortcutsHelp,
     UiTick,
     EventOccurred(iced::Event),
+    WindowOpened(WindowKind, window::Id),
+    WindowClosed(window::Id),
     ShowNarrowList,
     ReconnectRequested,
     WorkOfflineRequested,
@@ -127,6 +136,8 @@ pub struct App {
     context_thread: Option<ThreadId>,
     transition_label: String,
     transition_ticks_remaining: u8,
+    main_window: Option<window::Id>,
+    account_window: Option<window::Id>,
     account_setup_visible: bool,
     shortcuts_help_visible: bool,
     editing_account_id: Option<AccountId>,
@@ -136,6 +147,7 @@ pub struct App {
     account_smtp_host: String,
     account_smtp_port: String,
     account_password: String,
+    account_manual_config: bool,
     identity_name: String,
     identity_email: String,
     account_connection_status: String,
@@ -183,6 +195,8 @@ pub fn init() -> (App, Task<Message>) {
         context_thread: None,
         transition_label: String::new(),
         transition_ticks_remaining: 0,
+        main_window: None,
+        account_window: None,
         account_setup_visible: false,
         shortcuts_help_visible: false,
         editing_account_id: None,
@@ -192,18 +206,35 @@ pub fn init() -> (App, Task<Message>) {
         account_smtp_host: String::new(),
         account_smtp_port: "587".to_string(),
         account_password: String::new(),
+        account_manual_config: false,
         identity_name: String::new(),
         identity_email: String::new(),
         account_connection_status: String::new(),
-        status: "Ready · Last synced just now".to_string(),
+        status: "Ready".to_string(),
         window_size: iced::Size::new(1280.0, 800.0),
         narrow_pane_view: NarrowPaneView::List,
     };
 
-    (app, Task::none())
+    let (_, open_main) = window::open(window::Settings {
+        size: iced::Size::new(1280.0, 800.0),
+        position: window::Position::Centered,
+        ..Default::default()
+    });
+
+    (
+        app,
+        open_main.map(|id| Message::WindowOpened(WindowKind::Main, id)),
+    )
 }
 
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
+    if account_window_blocks_main(app, &message) {
+        return app
+            .account_window
+            .map(window::gain_focus)
+            .unwrap_or_else(Task::none);
+    }
+
     match message {
         Message::SyncNow => {
             let engine = app.engine.clone();
@@ -223,8 +254,34 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::EngineEvent(event) => handle_engine_event(app, event),
+        Message::WindowOpened(kind, id) => {
+            match kind {
+                WindowKind::Main => app.main_window = Some(id),
+                WindowKind::AccountSettings => {
+                    app.account_window = Some(id);
+                    app.account_setup_visible = true;
+                }
+            }
+            Task::none()
+        }
+        Message::WindowClosed(id) => {
+            if app.account_window == Some(id) {
+                app.account_window = None;
+                app.account_setup_visible = false;
+            }
+            if app.main_window == Some(id) {
+                app.main_window = None;
+                return iced::exit();
+            }
+            Task::none()
+        }
         Message::MailboxSelected(mailbox_id, name) => {
-            app.account_setup_visible = false;
+            if app.account_window.is_some() {
+                return app
+                    .account_window
+                    .map(window::gain_focus)
+                    .unwrap_or_else(Task::none);
+            }
             app.selected_mailbox_id = mailbox_id.clone();
             app.selected_mailbox_name = name.clone();
             app.selected_body = None;
@@ -251,23 +308,20 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             )
         }
         Message::AddAccount => {
-            app.account_setup_visible = true;
             app.editing_account_id = None;
             reset_account_form(app);
-            app.selected_body = None;
-            app.selected_render = None;
-            app.attachment_preview = None;
-            app.attachment_open = None;
-            app.selected_thread = None;
-            app.view_mode = ViewMode::Reader;
-            app.inline_reply_open = false;
             app.context_thread = None;
-            start_view_transition(app, "Account setup");
-            app.status = "Account setup ready".to_string();
-            Task::none()
+            app.inline_reply_open = false;
+            app.status = "Account settings opened".to_string();
+            open_account_window(app)
         }
         Message::Compose => {
-            app.account_setup_visible = false;
+            if app.account_window.is_some() {
+                return app
+                    .account_window
+                    .map(window::gain_focus)
+                    .unwrap_or_else(Task::none);
+            }
             app.view_mode = ViewMode::Compose;
             app.inline_reply_open = false;
             app.context_thread = None;
@@ -282,8 +336,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ToggleShortcutsHelp => {
+            if app.account_window.is_some() {
+                return app
+                    .account_window
+                    .map(window::gain_focus)
+                    .unwrap_or_else(Task::none);
+            }
             app.shortcuts_help_visible = !app.shortcuts_help_visible;
-            app.account_setup_visible = false;
             app.context_thread = None;
             start_view_transition(
                 app,
@@ -324,9 +383,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 start_view_transition(app, "Reader");
                 app.status = "Shortcuts help closed".to_string();
             } else if app.account_setup_visible {
-                app.account_setup_visible = false;
-                start_view_transition(app, "Reader");
-                app.status = "Account panel closed".to_string();
+                app.status = "Account settings closed".to_string();
+                return close_account_window(app);
             } else if app.context_thread.is_some() {
                 app.context_thread = None;
                 start_view_transition(app, "Thread list");
@@ -681,34 +739,38 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::AccountEmailChanged(value) => {
             app.account_email = value;
-            if let Some(domain) = account_domain(&app.account_email) {
-                if app.account_imap_host.trim().is_empty() {
-                    app.account_imap_host = format!("imap.{domain}");
-                }
-                if app.account_smtp_host.trim().is_empty() {
-                    app.account_smtp_host = format!("smtp.{domain}");
-                }
-            }
+            apply_smart_account_defaults(app);
             Task::none()
         }
         Message::AccountImapHostChanged(value) => {
+            app.account_manual_config = true;
             app.account_imap_host = value;
             Task::none()
         }
         Message::AccountImapPortChanged(value) => {
+            app.account_manual_config = true;
             app.account_imap_port = value;
             Task::none()
         }
         Message::AccountSmtpHostChanged(value) => {
+            app.account_manual_config = true;
             app.account_smtp_host = value;
             Task::none()
         }
         Message::AccountSmtpPortChanged(value) => {
+            app.account_manual_config = true;
             app.account_smtp_port = value;
             Task::none()
         }
         Message::AccountPasswordChanged(value) => {
             app.account_password = value;
+            Task::none()
+        }
+        Message::AccountManualConfigToggled(value) => {
+            app.account_manual_config = value;
+            if provider_defaults_for_email(&app.account_email).is_some() {
+                apply_smart_account_defaults(app);
+            }
             Task::none()
         }
         Message::SaveAccount => match account_config_from_form(app) {
@@ -778,18 +840,45 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .find(|account| account.id == account_id)
                 .cloned()
             {
-                app.account_setup_visible = true;
+                let provider_defaults = provider_defaults_for_email(&account.email);
+                let manual_config = provider_defaults
+                    .as_ref()
+                    .map(|defaults| {
+                        account.provider != defaults.provider
+                            || account.auth_type != defaults.auth_type
+                            || !endpoint_matches_or_is_stale_guess(
+                                &account.imap_host,
+                                account.imap_port,
+                                defaults.imap_host,
+                                defaults.imap_port,
+                            )
+                            || !endpoint_matches_or_is_stale_guess(
+                                &account.smtp_host,
+                                account.smtp_port,
+                                defaults.smtp_host,
+                                defaults.smtp_port,
+                            )
+                    })
+                    .unwrap_or(true);
                 app.editing_account_id = Some(account.id);
                 app.account_email = account.email;
                 app.account_imap_host = account.imap_host;
                 app.account_imap_port = account.imap_port.to_string();
+                app.account_manual_config = manual_config;
+                if !app.account_manual_config {
+                    apply_smart_account_defaults(app);
+                }
                 app.account_smtp_host = account.smtp_host;
                 app.account_smtp_port = account.smtp_port.to_string();
+                if !app.account_manual_config {
+                    apply_smart_account_defaults(app);
+                }
                 app.account_password.clear();
                 app.identity_name.clear();
                 app.identity_email.clear();
                 app.account_connection_status.clear();
                 app.status = "Editing account".to_string();
+                return open_account_window(app);
             } else {
                 app.status = "Account no longer exists".to_string();
             }
@@ -960,6 +1049,7 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         iced::keyboard::on_key_press(keyboard_shortcut),
         iced::time::every(Duration::from_secs(60)).map(|_| Message::ProbeNetwork),
         iced::event::listen().map(Message::EventOccurred),
+        window::close_events().map(Message::WindowClosed),
     ];
     if app.transition_ticks_remaining > 0 {
         subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::UiTick));
@@ -968,7 +1058,15 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     Subscription::batch(subscriptions)
 }
 
-pub fn view(app: &App) -> Element<'_, Message> {
+pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
+    if app.account_window == Some(id) {
+        return account_settings_window(app);
+    }
+
+    main_window_view(app)
+}
+
+fn main_window_view(app: &App) -> Element<'_, Message> {
     let mailboxes = crate::views::mailbox_list::view(
         &app.mailboxes,
         app.selected_mailbox_id.as_ref(),
@@ -983,26 +1081,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
     );
     let mut reader = if app.shortcuts_help_visible {
         shortcuts_help_modal()
-    } else if app.account_setup_visible {
-        column![crate::views::account_setup::view(
-            crate::views::account_setup::AccountSetupViewState {
-                accounts: &app.accounts,
-                identities: &app.identities,
-                editing_account_id: app.editing_account_id.as_ref(),
-                email: &app.account_email,
-                imap_host: &app.account_imap_host,
-                imap_port: &app.account_imap_port,
-                smtp_host: &app.account_smtp_host,
-                smtp_port: &app.account_smtp_port,
-                password: &app.account_password,
-                identity_name: &app.identity_name,
-                identity_email: &app.identity_email,
-                connection_status: &app.account_connection_status,
-            },
-        )]
-        .height(Length::Fill)
-        .spacing(10)
-        .into()
     } else if app.view_mode == ViewMode::Compose {
         column![crate::views::composer::view(
             &app.draft_to,
@@ -1195,8 +1273,115 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-pub fn theme(_app: &App) -> Theme {
+pub fn title(app: &App, id: window::Id) -> String {
+    if app.account_window == Some(id) {
+        "Courier Account Settings".to_string()
+    } else {
+        "Courier".to_string()
+    }
+}
+
+pub fn theme(_app: &App, _id: window::Id) -> Theme {
     Theme::Light
+}
+
+fn account_window_blocks_main(app: &App, message: &Message) -> bool {
+    if app.account_window.is_none() {
+        return false;
+    }
+
+    matches!(
+        message,
+        Message::SyncNow
+            | Message::MailboxSelected(_, _)
+            | Message::Compose
+            | Message::ReplyInline
+            | Message::ArchiveSelected
+            | Message::MarkReadSelected
+            | Message::TrashSelected
+            | Message::SearchChanged(_)
+            | Message::SelectThread(_)
+            | Message::SendDraft
+            | Message::PreviewAttachment(_)
+            | Message::OpenAttachment(_)
+            | Message::DownloadAttachment(_)
+            | Message::SelectNextThread
+            | Message::SelectPreviousThread
+            | Message::OpenThreadContext(_)
+            | Message::OpenSelectedThreadContext
+            | Message::ToggleShortcutsHelp
+            | Message::ShowNarrowList
+            | Message::ReconnectRequested
+            | Message::WorkOfflineRequested
+    )
+}
+
+fn open_account_window(app: &mut App) -> Task<Message> {
+    app.account_setup_visible = true;
+    if let Some(id) = app.account_window {
+        return window::gain_focus(id);
+    }
+
+    let (_, open) = window::open(window::Settings {
+        size: iced::Size::new(600.0, 550.0),
+        min_size: Some(iced::Size::new(600.0, 550.0)),
+        max_size: Some(iced::Size::new(600.0, 550.0)),
+        position: window::Position::Centered,
+        resizable: false,
+        exit_on_close_request: true,
+        ..Default::default()
+    });
+
+    open.map(|id| Message::WindowOpened(WindowKind::AccountSettings, id))
+}
+
+fn close_account_window(app: &mut App) -> Task<Message> {
+    app.account_setup_visible = false;
+    let Some(id) = app.account_window.take() else {
+        return Task::none();
+    };
+    window::close(id)
+}
+
+fn account_settings_window(app: &App) -> Element<'_, Message> {
+    let defaults = provider_defaults_for_email(&app.account_email);
+    let provider_label = defaults
+        .as_ref()
+        .map(|defaults| defaults.label)
+        .or_else(|| edited_account(app).map(|account| provider_name(&account.provider)))
+        .unwrap_or("Custom IMAP/SMTP");
+    let auth_type = selected_account_auth_type(app, defaults.as_ref());
+    let smart_config_active = defaults.is_some();
+    let editing_account_enabled = edited_account(app).map(|account| account.enabled);
+
+    container(crate::views::account_setup::view(
+        crate::views::account_setup::AccountSetupViewState {
+            identities: &app.identities,
+            editing_account_id: app.editing_account_id.as_ref(),
+            editing_account_enabled,
+            email: &app.account_email,
+            provider_label,
+            smart_config_active,
+            manual_config: app.account_manual_config,
+            auth_type,
+            imap_host: &app.account_imap_host,
+            imap_port: &app.account_imap_port,
+            smtp_host: &app.account_smtp_host,
+            smtp_port: &app.account_smtp_port,
+            password: &app.account_password,
+            identity_name: &app.identity_name,
+            identity_email: &app.identity_email,
+            connection_status: &app.account_connection_status,
+        },
+    ))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(iced::Background::Color(crate::theme::BACKGROUND)),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn start_view_transition(app: &mut App, label: &str) {
@@ -1269,13 +1454,20 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
     } else {
         for account in &app.accounts {
             let provider_lbl = provider_name(&account.provider);
-            let status_text = match (account.enabled, app.network_online) {
-                (false, _) => format!("{provider_lbl} - Disabled"),
-                (true, false) => format!("{provider_lbl} - Offline"),
-                (true, true) => format!("{provider_lbl} - Synced just now"),
+            let account_has_error = app.notifications.iter().any(|notification| {
+                notification.kind == NotificationKind::Error
+                    && notification.account_id.as_ref() == Some(&account.id)
+            });
+            let status_text = match (account.enabled, app.network_online, account_has_error) {
+                (_, _, true) => format!("{provider_lbl} - Needs attention"),
+                (false, _, _) => format!("{provider_lbl} - Disabled"),
+                (true, false, _) => format!("{provider_lbl} - Offline"),
+                (true, true, _) => format!("{provider_lbl} - Ready"),
             };
 
-            let status_color = if account.enabled && app.network_online {
+            let status_color = if account_has_error {
+                crate::theme::DANGER
+            } else if account.enabled && app.network_online {
                 crate::theme::SUCCESS
             } else {
                 crate::theme::TEXT_MUTED
@@ -1515,14 +1707,10 @@ fn reader_action_bar(app: &App) -> Element<'_, Message> {
     }
     left_content = left_content.push(text(title).size(13).color(crate::theme::TEXT));
 
-    let mut bar = row![left_content, iced::widget::horizontal_space(), actions,]
+    let bar = row![left_content, iced::widget::horizontal_space(), actions,]
         .align_y(iced::Alignment::Center)
         .spacing(crate::theme::SPACE_SM)
         .padding(crate::theme::SPACE_SM);
-
-    if app.unread_notifications > 0 {
-        bar = bar.push(crate::components::badge::count(app.unread_notifications));
-    }
 
     crate::components::surface::toolbar_surface(bar).into()
 }
@@ -1614,43 +1802,40 @@ fn global_banners_view(app: &App) -> Element<'_, Message> {
     }
 
     if !app.notifications.is_empty() {
-        let unread_errors = app
+        let account_issue = app
             .notifications
             .iter()
-            .filter(|n| n.kind == NotificationKind::Error)
-            .count();
-        if unread_errors > 0 {
-            let text_lbl = if unread_errors == 1 {
-                "1 error".to_string()
-            } else {
-                format!("{} errors", unread_errors)
-            };
+            .rev()
+            .find(|notification| notification.kind == NotificationKind::Error);
+        if let Some(notification) = account_issue {
             banner_row = banner_row.push(
                 row![
                     Icon::Error.view_styled(16.0, crate::theme::DANGER),
-                    text(text_lbl).size(13).color(crate::theme::TEXT),
+                    text(&notification.body).size(13).color(crate::theme::TEXT),
+                    crate::components::action_bar::button_text("Review", Message::AddAccount),
+                    crate::components::action_bar::button_text(
+                        "Clear",
+                        Message::ClearNotifications
+                    ),
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
             );
-        } else {
-            let unread_count = app.unread_notifications;
-            if unread_count > 0 {
-                banner_row = banner_row.push(
-                    row![
-                        Icon::Bell.view_styled(16.0, crate::theme::ACCENT),
-                        text(format!("{} notifications", unread_count))
-                            .size(13)
-                            .color(crate::theme::TEXT),
-                        crate::components::action_bar::button_text(
-                            "Clear",
-                            Message::ClearNotifications
-                        )
-                    ]
-                    .spacing(8)
-                    .align_y(iced::Alignment::Center),
-                );
-            }
+        } else if app.unread_notifications > 0 {
+            banner_row = banner_row.push(
+                row![
+                    Icon::Bell.view_styled(16.0, crate::theme::ACCENT),
+                    text("New account or mail activity")
+                        .size(13)
+                        .color(crate::theme::TEXT),
+                    crate::components::action_bar::button_text(
+                        "Clear",
+                        Message::ClearNotifications
+                    )
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
         }
     }
 
@@ -1879,7 +2064,7 @@ fn notification_kind_label(kind: &NotificationKind) -> &'static str {
 fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
     match event {
         EngineEvent::Ready => {
-            app.status = "Ready · Last synced just now".to_string();
+            app.status = "Ready".to_string();
             let engine = app.engine.clone();
             return Task::perform(
                 async move {
@@ -1904,20 +2089,25 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
             app.status = "Mailboxes loaded".to_string();
         }
         EngineEvent::AccountSaved(account) => {
-            app.account_setup_visible = false;
             app.editing_account_id = None;
             app.view_mode = ViewMode::Reader;
             reset_account_form(app);
             app.status = format!("Account saved: {}", account.email);
+            return close_account_window(app);
         }
         EngineEvent::AccountConnectionTested(result) => {
-            let imap = endpoint_status("IMAP", &result.imap);
-            let smtp = endpoint_status("SMTP", &result.smtp);
-            app.account_connection_status = format!("{imap}; {smtp}");
+            let imap = endpoint_status("Incoming mail", &result.imap);
+            let smtp = endpoint_status("Outgoing mail", &result.smtp);
+            app.account_connection_status = format!("{imap} {smtp}");
             app.status = if result.imap.ok && result.smtp.ok {
-                "Connection test passed".to_string()
+                "Connection verified".to_string()
             } else {
-                "Connection test failed".to_string()
+                if is_authentication_error(result.imap.error.as_deref())
+                    || is_authentication_error(result.smtp.error.as_deref())
+                {
+                    app.account_password.clear();
+                }
+                "Please review the highlighted account settings".to_string()
             };
         }
         EngineEvent::OAuth2AuthorizationStarted(result) => {
@@ -1934,9 +2124,9 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
         }
         EngineEvent::CredentialStoreChecked(status) => {
             app.status = if status.available {
-                "Ready · Last synced just now".to_string()
+                "Ready".to_string()
             } else {
-                status.message
+                user_facing_error(&status.message)
             };
         }
         EngineEvent::CredentialSaved(result) => {
@@ -1977,7 +2167,7 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
             }
             Err(error) => {
                 app.attachment_preview = None;
-                app.status = error;
+                app.status = user_facing_error(&error);
             }
         },
         EngineEvent::AttachmentOpenPrepared(request) => {
@@ -1996,7 +2186,7 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 app.status = format!("Opened attachment: {}", request.attachment.filename);
             }
             Err(error) => {
-                app.status = format!("Attachment open failed: {error}");
+                app.status = user_facing_error(&format!("Attachment open failed: {error}"));
             }
         },
         EngineEvent::AttachmentTransfersUpdated(transfers) => {
@@ -2021,7 +2211,8 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                 app.status = format!("{} sync conflict(s)", app.conflicts.len());
             }
         }
-        EngineEvent::NotificationRaised(notification) => {
+        EngineEvent::NotificationRaised(mut notification) => {
+            notification.body = user_facing_error(&notification.body);
             app.status = notification.title.clone();
             app.notifications.push(notification);
             app.unread_notifications = app.unread_notifications.saturating_add(1);
@@ -2043,11 +2234,11 @@ fn handle_engine_event(app: &mut App, event: EngineEvent) -> Task<Message> {
                     app.view_mode = ViewMode::Reader;
                     "Message sent".to_string()
                 }
-                Err(error) => format!("Send failed: {error}"),
+                Err(error) => user_facing_error(&format!("Send failed: {error}")),
             };
         }
         EngineEvent::Error(error) => {
-            app.status = error;
+            app.status = user_facing_error(&error);
         }
     }
 
@@ -2111,7 +2302,7 @@ fn keyboard_shortcut(key: Key, modifiers: Modifiers) -> Option<Message> {
 }
 
 fn select_relative_thread(app: &mut App, direction: isize) -> Task<Message> {
-    if app.account_setup_visible || app.view_mode != ViewMode::Reader || app.threads.is_empty() {
+    if app.account_window.is_some() || app.view_mode != ViewMode::Reader || app.threads.is_empty() {
         return Task::none();
     }
 
@@ -2162,21 +2353,39 @@ fn split_csv(value: &str) -> Vec<String> {
 
 fn account_config_from_form(app: &App) -> Result<AccountConfig, String> {
     let email = app.account_email.trim();
-    let imap_host = app.account_imap_host.trim();
-    let smtp_host = app.account_smtp_host.trim();
-
     if email.is_empty() || !email.contains('@') {
         return Err("Enter a valid email address".to_string());
     }
-    if imap_host.is_empty() {
-        return Err("Enter an IMAP host".to_string());
-    }
-    if smtp_host.is_empty() {
-        return Err("Enter an SMTP host".to_string());
-    }
 
-    let imap_port = parse_port(&app.account_imap_port, "IMAP")?;
-    let smtp_port = parse_port(&app.account_smtp_port, "SMTP")?;
+    let defaults = provider_defaults_for_email(email);
+    let use_defaults = defaults.is_some() && !app.account_manual_config;
+    let provider = selected_account_provider(app, defaults.as_ref(), use_defaults);
+    let auth_type = selected_account_auth_type(app, defaults.as_ref());
+
+    let (imap_host, imap_port, smtp_host, smtp_port) = if use_defaults {
+        let defaults = defaults.as_ref().expect("checked above");
+        (
+            defaults.imap_host.to_string(),
+            defaults.imap_port,
+            defaults.smtp_host.to_string(),
+            defaults.smtp_port,
+        )
+    } else {
+        let imap_host = app.account_imap_host.trim();
+        let smtp_host = app.account_smtp_host.trim();
+        if imap_host.is_empty() {
+            return Err("Enter the incoming mail server address".to_string());
+        }
+        if smtp_host.is_empty() {
+            return Err("Enter the outgoing mail server address".to_string());
+        }
+        (
+            imap_host.to_string(),
+            parse_port(&app.account_imap_port, "IMAP")?,
+            smtp_host.to_string(),
+            parse_port(&app.account_smtp_port, "SMTP")?,
+        )
+    };
 
     Ok(AccountConfig {
         id: app
@@ -2184,16 +2393,12 @@ fn account_config_from_form(app: &App) -> Result<AccountConfig, String> {
             .clone()
             .unwrap_or_else(|| AccountId(format!("account:{}", safe_identifier(email)))),
         email: email.to_string(),
-        provider: edited_account(app)
-            .map(|account| account.provider.clone())
-            .unwrap_or(ProviderKind::GenericImap),
-        imap_host: imap_host.to_string(),
+        provider,
+        imap_host,
         imap_port,
-        smtp_host: smtp_host.to_string(),
+        smtp_host,
         smtp_port,
-        auth_type: edited_account(app)
-            .map(|account| account.auth_type.clone())
-            .unwrap_or(AuthType::Password),
+        auth_type,
     })
 }
 
@@ -2256,6 +2461,7 @@ fn reset_account_form(app: &mut App) {
     app.account_smtp_host.clear();
     app.account_smtp_port = "587".to_string();
     app.account_password.clear();
+    app.account_manual_config = false;
     app.identity_name.clear();
     app.identity_email.clear();
     app.account_connection_status.clear();
@@ -2263,15 +2469,63 @@ fn reset_account_form(app: &mut App) {
 
 fn endpoint_status(label: &str, result: &courier_proto::EndpointCheckResult) -> String {
     if result.ok {
-        format!("{label} {}:{} reachable", result.host, result.port)
+        format!("{label}: verified.")
     } else {
         format!(
-            "{label} {}:{} failed: {}",
-            result.host,
-            result.port,
-            result.error.as_deref().unwrap_or("unknown error")
+            "{label}: {}.",
+            user_facing_error(result.error.as_deref().unwrap_or("unknown error"))
         )
     }
+}
+
+fn user_facing_error(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("missing endpoint")
+        || lower.contains("no such host")
+        || lower.contains("dns")
+        || lower.contains("failed to lookup")
+        || lower.contains("could not resolve")
+        || lower.contains("cannot resolve")
+        || lower.contains("connection refused")
+        || lower.contains("invalid imap server")
+        || lower.contains("imap.o")
+    {
+        "Unable to connect to the mail server. Check that the server address is correct".to_string()
+    } else if is_authentication_error(Some(message)) {
+        "The mailbox password is incorrect or expired. Enter the password again".to_string()
+    } else if lower.contains("oauth") {
+        "Secure sign-in is required for this mail provider. Start OAuth2 authorization from the account card".to_string()
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "The mail server did not respond in time. Check your network and try again".to_string()
+    } else if lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("certificate")
+        || lower.contains("handshake")
+    {
+        "Unable to establish a secure connection to the mail server".to_string()
+    } else if lower.contains("sync failed") {
+        "Sync could not complete. Review the account settings and try again".to_string()
+    } else if message.trim().is_empty() {
+        "Something went wrong. Try again".to_string()
+    } else {
+        message
+            .trim_start_matches("ERR ")
+            .trim_start_matches("failed: ")
+            .to_string()
+    }
+}
+
+fn is_authentication_error(message: Option<&str>) -> bool {
+    let Some(message) = message else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("credential")
+        || lower.contains("password")
+        || lower.contains("invalid user")
+        || lower.contains("invalid login")
 }
 
 fn parse_port(value: &str, label: &str) -> Result<u16, String> {
@@ -2281,13 +2535,106 @@ fn parse_port(value: &str, label: &str) -> Result<u16, String> {
         .map_err(|_| format!("Enter a valid {label} port"))
 }
 
+#[derive(Debug, Clone)]
+struct MailProviderDefaults {
+    label: &'static str,
+    provider: ProviderKind,
+    auth_type: AuthType,
+    imap_host: &'static str,
+    imap_port: u16,
+    smtp_host: &'static str,
+    smtp_port: u16,
+}
+
+fn provider_defaults_for_email(email: &str) -> Option<MailProviderDefaults> {
+    let domain = account_domain(email)?;
+    match domain.as_str() {
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => Some(MailProviderDefaults {
+            label: "Outlook Mail",
+            provider: ProviderKind::Outlook,
+            auth_type: AuthType::OAuth2,
+            imap_host: "outlook.office365.com",
+            imap_port: 993,
+            smtp_host: "smtp-mail.outlook.com",
+            smtp_port: 587,
+        }),
+        "gmail.com" | "googlemail.com" => Some(MailProviderDefaults {
+            label: "Gmail",
+            provider: ProviderKind::Gmail,
+            auth_type: AuthType::OAuth2,
+            imap_host: "imap.gmail.com",
+            imap_port: 993,
+            smtp_host: "smtp.gmail.com",
+            smtp_port: 587,
+        }),
+        _ => None,
+    }
+}
+
+fn apply_smart_account_defaults(app: &mut App) {
+    let Some(defaults) = provider_defaults_for_email(&app.account_email) else {
+        if account_domain(&app.account_email).is_none() && !app.account_manual_config {
+            app.account_imap_host.clear();
+            app.account_smtp_host.clear();
+        }
+        return;
+    };
+
+    app.account_imap_host = defaults.imap_host.to_string();
+    app.account_imap_port = defaults.imap_port.to_string();
+    app.account_smtp_host = defaults.smtp_host.to_string();
+    app.account_smtp_port = defaults.smtp_port.to_string();
+}
+
+fn endpoint_matches_or_is_stale_guess(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    if host == default_host && port == default_port {
+        return true;
+    }
+
+    host.starts_with("imap.") || host.starts_with("smtp.") || host == "imap.o" || host == "smtp.o"
+}
+
+fn selected_account_provider(
+    app: &App,
+    defaults: Option<&MailProviderDefaults>,
+    use_defaults: bool,
+) -> ProviderKind {
+    if use_defaults {
+        return defaults
+            .map(|defaults| defaults.provider.clone())
+            .unwrap_or(ProviderKind::GenericImap);
+    }
+
+    edited_account(app)
+        .map(|account| account.provider.clone())
+        .unwrap_or(ProviderKind::GenericImap)
+}
+
+fn selected_account_auth_type(app: &App, defaults: Option<&MailProviderDefaults>) -> AuthType {
+    if !app.account_manual_config {
+        if let Some(defaults) = defaults {
+            return defaults.auth_type.clone();
+        }
+    }
+
+    edited_account(app)
+        .map(|account| account.auth_type.clone())
+        .unwrap_or(AuthType::Password)
+}
+
 fn account_domain(email: &str) -> Option<String> {
     let (_, domain) = email.trim().split_once('@')?;
-    let domain = domain.trim();
-    if domain.is_empty() {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() || !domain.contains('.') {
         None
     } else {
-        Some(domain.to_string())
+        Some(domain)
     }
 }
 

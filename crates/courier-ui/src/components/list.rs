@@ -23,6 +23,7 @@ pub fn outline_row<'a>(
         text(label)
             .size(crate::theme::FONT_BODY)
             .color(crate::theme::TEXT)
+            .width(Length::Fill)
     ]
     .align_y(Alignment::Center)
     .spacing(crate::theme::SPACE_SM)

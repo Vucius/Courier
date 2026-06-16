@@ -33,10 +33,7 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
             } else {
                 body.to.join(", ")
             };
-            let mut metadata = vec![
-                ("From", body.from.clone()),
-                ("To", recipients),
-            ];
+            let mut metadata = vec![("From", body.from.clone()), ("To", recipients)];
             if let Some(account) = &state.account_display {
                 metadata.push(("Account", account.clone()));
             }
@@ -45,7 +42,11 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
             let mut content = column![
                 crate::components::surface::header(
                     &body.subject,
-                    crate::components::action_bar::button_primary_with_icon("Reply", Icon::Reply, Message::ReplyInline),
+                    crate::components::action_bar::button_primary_with_icon(
+                        "Reply",
+                        Icon::Reply,
+                        Message::ReplyInline
+                    ),
                 ),
                 crate::components::surface::divider(),
                 row![
@@ -78,47 +79,38 @@ pub fn view<'a>(state: ReaderViewState<'a>) -> Element<'a, Message> {
 
             container(content).height(Length::FillPortion(3)).into()
         }
-        None => {
-            let mut action_row = row![
-                crate::components::action_bar::button_primary("Compose new email", Message::Compose),
+        None => container(
+            column![
+                container(Icon::Inbox.view_styled(24.0, crate::theme::ACCENT))
+                    .width(Length::Fixed(48.0))
+                    .height(Length::Fixed(48.0))
+                    .center_x(Length::Fixed(48.0))
+                    .center_y(Length::Fixed(48.0))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(crate::theme::ROW_SELECTED)),
+                        border: Border {
+                            width: 1.0,
+                            radius: 24.0.into(),
+                            color: crate::theme::ACCENT_MUTED,
+                        },
+                        ..container::Style::default()
+                    }),
+                text("No message selected")
+                    .size(16)
+                    .color(crate::theme::TEXT),
+                text(if state.network_online {
+                    "Select an email from the list to read, reply, archive, or delete it."
+                } else {
+                    "Reconnect from the sidebar when you are ready to sync new mail."
+                })
+                .size(13)
+                .color(crate::theme::TEXT_MUTED),
             ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center);
-
-            if !state.network_online {
-                action_row = action_row.push(
-                    crate::components::action_bar::button_toolbar("Reconnect to sync", Message::ReconnectRequested)
-                );
-            }
-
-            container(
-                column![
-                    container(Icon::Inbox.view_styled(24.0, crate::theme::ACCENT))
-                        .width(Length::Fixed(48.0))
-                        .height(Length::Fixed(48.0))
-                        .center_x(Length::Fixed(48.0))
-                        .center_y(Length::Fixed(48.0))
-                        .style(|_| container::Style {
-                            background: Some(Background::Color(crate::theme::ROW_SELECTED)),
-                            border: Border {
-                                width: 1.0,
-                                radius: 24.0.into(),
-                                color: crate::theme::ACCENT_MUTED,
-                            },
-                            ..container::Style::default()
-                        }),
-                    text("No message selected").size(16).color(crate::theme::TEXT),
-                    text("Select an email from the list to read, reply, archive, or delete it.")
-                        .size(13)
-                        .color(crate::theme::TEXT_MUTED),
-                    action_row,
-                ]
-                .align_x(iced::Alignment::Center)
-                .spacing(12),
-            )
-            .center(Length::Fill)
-            .into()
-        }
+            .align_x(iced::Alignment::Center)
+            .spacing(12),
+        )
+        .center(Length::Fill)
+        .into(),
     }
 }
 
@@ -128,8 +120,17 @@ fn inline_reply_view<'a>(to: &'a str, subject: &'a str, body: &'a str) -> Elemen
             row![
                 crate::components::list::section_label("Reply"),
                 iced::widget::horizontal_space(),
-                crate::components::action_bar::button_text_with_icon("Close", Icon::Delete, crate::theme::TEXT_MUTED, Message::CloseInlineReply),
-                crate::components::action_bar::button_primary_with_icon("Send", Icon::Send, Message::SendDraft),
+                crate::components::action_bar::button_text_with_icon(
+                    "Close",
+                    Icon::Delete,
+                    crate::theme::TEXT_MUTED,
+                    Message::CloseInlineReply
+                ),
+                crate::components::action_bar::button_primary_with_icon(
+                    "Send",
+                    Icon::Send,
+                    Message::SendDraft
+                ),
             ]
             .align_y(iced::Alignment::Center),
             crate::components::form::labeled_input(
