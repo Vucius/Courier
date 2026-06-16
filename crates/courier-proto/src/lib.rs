@@ -147,7 +147,7 @@ pub struct OAuth2Callback {
     pub state: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredentialKind {
     Password,
     OAuthAccessToken,
@@ -352,7 +352,10 @@ pub enum EngineCommand {
     SaveAccount(AccountConfig),
     SetAccountEnabled(AccountId, bool),
     DeleteAccount(AccountId),
-    TestAccountConnection(AccountConfig),
+    TestAccountConnection {
+        account: AccountConfig,
+        secret: Option<CredentialSecret>,
+    },
     BeginOAuth2(AccountId),
     CompleteOAuth2(OAuth2Callback),
     CredentialStatus,

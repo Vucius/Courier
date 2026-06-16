@@ -102,7 +102,7 @@ impl ProviderCapabilities {
                 security: TransportSecurity::Tls,
             }),
             smtp_endpoint: Some(ProviderEndpoint {
-                host: "smtp.office365.com".to_string(),
+                host: "smtp-mail.outlook.com".to_string(),
                 port: 587,
                 security: TransportSecurity::StartTls,
             }),

@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use courier_adapter::{
-    AttachmentFetchRequest, ConfiguredRemote, CredentialSecretResolver, MailRemote,
+    AccountConnectionCheck, AttachmentFetchRequest, ConfiguredRemote, CredentialSecretResolver,
+    MailRemote,
 };
 use courier_credential::{
     CredentialStore, OsCredentialStore, account_credential_refs, credential_ref,
@@ -337,16 +338,19 @@ impl EngineRuntime {
                         });
                     }
                     Err(error) => {
+                        let message = sync_error_message(&error.to_string());
                         self.publish_notification(DesktopNotification {
                             id: format!("sync-error:{}", unix_timestamp()),
                             kind: NotificationKind::Error,
                             title: "Sync failed".to_string(),
-                            body: error.to_string(),
+                            body: message.clone(),
                             account_id: Some(account_id),
                             message_ids: Vec::new(),
                             created_at: unix_timestamp(),
                         });
-                        let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
+                        let _ = self
+                            .event_tx
+                            .send(EngineEvent::Error(format!("Sync failed: {message}")));
                     }
                 }
             }
@@ -427,10 +431,89 @@ impl EngineRuntime {
                     let _ = self
                         .event_tx
                         .send(EngineEvent::AccountSaved(AccountSummary {
-                            id: account.id,
-                            email: account.email,
-                            provider: account.provider,
+                            id: account.id.clone(),
+                            email: account.email.clone(),
+                            provider: account.provider.clone(),
                         }));
+
+                    let check = test_stored_account_connection(storage, &account).await;
+                    let imap_ok = check.imap.ok;
+                    let smtp_ok = check.smtp.ok;
+                    let imap_message = check
+                        .imap
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "IMAP connection failed".to_string());
+                    let _ = self
+                        .event_tx
+                        .send(EngineEvent::AccountConnectionTested(check));
+
+                    if !imap_ok {
+                        self.publish_notification(DesktopNotification {
+                            id: format!("account-test-error:{}", unix_timestamp()),
+                            kind: NotificationKind::Error,
+                            title: "Account saved but sync blocked".to_string(),
+                            body: imap_message,
+                            account_id: Some(account.id),
+                            message_ids: Vec::new(),
+                            created_at: unix_timestamp(),
+                        });
+                        return;
+                    }
+
+                    if !smtp_ok {
+                        self.publish_notification(DesktopNotification {
+                            id: format!("account-smtp-warning:{}", unix_timestamp()),
+                            kind: NotificationKind::Warning,
+                            title: "SMTP not verified".to_string(),
+                            body:
+                                "Account saved; sending may fail until SMTP authentication succeeds"
+                                    .to_string(),
+                            account_id: Some(account.id.clone()),
+                            message_ids: Vec::new(),
+                            created_at: unix_timestamp(),
+                        });
+                    }
+
+                    if self.network_online {
+                        let _ = self.event_tx.send(EngineEvent::SyncProgress {
+                            account_id: account.id.clone(),
+                            progress: 0.05,
+                        });
+                        if let Ok(sync) = scheduler_for_account(storage, &account.id) {
+                            match sync.sync_now(account.id.clone()).await {
+                                Ok(report) => {
+                                    self.publish_snapshot(storage);
+                                    self.publish_conflicts(storage);
+                                    for update in report.mailbox_updates {
+                                        let _ = self.event_tx.send(EngineEvent::NewMessages {
+                                            mailbox_id: update.mailbox_id.clone(),
+                                            messages: update.message_ids.clone(),
+                                        });
+                                    }
+                                    let _ = self.event_tx.send(EngineEvent::SyncProgress {
+                                        account_id: account.id,
+                                        progress: 1.0,
+                                    });
+                                }
+                                Err(error) => {
+                                    let message = sync_error_message(&error.to_string());
+                                    self.publish_notification(DesktopNotification {
+                                        id: format!("sync-error:{}", unix_timestamp()),
+                                        kind: NotificationKind::Error,
+                                        title: "Sync failed".to_string(),
+                                        body: message.clone(),
+                                        account_id: Some(account.id),
+                                        message_ids: Vec::new(),
+                                        created_at: unix_timestamp(),
+                                    });
+                                    let _ = self.event_tx.send(EngineEvent::Error(format!(
+                                        "Sync failed: {message}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
@@ -471,13 +554,13 @@ impl EngineRuntime {
                     let _ = self.event_tx.send(EngineEvent::Error(error.to_string()));
                 }
             },
-            EngineCommand::TestAccountConnection(account) => {
-                let result = test_account_connection(&account).await;
+            EngineCommand::TestAccountConnection { account, secret } => {
+                let result = test_account_connection(account, secret).await;
                 tracing::info!(
-                    account_id = %account.id.0,
+                    account_id = %result.account_id.0,
                     imap_ok = result.imap.ok,
                     smtp_ok = result.smtp.ok,
-                    "tested account TCP connectivity"
+                    "tested account authenticated connectivity"
                 );
                 let _ = self
                     .event_tx
@@ -1442,13 +1525,77 @@ fn account_config(account: AccountState) -> AccountConfig {
 }
 
 async fn test_account_connection(
-    account: &courier_proto::AccountConfig,
+    account: courier_proto::AccountConfig,
+    secret: Option<CredentialSecret>,
+) -> AccountConnectionTestResult {
+    let account_id = account.id.clone();
+    let remote = ConfiguredRemote::from_account_config_with_secret_resolver(
+        account,
+        Some(credential_secret_resolver(secret)),
+    );
+    account_connection_result(account_id, remote.test_account_connection().await)
+}
+
+async fn test_stored_account_connection(
+    storage: &Storage,
+    account: &AccountConfig,
+) -> AccountConnectionTestResult {
+    match remote_for_account(storage, &account.id) {
+        Ok(remote) => {
+            account_connection_result(account.id.clone(), remote.test_account_connection().await)
+        }
+        Err(error) => AccountConnectionTestResult {
+            account_id: account.id.clone(),
+            imap: EndpointCheckResult {
+                host: account.imap_host.clone(),
+                port: account.imap_port,
+                ok: false,
+                error: Some(sync_error_message(&error)),
+            },
+            smtp: EndpointCheckResult {
+                host: account.smtp_host.clone(),
+                port: account.smtp_port,
+                ok: false,
+                error: Some(sync_error_message(&error)),
+            },
+        },
+    }
+}
+
+fn account_connection_result(
+    account_id: AccountId,
+    check: AccountConnectionCheck,
 ) -> AccountConnectionTestResult {
     AccountConnectionTestResult {
-        account_id: account.id.clone(),
-        imap: test_endpoint(&account.imap_host, account.imap_port).await,
-        smtp: test_endpoint(&account.smtp_host, account.smtp_port).await,
+        account_id,
+        imap: EndpointCheckResult {
+            host: check.imap.host,
+            port: check.imap.port,
+            ok: check.imap.ok,
+            error: (!check.imap.ok).then_some(check.imap.message),
+        },
+        smtp: EndpointCheckResult {
+            host: check.smtp.host,
+            port: check.smtp.port,
+            ok: check.smtp.ok,
+            error: (!check.smtp.ok).then_some(check.smtp.message),
+        },
     }
+}
+
+fn credential_secret_resolver(secret: Option<CredentialSecret>) -> CredentialSecretResolver {
+    let store = std::sync::Arc::new(OsCredentialStore::new());
+    CredentialSecretResolver::new(move |reference| {
+        if let Some(secret) = secret.as_ref()
+            && secret.reference.account_id == reference.account_id
+            && secret.reference.kind == reference.kind
+        {
+            return Ok(Some(secret.secret.clone()));
+        }
+        store
+            .get_secret(reference)
+            .map_err(|error| error.to_string())
+    })
 }
 
 async fn probe_network_status(accounts: &[AccountState]) -> NetworkStatus {
@@ -1512,6 +1659,40 @@ fn endpoint_probe_label(endpoint: &EndpointCheckResult) -> String {
             endpoint.port,
             endpoint.error.as_deref().unwrap_or("failed")
         )
+    }
+}
+
+fn sync_error_message(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("oauth") {
+        "OAuth2 required".to_string()
+    } else if lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("credential")
+        || lower.contains("password")
+        || lower.contains("invalid user")
+        || lower.contains("invalid login")
+    {
+        "Authentication failed".to_string()
+    } else if lower.contains("cannot select inbox") {
+        "Cannot select INBOX".to_string()
+    } else if lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("certificate")
+        || lower.contains("handshake")
+    {
+        "TLS handshake failed".to_string()
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "Network timeout".to_string()
+    } else if lower.contains("missing endpoint")
+        || lower.contains("no such host")
+        || lower.contains("dns")
+        || lower.contains("connection refused")
+        || lower.contains("failed to lookup")
+    {
+        "Invalid IMAP server".to_string()
+    } else {
+        message.to_string()
     }
 }
 

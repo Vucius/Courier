@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::components::icon::Icon;
 use courier_app::{EngineConfig, EngineHandle, spawn_engine};
 use courier_proto::{
     AccountConfig, AccountId, AccountState, AttachmentId, AttachmentOpenRequest, AttachmentPreview,
@@ -15,7 +16,6 @@ use iced::keyboard::{Key, Modifiers, key};
 use iced::widget::{column, container, progress_bar, row, text};
 use iced::{Element, Length, Subscription, Task, Theme};
 use std::time::Duration;
-use crate::components::icon::Icon;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -287,7 +287,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.context_thread = None;
             start_view_transition(
                 app,
-                if app.shortcuts_help_visible { "Shortcuts help" } else { "Reader" },
+                if app.shortcuts_help_visible {
+                    "Shortcuts help"
+                } else {
+                    "Reader"
+                },
             );
             Task::none()
         }
@@ -368,14 +372,23 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::MarkReadSelected => {
             if app.view_mode == ViewMode::Reader && !app.account_setup_visible {
                 if let Some(body) = app.selected_body.as_ref() {
-                    let is_unread = app.threads.iter().any(|t| t.id == body.thread_id && t.unread);
+                    let is_unread = app
+                        .threads
+                        .iter()
+                        .any(|t| t.id == body.thread_id && t.unread);
                     let target_read = is_unread;
                     let engine = app.engine.clone();
                     let message_id = body.id.clone();
-                    app.status = if target_read { "Marking read...".to_string() } else { "Marking unread...".to_string() };
+                    app.status = if target_read {
+                        "Marking read...".to_string()
+                    } else {
+                        "Marking unread...".to_string()
+                    };
                     Task::perform(
                         async move {
-                            let _ = engine.send(EngineCommand::MarkRead(message_id, target_read)).await;
+                            let _ = engine
+                                .send(EngineCommand::MarkRead(message_id, target_read))
+                                .await;
                         },
                         |_| Message::SyncQueued,
                     )
@@ -727,12 +740,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::TestAccountConnection => match account_config_from_form(app) {
             Ok(account) => {
                 let engine = app.engine.clone();
-                app.account_connection_status = "Testing IMAP and SMTP reachability".to_string();
+                let password_secret = account_password_secret(app, &account);
+                app.account_connection_status = "Testing IMAP and SMTP authentication".to_string();
                 app.status = "Testing account connection".to_string();
                 Task::perform(
                     async move {
                         let _ = engine
-                            .send(EngineCommand::TestAccountConnection(account))
+                            .send(EngineCommand::TestAccountConnection {
+                                account,
+                                secret: password_secret,
+                            })
                             .await;
                     },
                     |_| Message::SyncQueued,
@@ -952,8 +969,11 @@ pub fn subscription(app: &App) -> Subscription<Message> {
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
-    let mailboxes =
-        crate::views::mailbox_list::view(&app.mailboxes, app.selected_mailbox_id.as_ref(), &app.selected_mailbox_name);
+    let mailboxes = crate::views::mailbox_list::view(
+        &app.mailboxes,
+        app.selected_mailbox_id.as_ref(),
+        &app.selected_mailbox_name,
+    );
     let visible_threads = app.threads.iter().collect::<Vec<_>>();
     let threads = crate::views::thread_list::view(
         &visible_threads,
@@ -998,7 +1018,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         let mut reader_stack = column![reader_action_bar(app)]
             .height(Length::Fill)
             .spacing(10);
-        let account_display = app.selected_thread.as_ref()
+        let account_display = app
+            .selected_thread
+            .as_ref()
             .and_then(|thread_id| app.threads.iter().find(|t| t.id == *thread_id))
             .and_then(|thread| app.accounts.iter().find(|a| a.id == thread.account_id))
             .map(|account| account.email.clone());
@@ -1033,27 +1055,33 @@ pub fn view(app: &App) -> Element<'_, Message> {
         crate::components::surface::header(
             "Courier",
             row![
-                button(
-                    Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED)
-                )
-                .padding(4)
-                .style(button::text)
-                .on_press(Message::AddAccount),
+                button(Icon::Settings.view_styled(14.0, crate::theme::TEXT_MUTED))
+                    .padding(4)
+                    .style(button::text)
+                    .on_press(Message::AddAccount),
             ]
             .align_y(iced::Alignment::Center)
         ),
-        button(row![
-            Icon::Compose.view_styled(16.0, iced::Color::WHITE),
-            text("Compose").size(14).color(iced::Color::WHITE)
-        ].spacing(8).align_y(iced::Alignment::Center))
+        button(
+            row![
+                Icon::Compose.view_styled(16.0, iced::Color::WHITE),
+                text("Compose").size(14).color(iced::Color::WHITE)
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        )
         .width(Length::Fill)
         .padding(10)
         .style(iced::widget::button::primary)
         .on_press(Message::Compose),
-        button(row![
-            Icon::Sync.view_styled(16.0, crate::theme::TEXT),
-            text("Sync all").size(14).color(crate::theme::TEXT)
-        ].spacing(8).align_y(iced::Alignment::Center))
+        button(
+            row![
+                Icon::Sync.view_styled(16.0, crate::theme::TEXT),
+                text("Sync all").size(14).color(crate::theme::TEXT)
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        )
         .width(Length::Fill)
         .padding(10)
         .on_press(Message::SyncNow)
@@ -1093,7 +1121,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
     let content = if app.window_size.width > 1200.0 {
         row![
-            crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+            crate::components::surface::pane(sidebar)
+                .width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
             crate::components::surface::pane(thread_column)
                 .width(Length::Fixed(crate::theme::THREAD_LIST_WIDTH)),
             crate::components::surface::pane(reader).width(Length::Fill),
@@ -1101,12 +1130,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
     } else {
         if app.narrow_pane_view == NarrowPaneView::List {
             row![
-                crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+                crate::components::surface::pane(sidebar)
+                    .width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
                 crate::components::surface::pane(thread_column).width(Length::Fill),
             ]
         } else {
             row![
-                crate::components::surface::pane(sidebar).width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
+                crate::components::surface::pane(sidebar)
+                    .width(Length::Fixed(crate::theme::SIDEBAR_WIDTH)),
                 crate::components::surface::pane(reader).width(Length::Fill),
             ]
         }
@@ -1115,7 +1146,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .spacing(crate::theme::SPACE_SM);
 
     let mut main_col = column![];
-    
+
     if !app.network_online {
         main_col = main_col.push(
             container(
@@ -1123,10 +1154,13 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     Icon::Warning.view_styled(16.0, crate::theme::DANGER),
                     text("Working Offline").size(13).color(crate::theme::TEXT),
                     iced::widget::horizontal_space(),
-                    crate::components::action_bar::button_text("Reconnect", Message::ReconnectRequested)
+                    crate::components::action_bar::button_text(
+                        "Reconnect",
+                        Message::ReconnectRequested
+                    )
                 ]
                 .align_y(iced::Alignment::Center)
-                .spacing(8)
+                .spacing(8),
             )
             .padding(8)
             .width(Length::Fill)
@@ -1138,20 +1172,25 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     color: crate::theme::WARNING,
                 },
                 ..container::Style::default()
-            })
+            }),
         );
     }
-    
+
     if !app.conflicts.is_empty() || !app.notifications.is_empty() {
         main_col = main_col.push(global_banners_view(app));
     }
 
-    main_col = main_col.push(content).push(crate::components::status_bar::view(&app.status, shortcut_hint(app)));
+    main_col = main_col
+        .push(content)
+        .push(crate::components::status_bar::view(
+            &app.status,
+            shortcut_hint(app),
+        ));
 
     crate::components::surface::app_background(
         main_col
-        .spacing(crate::theme::SPACE_SM)
-        .padding(crate::theme::APP_PADDING),
+            .spacing(crate::theme::SPACE_SM)
+            .padding(crate::theme::APP_PADDING),
     )
     .into()
 }
@@ -1159,7 +1198,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
 pub fn theme(_app: &App) -> Theme {
     Theme::Light
 }
-
 
 fn start_view_transition(app: &mut App, label: &str) {
     app.transition_label = label.to_string();
@@ -1215,20 +1253,18 @@ fn provider_name(provider: &ProviderKind) -> &'static str {
 fn sidebar_accounts(app: &App) -> Element<'_, Message> {
     use iced::widget::button;
 
-    let mut col = column![
-        crate::components::list::section_label("ACCOUNTS")
-    ]
-    .spacing(crate::theme::SPACE_XS);
+    let mut col =
+        column![crate::components::list::section_label("ACCOUNTS")].spacing(crate::theme::SPACE_XS);
 
     if app.accounts.is_empty() {
         col = col.push(
             container(
                 text("No accounts configured")
                     .size(12)
-                    .color(crate::theme::TEXT_MUTED)
+                    .color(crate::theme::TEXT_MUTED),
             )
             .padding(crate::theme::SPACE_SM)
-            .width(Length::Fill)
+            .width(Length::Fill),
         );
     } else {
         for account in &app.accounts {
@@ -1252,7 +1288,7 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
                     iced::widget::horizontal_space(),
                 ]
                 .spacing(6)
-                .align_y(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center),
             )
             .width(Length::Fill)
             .padding([6, 8])
@@ -1301,7 +1337,7 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
                     crate::components::surface::divider(),
                     actions,
                 ]
-                .spacing(6)
+                .spacing(6),
             )
             .padding(crate::theme::SPACE_SM)
             .width(Length::Fill)
@@ -1325,7 +1361,7 @@ fn sidebar_accounts(app: &App) -> Element<'_, Message> {
             text("+ Add account").size(13).color(crate::theme::ACCENT)
         ]
         .spacing(6)
-        .align_y(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center),
     )
     .width(Length::Fill)
     .padding([8, 12])
@@ -1402,10 +1438,20 @@ fn shortcut_hint(app: &App) -> &'static str {
 fn reader_action_bar(app: &App) -> Element<'_, Message> {
     let mut actions = row![].spacing(crate::theme::SPACE_XS);
     if app.selected_body.is_some() {
-        let is_unread = app.selected_body.as_ref().map(|body| {
-            app.threads.iter().any(|t| t.id == body.thread_id && t.unread)
-        }).unwrap_or(false);
-        let mark_label = if is_unread { "Mark read" } else { "Mark unread" };
+        let is_unread = app
+            .selected_body
+            .as_ref()
+            .map(|body| {
+                app.threads
+                    .iter()
+                    .any(|t| t.id == body.thread_id && t.unread)
+            })
+            .unwrap_or(false);
+        let mark_label = if is_unread {
+            "Mark read"
+        } else {
+            "Mark unread"
+        };
 
         actions = actions
             .push(crate::components::action_bar::button_text_with_icon(
@@ -1458,25 +1504,21 @@ fn reader_action_bar(app: &App) -> Element<'_, Message> {
         .map(|body| body.subject.as_str())
         .unwrap_or("Message");
 
-    let mut left_content = row![].spacing(crate::theme::SPACE_SM).align_y(iced::Alignment::Center);
+    let mut left_content = row![]
+        .spacing(crate::theme::SPACE_SM)
+        .align_y(iced::Alignment::Center);
     if app.window_size.width <= 1200.0 && app.narrow_pane_view == NarrowPaneView::Detail {
-        left_content = left_content.push(
-            crate::components::action_bar::button_text(
-                "❮ Back",
-                Message::ShowNarrowList
-            )
-        );
+        left_content = left_content.push(crate::components::action_bar::button_text(
+            "❮ Back",
+            Message::ShowNarrowList,
+        ));
     }
     left_content = left_content.push(text(title).size(13).color(crate::theme::TEXT));
 
-    let mut bar = row![
-        left_content,
-        iced::widget::horizontal_space(),
-        actions,
-    ]
-    .align_y(iced::Alignment::Center)
-    .spacing(crate::theme::SPACE_SM)
-    .padding(crate::theme::SPACE_SM);
+    let mut bar = row![left_content, iced::widget::horizontal_space(), actions,]
+        .align_y(iced::Alignment::Center)
+        .spacing(crate::theme::SPACE_SM)
+        .padding(crate::theme::SPACE_SM);
 
     if app.unread_notifications > 0 {
         bar = bar.push(crate::components::badge::count(app.unread_notifications));
@@ -1505,10 +1547,30 @@ fn thread_context_menu<'a>(app: &'a App, thread_id: &'a ThreadId) -> Element<'a,
             .align_y(iced::Alignment::Center),
             text(title).size(13).color(crate::theme::TEXT),
             row![
-                crate::components::action_bar::button_text_with_icon("Reply", Icon::Reply, crate::theme::TEXT_MUTED, Message::ReplyInline),
-                crate::components::action_bar::button_text_with_icon("Archive", Icon::Archive, crate::theme::TEXT_MUTED, Message::ArchiveSelected),
-                crate::components::action_bar::button_text_with_icon("Mark read", Icon::CheckCircle, crate::theme::TEXT_MUTED, Message::MarkReadSelected),
-                crate::components::action_bar::button_text_with_icon("Trash", Icon::Delete, crate::theme::TEXT_MUTED, Message::TrashSelected),
+                crate::components::action_bar::button_text_with_icon(
+                    "Reply",
+                    Icon::Reply,
+                    crate::theme::TEXT_MUTED,
+                    Message::ReplyInline
+                ),
+                crate::components::action_bar::button_text_with_icon(
+                    "Archive",
+                    Icon::Archive,
+                    crate::theme::TEXT_MUTED,
+                    Message::ArchiveSelected
+                ),
+                crate::components::action_bar::button_text_with_icon(
+                    "Mark read",
+                    Icon::CheckCircle,
+                    crate::theme::TEXT_MUTED,
+                    Message::MarkReadSelected
+                ),
+                crate::components::action_bar::button_text_with_icon(
+                    "Trash",
+                    Icon::Delete,
+                    crate::theme::TEXT_MUTED,
+                    Message::TrashSelected
+                ),
             ]
             .spacing(crate::theme::SPACE_XS),
             text("Keyboard: R reply · D trash · Esc close")
@@ -1533,7 +1595,7 @@ fn thread_context_menu<'a>(app: &'a App, thread_id: &'a ThreadId) -> Element<'a,
 
 fn global_banners_view(app: &App) -> Element<'_, Message> {
     let mut banner_row = row![].spacing(16).align_y(iced::Alignment::Center);
-    
+
     if !app.conflicts.is_empty() {
         let text_lbl = if app.conflicts.len() == 1 {
             "1 sync conflict".to_string()
@@ -1547,12 +1609,16 @@ fn global_banners_view(app: &App) -> Element<'_, Message> {
                 crate::components::action_bar::button_text("Resolve", Message::SyncQueued) // In a real app we'd open a modal
             ]
             .spacing(8)
-            .align_y(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center),
         );
     }
-    
+
     if !app.notifications.is_empty() {
-        let unread_errors = app.notifications.iter().filter(|n| n.kind == NotificationKind::Error).count();
+        let unread_errors = app
+            .notifications
+            .iter()
+            .filter(|n| n.kind == NotificationKind::Error)
+            .count();
         if unread_errors > 0 {
             let text_lbl = if unread_errors == 1 {
                 "1 error".to_string()
@@ -1565,7 +1631,7 @@ fn global_banners_view(app: &App) -> Element<'_, Message> {
                     text(text_lbl).size(13).color(crate::theme::TEXT),
                 ]
                 .spacing(8)
-                .align_y(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center),
             );
         } else {
             let unread_count = app.unread_notifications;
@@ -1573,16 +1639,21 @@ fn global_banners_view(app: &App) -> Element<'_, Message> {
                 banner_row = banner_row.push(
                     row![
                         Icon::Bell.view_styled(16.0, crate::theme::ACCENT),
-                        text(format!("{} notifications", unread_count)).size(13).color(crate::theme::TEXT),
-                        crate::components::action_bar::button_text("Clear", Message::ClearNotifications)
+                        text(format!("{} notifications", unread_count))
+                            .size(13)
+                            .color(crate::theme::TEXT),
+                        crate::components::action_bar::button_text(
+                            "Clear",
+                            Message::ClearNotifications
+                        )
                     ]
                     .spacing(8)
-                    .align_y(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center),
                 );
             }
         }
     }
-    
+
     container(banner_row)
         .padding(8)
         .width(Length::Fill)
@@ -1702,8 +1773,6 @@ fn notification_sidebar_controls(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-
-
 fn quiet_duration_label(seconds: i64) -> String {
     let minutes = (seconds.max(60) + 59) / 60;
     if minutes < 60 {
@@ -1721,8 +1790,6 @@ fn quiet_duration_label(seconds: i64) -> String {
         }
     }
 }
-
-
 
 #[allow(dead_code)]
 fn notifications_view<'a>(
@@ -2247,7 +2314,9 @@ fn shortcuts_help_modal<'a>() -> Element<'a, Message> {
     container(
         column![
             row![
-                text("Keyboard Shortcuts").size(crate::theme::FONT_TITLE).color(crate::theme::TEXT),
+                text("Keyboard Shortcuts")
+                    .size(crate::theme::FONT_TITLE)
+                    .color(crate::theme::TEXT),
                 iced::widget::horizontal_space(),
                 crate::components::action_bar::button_text_with_icon(
                     "Close",
@@ -2270,7 +2339,7 @@ fn shortcuts_help_modal<'a>() -> Element<'a, Message> {
             .spacing(12),
         ]
         .spacing(16)
-        .padding(24)
+        .padding(24),
     )
     .width(Length::Fill)
     .height(Length::Fill)
@@ -2288,17 +2357,22 @@ fn shortcuts_help_modal<'a>() -> Element<'a, Message> {
 
 fn shortcut_row<'a>(key: &'static str, description: &'static str) -> Element<'a, Message> {
     row![
-        container(text(key).size(12).font(iced::Font::MONOSPACE).color(crate::theme::TEXT))
-            .padding([4, 8])
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(crate::theme::SURFACE)),
-                border: iced::Border {
-                    width: 1.0,
-                    radius: crate::theme::RADIUS_SM.into(),
-                    color: crate::theme::BORDER,
-                },
-                ..container::Style::default()
-            }),
+        container(
+            text(key)
+                .size(12)
+                .font(iced::Font::MONOSPACE)
+                .color(crate::theme::TEXT)
+        )
+        .padding([4, 8])
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(crate::theme::SURFACE)),
+            border: iced::Border {
+                width: 1.0,
+                radius: crate::theme::RADIUS_SM.into(),
+                color: crate::theme::BORDER,
+            },
+            ..container::Style::default()
+        }),
         text(description).size(13).color(crate::theme::TEXT_MUTED),
     ]
     .spacing(12)

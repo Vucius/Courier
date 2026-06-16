@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_imap::types::NameAttribute;
 use courier_domain::SyncCursor;
@@ -158,6 +159,20 @@ pub struct AttachmentFetchRequest {
 pub struct AttachmentFetchResult {
     pub attachment_id: AttachmentId,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountConnectionCheck {
+    pub imap: EndpointConnectionCheck,
+    pub smtp: EndpointConnectionCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointConnectionCheck {
+    pub host: String,
+    pub port: u16,
+    pub ok: bool,
+    pub message: String,
 }
 
 pub trait MailRemote {
@@ -457,6 +472,53 @@ impl ConfiguredRemote {
             ProviderKind::Gmail => Self::Gmail(GmailRemote::new(account, secret_resolver)),
             ProviderKind::Outlook => Self::Outlook(OutlookRemote::new(account, secret_resolver)),
             ProviderKind::Jmap => Self::Jmap(JmapRemote::new(account, secret_resolver)),
+        }
+    }
+
+    pub async fn test_account_connection(&self) -> AccountConnectionCheck {
+        match self {
+            ConfiguredRemote::LocalNoop(_) => AccountConnectionCheck {
+                imap: EndpointConnectionCheck {
+                    host: "local".to_string(),
+                    port: 0,
+                    ok: true,
+                    message: "Connection verified".to_string(),
+                },
+                smtp: EndpointConnectionCheck {
+                    host: "local".to_string(),
+                    port: 0,
+                    ok: true,
+                    message: "Connection verified".to_string(),
+                },
+            },
+            ConfiguredRemote::ImapSmtp(remote) => {
+                test_imap_smtp_account_connection(
+                    remote.account.clone(),
+                    remote.plan.clone(),
+                    remote.secret_resolver.clone(),
+                )
+                .await
+            }
+            ConfiguredRemote::Gmail(remote) => {
+                test_imap_smtp_account_connection(
+                    remote.account.clone(),
+                    remote.plan.clone(),
+                    remote.secret_resolver.clone(),
+                )
+                .await
+            }
+            ConfiguredRemote::Outlook(remote) => {
+                test_imap_smtp_account_connection(
+                    remote.account.clone(),
+                    remote.plan.clone(),
+                    remote.secret_resolver.clone(),
+                )
+                .await
+            }
+            ConfiguredRemote::Jmap(remote) => AccountConnectionCheck {
+                imap: endpoint_not_applicable("JMAP", remote.plan.jmap_endpoint.as_ref()),
+                smtp: endpoint_not_applicable("SMTP", remote.plan.smtp_endpoint.as_ref()),
+            },
         }
     }
 }
@@ -823,6 +885,168 @@ fn smtp_transport(
     }
 
     Ok(builder.build())
+}
+
+async fn test_imap_smtp_account_connection(
+    account: AccountConfig,
+    plan: ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+) -> AccountConnectionCheck {
+    let imap = test_imap_connection(&account, &plan, secret_resolver.clone()).await;
+    let smtp = test_smtp_connection(&account, &plan, secret_resolver).await;
+    AccountConnectionCheck { imap, smtp }
+}
+
+async fn test_imap_connection(
+    account: &AccountConfig,
+    plan: &ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+) -> EndpointConnectionCheck {
+    let Some(endpoint) = plan.imap_endpoint.as_ref() else {
+        return endpoint_missing("IMAP", "imap");
+    };
+    let host = endpoint.host.clone();
+    let port = endpoint.port;
+
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut session = open_tls_imap_session(account, plan, secret_resolver.as_ref()).await?;
+        session
+            .list(None, Some("*"))
+            .await
+            .map_err(|error| Error::Imap(error.to_string()))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| Error::Imap(error.to_string()))?;
+        session
+            .select("INBOX")
+            .await
+            .map_err(|error| Error::Imap(format!("Cannot select INBOX: {error}")))?;
+        let _ = session.logout().await;
+        Ok(())
+    })
+    .await;
+
+    endpoint_check_from_result("IMAP", host, port, result)
+}
+
+async fn test_smtp_connection(
+    account: &AccountConfig,
+    plan: &ProtocolConnectionPlan,
+    secret_resolver: Option<CredentialSecretResolver>,
+) -> EndpointConnectionCheck {
+    let Some(endpoint) = plan.smtp_endpoint.as_ref() else {
+        return endpoint_missing("SMTP", "smtp");
+    };
+    let host = endpoint.host.clone();
+    let port = endpoint.port;
+
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let auth_secret = resolve_smtp_auth_secret(account, plan, secret_resolver.as_ref())?;
+        let mailer = smtp_transport(endpoint, account, auth_secret)?;
+        match mailer.test_connection().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::Smtp("SMTP NOOP failed".to_string())),
+            Err(error) => Err(Error::Smtp(error.to_string())),
+        }
+    })
+    .await;
+
+    endpoint_check_from_result("SMTP", host, port, result)
+}
+
+fn endpoint_check_from_result(
+    label: &str,
+    host: String,
+    port: u16,
+    result: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
+) -> EndpointConnectionCheck {
+    match result {
+        Ok(Ok(())) => EndpointConnectionCheck {
+            host,
+            port,
+            ok: true,
+            message: "Connection verified".to_string(),
+        },
+        Ok(Err(error)) => EndpointConnectionCheck {
+            host,
+            port,
+            ok: false,
+            message: classify_connection_error(label, &error),
+        },
+        Err(_) => EndpointConnectionCheck {
+            host,
+            port,
+            ok: false,
+            message: "Network timeout".to_string(),
+        },
+    }
+}
+
+fn endpoint_missing(label: &str, endpoint: &'static str) -> EndpointConnectionCheck {
+    EndpointConnectionCheck {
+        host: label.to_string(),
+        port: 0,
+        ok: false,
+        message: format!("Invalid {endpoint} server"),
+    }
+}
+
+fn endpoint_not_applicable(
+    label: &str,
+    endpoint: Option<&ProviderEndpoint>,
+) -> EndpointConnectionCheck {
+    EndpointConnectionCheck {
+        host: endpoint
+            .map(|endpoint| endpoint.host.clone())
+            .unwrap_or_else(|| label.to_string()),
+        port: endpoint.map(|endpoint| endpoint.port).unwrap_or_default(),
+        ok: false,
+        message: "OAuth2 required".to_string(),
+    }
+}
+
+fn classify_connection_error(label: &str, error: &Error) -> String {
+    match error {
+        Error::UnsupportedAuth(_) | Error::MissingCredential("oauth access token") => {
+            "OAuth2 required".to_string()
+        }
+        Error::MissingCredential(_) | Error::Credential(_) => "Authentication failed".to_string(),
+        Error::MissingEndpoint(endpoint) => format!("Invalid {endpoint} server"),
+        Error::Imap(message) | Error::Smtp(message) => classify_transport_error(label, message),
+        other => other.to_string(),
+    }
+}
+
+fn classify_transport_error(label: &str, message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("cannot select inbox") {
+        "Cannot select INBOX".to_string()
+    } else if lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("credentials")
+        || lower.contains("password")
+        || lower.contains("invalid user")
+        || lower.contains("invalid login")
+    {
+        "Authentication failed".to_string()
+    } else if lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("certificate")
+        || lower.contains("handshake")
+    {
+        "TLS handshake failed".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "Network timeout".to_string()
+    } else if lower.contains("name or service not known")
+        || lower.contains("nodename")
+        || lower.contains("dns")
+        || lower.contains("connection refused")
+        || lower.contains("failed to lookup")
+    {
+        format!("Invalid {label} server")
+    } else {
+        message.to_string()
+    }
 }
 
 fn smtp_envelope(message: &OutgoingMessage) -> Result<Envelope> {
