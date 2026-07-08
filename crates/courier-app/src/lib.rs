@@ -1186,8 +1186,7 @@ impl EngineRuntime {
             .find(|account| account.id == account_id)
             .ok_or_else(|| format!("Account not found: {}", account_id.0))?;
         let redirect_uri = "http://127.0.0.1:48176/oauth/callback";
-        let client_id = std::env::var("COURIER_OAUTH_CLIENT_ID")
-            .unwrap_or_else(|_| "configure-client-id".to_string());
+        let client_id = courier_provider::oauth_providers::get_client_id(&account.provider);
         let config = oauth2_client_config(&account.provider, client_id, redirect_uri)
             .ok_or_else(|| "OAuth2 is not configured for this provider".to_string())?;
         if config.auth_url.is_empty() {
@@ -1293,8 +1292,7 @@ impl EngineRuntime {
         }
 
         let redirect_uri = "http://127.0.0.1:48176/oauth/callback";
-        let client_id = std::env::var("COURIER_OAUTH_CLIENT_ID")
-            .unwrap_or_else(|_| "configure-client-id".to_string());
+        let client_id = courier_provider::oauth_providers::get_client_id(&account.provider);
         let config = oauth2_client_config(&account.provider, client_id, redirect_uri)
             .ok_or_else(|| "OAuth2 is not configured for this provider".to_string())?;
         if config.token_url.is_empty() {

@@ -1,3 +1,5 @@
+pub mod oauth_providers;
+
 use courier_proto::{OAuth2ClientConfig, ProviderKind};
 use serde::{Deserialize, Serialize};
 

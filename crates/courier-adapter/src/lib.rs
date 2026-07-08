@@ -1346,6 +1346,19 @@ async fn fetch_imap_delta(
             .flags()
             .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
 
+        let attachments = parsed
+            .attachments
+            .into_iter()
+            .map(|att| RemoteAttachment {
+                id: att.id,
+                filename: att.filename,
+                mime_type: att.mime_type,
+                size: att.size,
+                content_id: att.content_id,
+                inline: att.inline,
+            })
+            .collect();
+
         messages.push(RemoteMessage {
             id: message_id,
             thread_id,
@@ -1358,7 +1371,7 @@ async fn fetch_imap_delta(
             timestamp: unix_timestamp(),
             read,
             raw: Some(raw_message),
-            attachments: Vec::new(),
+            attachments,
         });
     }
 
@@ -1745,6 +1758,7 @@ enum JmapAuthSecret {
 struct JmapSession {
     api_url: String,
     download_url: String,
+    upload_url: String,
     accounts: BTreeMap<String, JmapSessionAccount>,
     primary_accounts: Option<BTreeMap<String, String>>,
 }
@@ -2237,6 +2251,22 @@ fn jmap_attachment_id(account_id: &str, blob_id: &str) -> AttachmentId {
     AttachmentId(format!("{account_id}:jmap:blob:{}", hex_encode(blob_id)))
 }
 
+fn jmap_id_from_message_id(account_id: &str, message_id: &MessageId) -> Result<String> {
+    let prefix = format!("{account_id}:jmap:email:");
+    let Some(encoded) = message_id.0.strip_prefix(&prefix) else {
+        return Err(Error::InvalidRemoteMessage(format!(
+            "message id has no JMAP email id: {}",
+            message_id.0
+        )));
+    };
+    hex_decode(encoded).ok_or_else(|| {
+        Error::InvalidRemoteMessage(format!(
+            "message id has invalid JMAP email id: {}",
+            message_id.0
+        ))
+    })
+}
+
 fn jmap_blob_id_from_attachment_id(
     account_id: &str,
     attachment_id: &AttachmentId,
@@ -2288,6 +2318,25 @@ async fn http_request_bytes(
             http_round_trip(&mut tcp, &request).await
         }
     }
+}
+
+async fn jmap_upload(
+    session: &JmapSession,
+    auth: &JmapAuthSecret,
+    account_id: &str,
+    data: Vec<u8>,
+    mime_type: &str,
+) -> Result<String> {
+    let url = session
+        .upload_url
+        .replace("{accountId}", &encode_path_component(account_id));
+    let response = http_request_bytes("POST", &url, auth, Some(data), Some(mime_type)).await?;
+    let json: Value = serde_json::from_slice(&response)
+        .map_err(|error| Error::Jmap(format!("upload response is not json: {error}")))?;
+    json.get("blobId")
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Jmap("upload response is missing blobId".to_string()))
 }
 
 async fn http_round_trip<S>(stream: &mut S, request: &[u8]) -> Result<Vec<u8>>
@@ -2630,9 +2679,71 @@ impl MailRemote for JmapRemote {
     }
 
     fn apply_ops(&self, ops: Vec<RemoteOp>) -> impl Future<Output = Result<()>> + Send {
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
         async move {
-            let _ = ops;
-            Err(Error::NotImplemented("jmap apply_ops"))
+            if ops.is_empty() {
+                return Ok(());
+            }
+
+            let auth = resolve_jmap_auth_secret(&account, &plan, secret_resolver.as_ref())?;
+            let session = fetch_jmap_session(&plan, &auth).await?;
+            let account_id = jmap_mail_account_id(&session)?;
+
+            let mut update = serde_json::Map::new();
+            let mut destroy = Vec::new();
+
+            for op in ops {
+                match op {
+                    RemoteOp::MarkRead { message_id, read } => {
+                        let id = jmap_id_from_message_id(&account.id.0, &MessageId(message_id))?;
+                        let mut keywords = serde_json::Map::new();
+                        if read {
+                            keywords.insert("$seen".to_string(), json!(true));
+                        } else {
+                            keywords.insert("$seen".to_string(), json!(null));
+                        }
+                        update.insert(id, json!({ "keywords": keywords }));
+                    }
+                    RemoteOp::Move { message_id, mailbox_id } => {
+                        let id = jmap_id_from_message_id(&account.id.0, &MessageId(message_id))?;
+                        let target = remote_mailbox_name(&account.id.0, &mailbox_id);
+                        update.insert(id, json!({ "mailboxIds": { target: true } }));
+                    }
+                    RemoteOp::Delete { message_id } => {
+                        let id = jmap_id_from_message_id(&account.id.0, &MessageId(message_id))?;
+                        destroy.push(id);
+                    }
+                }
+            }
+
+            let mut email_set = json!({
+                "accountId": account_id,
+            });
+            
+            if !update.is_empty() {
+                email_set.as_object_mut().unwrap().insert("update".to_string(), json!(update));
+            }
+            if !destroy.is_empty() {
+                email_set.as_object_mut().unwrap().insert("destroy".to_string(), json!(destroy));
+            }
+
+            let _ = jmap_method_call(
+                &session.api_url,
+                &auth,
+                json!({
+                    "using": jmap_using(),
+                    "methodCalls": [[
+                        "Email/set",
+                        email_set,
+                        "s0"
+                    ]]
+                }),
+            )
+            .await?;
+
+            Ok(())
         }
     }
 
@@ -2640,9 +2751,82 @@ impl MailRemote for JmapRemote {
         &self,
         message: OutgoingMessage,
     ) -> impl Future<Output = Result<SendResult>> + Send {
+        let account = self.account.clone();
+        let plan = self.plan.clone();
+        let secret_resolver = self.secret_resolver.clone();
         async move {
-            let _ = message;
-            Err(Error::NotImplemented("jmap send_message"))
+            let auth = resolve_jmap_auth_secret(&account, &plan, secret_resolver.as_ref())?;
+            let session = fetch_jmap_session(&plan, &auth).await?;
+            let account_id = jmap_mail_account_id(&session)?;
+
+            let blob_id = jmap_upload(
+                &session,
+                &auth,
+                account_id,
+                message.rfc822,
+                "message/rfc822",
+            )
+            .await?;
+
+            let rcpt_to = message
+                .recipients
+                .into_iter()
+                .map(|email| json!({ "email": email }))
+                .collect::<Vec<_>>();
+            
+            let envelope = json!({
+                "mailFrom": { "email": message.from },
+                "rcptTo": rcpt_to
+            });
+
+            let res = jmap_method_call(
+                &session.api_url,
+                &auth,
+                json!({
+                    "using": [
+                        "urn:ietf:params:jmap:core",
+                        "urn:ietf:params:jmap:mail",
+                        "urn:ietf:params:jmap:submission"
+                    ],
+                    "methodCalls": [
+                        [
+                            "Email/import",
+                            {
+                                "accountId": account_id,
+                                "emails": {
+                                    "m1": {
+                                        "blobId": blob_id,
+                                        "mailboxIds": {}
+                                    }
+                                }
+                            },
+                            "0"
+                        ],
+                        [
+                            "EmailSubmission/set",
+                            {
+                                "accountId": account_id,
+                                "create": {
+                                    "s1": {
+                                        "emailId": "#m1",
+                                        "envelope": envelope
+                                    }
+                                }
+                            },
+                            "1"
+                        ]
+                    ]
+                }),
+            )
+            .await?;
+
+            let email_id = jmap_response_ids(&res, "Email/import")?
+                .into_iter()
+                .next();
+
+            Ok(SendResult {
+                remote_id: email_id,
+            })
         }
     }
 
